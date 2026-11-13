@@ -1,0 +1,731 @@
+//! Full-screen terminal UI.
+//!
+//! `weathered` with no subcommand, and `weathered tui`, open this screen. Installs
+//! and launches run on background tasks; the screen keeps reading the keyboard
+//! and the mouse while progress events arrive.
+
+mod model;
+mod theme;
+mod view;
+
+use std::io::{self, BufRead, BufReader, IsTerminal, Read};
+use std::path::PathBuf;
+use std::process::Child;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use crossterm::event::{
+    Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use crossterm::{cursor, execute, terminal};
+use futures::StreamExt;
+use model::{App, DetectedJava, Effect, Key, Mouse, Msg, Profile};
+use ratatui::backend::CrosstermBackend;
+use ratatui::Terminal;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use weathered_core::auth::{AccountStore, MicrosoftAuth};
+use weathered_core::config::{resolve_ms_client_id, Config};
+use weathered_core::download::build_http_client;
+use weathered_core::install::{install_version, InstallOptions};
+use weathered_core::java::{self, JavaMode};
+use weathered_core::launch::{prepare_launch, spawn_captured, LaunchRequest};
+use weathered_core::manifest;
+use weathered_core::paths::GamePaths;
+use weathered_core::platform::OsInfo;
+use weathered_core::progress::ProgressSink;
+use weathered_core::rules::FeatureSet;
+
+/// Open the terminal UI. `game_dir` overrides the saved directory for this run.
+pub async fn run(game_dir: Option<PathBuf>) -> Result<i32> {
+    if !io::stdout().is_terminal() {
+        anyhow::bail!("the terminal UI needs an interactive terminal. Try `weathered --help`.");
+    }
+    let mut config = Config::load()?;
+    let _ = config.ensure_client_id();
+    let dir = game_dir.unwrap_or_else(|| {
+        if config.game_dir.trim().is_empty() {
+            GamePaths::default_root()
+        } else {
+            PathBuf::from(config.game_dir.trim())
+        }
+    });
+    let mut app = App::empty(dir);
+    if !config.memory.trim().is_empty() {
+        app.memory = config.memory.trim().to_string();
+    }
+    if !config.offline_username.trim().is_empty() {
+        app.username = config.offline_username.trim().to_string();
+    }
+    app.java_path = config.java_path.trim().to_string();
+    app.client_id_input = config.ms_client_id.trim().to_string();
+    app.sync_profiles_from_disk();
+    app.reload_installed();
+    app.note("Loading version list...", false);
+
+    let (tx, mut rx) = mpsc::channel::<Msg>(512);
+    spawn_catalog(tx.clone(), app.game_dir.clone());
+    spawn_javas(tx.clone(), app.game_dir.clone());
+
+    let mut guard = TerminalGuard::enter()?;
+    let mut events = EventStream::new();
+    let mut launch_control: Option<LaunchControl> = None;
+    let mut login_task: Option<JoinHandle<()>> = None;
+
+    loop {
+        guard.terminal.draw(|frame| view::draw(frame, &mut app))?;
+        if app.quit {
+            break;
+        }
+        tokio::select! {
+            event = events.next() => {
+                match event {
+                    Some(Ok(Event::Key(key))) => {
+                        if let Some(mapped) = map_key(key) {
+                            let effect = app.on_key(mapped);
+                            dispatch(&mut app, effect, &mut config, &tx, &mut launch_control, &mut login_task).await;
+                        }
+                    }
+                    Some(Ok(Event::Mouse(mouse))) => {
+                        if let Some(mapped) = map_mouse(mouse) {
+                            let effect = app.on_mouse(mapped);
+                            dispatch(&mut app, effect, &mut config, &tx, &mut launch_control, &mut login_task).await;
+                        }
+                    }
+                    Some(Ok(Event::Resize(_, _))) => {}
+                    Some(Err(_)) | None => break,
+                    _ => {}
+                }
+            }
+            message = rx.recv() => {
+                if let Some(message) = message {
+                    let finished_login = matches!(message, Msg::LoginFinished { ok: true, .. });
+                    app.on_msg(message);
+                    if finished_login {
+                        app.sync_profiles_from_disk();
+                    }
+                }
+            }
+        }
+    }
+    if let Some(task) = login_task.take() {
+        task.abort();
+    }
+    if let Some(control) = launch_control.take() {
+        control.cancel();
+    }
+    Ok(0)
+}
+
+async fn dispatch(
+    app: &mut App,
+    effect: Effect,
+    config: &mut Config,
+    tx: &mpsc::Sender<Msg>,
+    launch_control: &mut Option<LaunchControl>,
+    login_task: &mut Option<JoinHandle<()>>,
+) {
+    match effect {
+        Effect::None => {}
+        Effect::Quit => app.quit = true,
+        Effect::Save => {
+            if let Err(err) = persist(app, config) {
+                app.note(format!("Could not save settings: {err}"), true);
+            }
+        }
+        Effect::RefreshManifest => {
+            app.catalog_ready = false;
+            app.note("Loading version list...", false);
+            spawn_catalog(tx.clone(), app.game_dir.clone());
+        }
+        Effect::Install { version } => {
+            spawn_install(tx.clone(), app.game_dir.clone(), version);
+        }
+        Effect::Launch => {
+            if let Some(previous) = launch_control.take() {
+                previous.cancel();
+            }
+            let control = LaunchControl::new();
+            let offline = app.selected_profile().is_none_or(|profile| profile.offline);
+            let account_uuid = app
+                .selected_profile()
+                .filter(|profile| !profile.offline)
+                .map(|profile| profile.account_uuid.clone())
+                .unwrap_or_default();
+            let version = app
+                .selected_version()
+                .map(|item| item.id.clone())
+                .unwrap_or_default();
+            spawn_launch(
+                tx.clone(),
+                LaunchParams {
+                    version,
+                    game_dir: app.game_dir.clone(),
+                    memory: app.memory.clone(),
+                    username: app.username.clone(),
+                    java_path: app.java_path.clone(),
+                    offline,
+                    account_uuid,
+                },
+                control.clone(),
+            );
+            *launch_control = Some(control);
+        }
+        Effect::StopGame => {
+            if let Some(control) = launch_control.take() {
+                control.cancel();
+            }
+            app.mark_game_stopped();
+            app.note("Stopped the game", false);
+        }
+        Effect::Login => {
+            if let Some(task) = login_task.take() {
+                task.abort();
+            }
+            match start_login(tx.clone(), app.client_id_input.clone()) {
+                Ok(task) => *login_task = Some(task),
+                Err(err) => app.note(err, true),
+            }
+        }
+        Effect::CancelLogin => {
+            if let Some(task) = login_task.take() {
+                task.abort();
+            }
+            app.note("Sign-in cancelled", false);
+        }
+    }
+}
+
+fn persist(app: &App, config: &mut Config) -> weathered_core::Result<()> {
+    config.game_dir = app.game_dir.display().to_string();
+    config.memory = app.memory.clone();
+    config.java_path = app.java_path.clone();
+    config.offline_username = app.username.clone();
+    config.ms_client_id = app.client_id_input.clone();
+    config.save()
+}
+
+struct LaunchParams {
+    version: String,
+    game_dir: PathBuf,
+    memory: String,
+    username: String,
+    java_path: String,
+    offline: bool,
+    account_uuid: String,
+}
+
+fn spawn_catalog(tx: mpsc::Sender<Msg>, game_dir: PathBuf) {
+    tokio::spawn(async move {
+        let client = match build_http_client() {
+            Ok(client) => client,
+            Err(err) => {
+                let _ = tx
+                    .send(Msg::Notice {
+                        text: err.to_string(),
+                        error: true,
+                    })
+                    .await;
+                return;
+            }
+        };
+        let paths = GamePaths::new(game_dir);
+        match manifest::fetch_manifest(&client, &paths.manifest_cache()).await {
+            Ok(fetched) => {
+                let entries = fetched
+                    .manifest
+                    .versions
+                    .into_iter()
+                    .map(|entry| model::CatalogEntry {
+                        id: entry.id,
+                        kind: entry.version_type,
+                        released: entry
+                            .release_time
+                            .as_deref()
+                            .and_then(|time| time.split('T').next())
+                            .unwrap_or("-")
+                            .to_string(),
+                    })
+                    .collect();
+                let _ = tx.send(Msg::Catalog(entries)).await;
+            }
+            Err(err) => {
+                let _ = tx
+                    .send(Msg::Notice {
+                        text: err.to_string(),
+                        error: true,
+                    })
+                    .await;
+            }
+        }
+    });
+}
+
+fn spawn_javas(tx: mpsc::Sender<Msg>, game_dir: PathBuf) {
+    tokio::task::spawn_blocking(move || {
+        let mut found = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for java in java::detect_system_javas() {
+            let path = java.path.display().to_string();
+            if seen.insert(path.clone()) {
+                found.push(DetectedJava {
+                    label: format!("{:<10} {path}", java.version),
+                    path,
+                });
+            }
+        }
+        for java in java::detect_vendored_runtimes(&GamePaths::new(game_dir)) {
+            let path = java.path.display().to_string();
+            if seen.insert(path.clone()) {
+                found.push(DetectedJava {
+                    label: format!("{:<10} {path}  ({})", java.version, java.source),
+                    path,
+                });
+            }
+        }
+        let _ = tx.blocking_send(Msg::Javas(found));
+    });
+}
+
+fn spawn_install(tx: mpsc::Sender<Msg>, game_dir: PathBuf, version: String) {
+    let progress_tx = tx.clone();
+    let version_for_progress = version.clone();
+    tokio::spawn(async move {
+        let sink = ProgressSink::new(move |event| {
+            let detail = std::path::Path::new(&event.detail)
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or(event.detail);
+            let _ = progress_tx.try_send(Msg::Progress {
+                version: version_for_progress.clone(),
+                stage: event.stage,
+                completed: event.completed,
+                total: event.total,
+                detail,
+                launching: false,
+            });
+        });
+        let outcome = async {
+            let client = build_http_client()?;
+            let paths = GamePaths::new(&game_dir);
+            let report = install_version(
+                &client,
+                &paths,
+                &InstallOptions {
+                    version: version.clone(),
+                    os: OsInfo::current(),
+                    concurrency: 32,
+                    java: JavaMode::Auto,
+                },
+                &sink,
+            )
+            .await?;
+            Ok::<_, weathered_core::Error>(format!(
+                "{} libraries, {} assets",
+                report.libraries, report.assets
+            ))
+        }
+        .await;
+        let (ok, detail) = match outcome {
+            Ok(detail) => (true, detail),
+            Err(err) => (false, err.to_string()),
+        };
+        let _ = tx
+            .send(Msg::InstallFinished {
+                version,
+                ok,
+                detail,
+            })
+            .await;
+    });
+}
+
+fn spawn_launch(tx: mpsc::Sender<Msg>, params: LaunchParams, control: LaunchControl) {
+    let progress_tx = tx.clone();
+    let version_for_progress = params.version.clone();
+    tokio::spawn(async move {
+        let sink = ProgressSink::new(move |event| {
+            let _ = progress_tx.try_send(Msg::Progress {
+                version: version_for_progress.clone(),
+                stage: event.stage,
+                completed: event.completed,
+                total: event.total,
+                detail: event.detail,
+                launching: true,
+            });
+        });
+        let started = async {
+            if control.is_cancelled() {
+                return Err(weathered_core::Error::message("launch cancelled"));
+            }
+            let client = build_http_client()?;
+            let paths = GamePaths::new(&params.game_dir);
+            let mut config = Config::load()?;
+            let client_id = config.ensure_client_id();
+            let session = if params.offline {
+                weathered_core::auth::offline_session(&params.username)
+            } else {
+                microsoft_session(&client, &params.account_uuid, &config).await?
+            };
+            let plan = prepare_launch(
+                &client,
+                &paths,
+                LaunchRequest {
+                    version_id: params.version.clone(),
+                    session,
+                    java: if params.java_path.is_empty() {
+                        None
+                    } else {
+                        Some(PathBuf::from(&params.java_path))
+                    },
+                    memory: params.memory.clone(),
+                    os: OsInfo::current(),
+                    features: FeatureSet::default(),
+                    client_id,
+                    quick_play_path: String::new(),
+                    quick_play_singleplayer: String::new(),
+                    quick_play_multiplayer: String::new(),
+                    quick_play_realms: String::new(),
+                    width: None,
+                    height: None,
+                    java_mode: if params.java_path.is_empty() {
+                        JavaMode::Auto
+                    } else {
+                        JavaMode::Skip
+                    },
+                    concurrency: 16,
+                },
+                &sink,
+            )
+            .await?;
+            if let Some(warning) = &plan.java_warning {
+                let _ = tx
+                    .send(Msg::Notice {
+                        text: warning.clone(),
+                        error: false,
+                    })
+                    .await;
+            }
+            if control.is_cancelled() {
+                return Err(weathered_core::Error::message("launch cancelled"));
+            }
+            let mut child = spawn_captured(&plan)?;
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+            control.store(child);
+            if let Some(stdout) = stdout {
+                pump(stdout, tx.clone());
+            }
+            if let Some(stderr) = stderr {
+                pump(stderr, tx.clone());
+            }
+            watch_exit(control.clone(), tx.clone());
+            Ok::<(), weathered_core::Error>(())
+        }
+        .await;
+        match started {
+            Ok(()) => {
+                let _ = tx.send(Msg::GameStarted).await;
+            }
+            Err(err) => {
+                let _ = tx
+                    .send(Msg::LaunchFailed {
+                        detail: err.to_string(),
+                    })
+                    .await;
+            }
+        }
+    });
+}
+
+fn pump(reader: impl Read + Send + 'static, tx: mpsc::Sender<Msg>) {
+    thread::spawn(move || {
+        let mut lines = BufReader::new(reader).lines();
+        while let Some(Ok(line)) = lines.next() {
+            if tx.blocking_send(Msg::GameLog(line)).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+fn watch_exit(control: LaunchControl, tx: mpsc::Sender<Msg>) {
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_millis(200));
+        let status = control.poll_exit();
+        if let Some(code) = status {
+            let _ = tx.blocking_send(Msg::GameExit(code));
+            return;
+        }
+    });
+}
+
+#[derive(Clone)]
+struct LaunchControl {
+    inner: Arc<LaunchInner>,
+}
+
+struct LaunchInner {
+    cancel: std::sync::atomic::AtomicBool,
+    child: Mutex<Option<Child>>,
+}
+
+impl LaunchControl {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(LaunchInner {
+                cancel: std::sync::atomic::AtomicBool::new(false),
+                child: Mutex::new(None),
+            }),
+        }
+    }
+
+    fn cancel(&self) {
+        self.inner
+            .cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.kill();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.inner.cancel.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn store(&self, child: Child) {
+        if let Ok(mut guard) = self.inner.child.lock() {
+            *guard = Some(child);
+        }
+    }
+
+    fn kill(&self) {
+        if let Ok(mut guard) = self.inner.child.lock() {
+            if let Some(child) = guard.as_mut() {
+                let _ = child.kill();
+            }
+        }
+    }
+
+    fn poll_exit(&self) -> Option<i32> {
+        let mut guard = self.inner.child.lock().ok()?;
+        let child = guard.as_mut()?;
+        match child.try_wait() {
+            Ok(Some(status)) => Some(status.code().unwrap_or(1)),
+            Ok(None) => None,
+            Err(_) => Some(1),
+        }
+    }
+}
+
+async fn microsoft_session(
+    client: &reqwest::Client,
+    uuid: &str,
+    config: &Config,
+) -> weathered_core::Result<weathered_core::auth::Session> {
+    use weathered_core::Error;
+    let mut store = AccountStore::load()?;
+    let account = store
+        .get(uuid)
+        .cloned()
+        .ok_or_else(|| Error::message("that Microsoft account is no longer saved"))?;
+    if !account.is_expired() {
+        return Ok(account.session());
+    }
+    let env = std::env::var("WEATHERED_MS_CLIENT_ID").ok();
+    let Some(client_id) = resolve_ms_client_id(None, env.as_deref(), config) else {
+        return Err(Error::MissingClientId);
+    };
+    let auth = MicrosoftAuth::new(client.clone(), client_id)?;
+    let refreshed = auth.refresh(&account).await?;
+    let session = refreshed.session();
+    store.upsert(refreshed);
+    store.save()?;
+    Ok(session)
+}
+
+fn start_login(tx: mpsc::Sender<Msg>, client_id: String) -> Result<JoinHandle<()>, String> {
+    let config = Config::load().map_err(|err| err.to_string())?;
+    let env = std::env::var("WEATHERED_MS_CLIENT_ID").ok();
+    let Some(client_id) = resolve_ms_client_id(Some(&client_id), env.as_deref(), &config) else {
+        return Err(
+            "Set a Microsoft client id in Settings, or export WEATHERED_MS_CLIENT_ID.".into(),
+        );
+    };
+    let tx_for_task = tx;
+    Ok(tokio::spawn(async move {
+        let client = match build_http_client() {
+            Ok(client) => client,
+            Err(err) => {
+                let _ = tx_for_task
+                    .send(Msg::LoginFinished {
+                        ok: false,
+                        detail: err.to_string(),
+                        name: String::new(),
+                    })
+                    .await;
+                return;
+            }
+        };
+        let auth = match MicrosoftAuth::new(client, client_id) {
+            Ok(auth) => auth,
+            Err(err) => {
+                let _ = tx_for_task
+                    .send(Msg::LoginFinished {
+                        ok: false,
+                        detail: err.to_string(),
+                        name: String::new(),
+                    })
+                    .await;
+                return;
+            }
+        };
+        let prompt_tx = tx_for_task.clone();
+        let result = auth
+            .login(|code| {
+                let _ = prompt_tx.try_send(Msg::LoginPrompt {
+                    url: code.verification_uri.clone(),
+                    code: code.user_code.clone(),
+                    message: code
+                        .message
+                        .clone()
+                        .unwrap_or_else(|| "Waiting for you to approve the sign-in.".into()),
+                });
+            })
+            .await;
+        match result {
+            Ok(account) => {
+                let name = account.username.clone();
+                let uuid = account.uuid.clone();
+                if let Ok(mut store) = AccountStore::load() {
+                    store.upsert(account);
+                    store.set_active(&uuid);
+                    let _ = store.save();
+                }
+                let _ = tx_for_task
+                    .send(Msg::LoginFinished {
+                        ok: true,
+                        detail: String::new(),
+                        name,
+                    })
+                    .await;
+            }
+            Err(err) => {
+                let _ = tx_for_task
+                    .send(Msg::LoginFinished {
+                        ok: false,
+                        detail: err.to_string(),
+                        name: String::new(),
+                    })
+                    .await;
+            }
+        }
+    }))
+}
+
+fn map_key(key: crossterm::event::KeyEvent) -> Option<Key> {
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
+        return Some(Key::CtrlC);
+    }
+    Some(match key.code {
+        KeyCode::Char(ch) => Key::Char(ch),
+        KeyCode::Enter => Key::Enter,
+        KeyCode::Esc => Key::Esc,
+        KeyCode::Up => Key::Up,
+        KeyCode::Down => Key::Down,
+        KeyCode::Left => Key::Left,
+        KeyCode::Right => Key::Right,
+        KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => Key::BackTab,
+        KeyCode::BackTab => Key::BackTab,
+        KeyCode::Tab => Key::Tab,
+        KeyCode::Backspace => Key::Backspace,
+        KeyCode::Home => Key::Home,
+        KeyCode::End => Key::End,
+        _ => return None,
+    })
+}
+
+fn map_mouse(mouse: MouseEvent) -> Option<Mouse> {
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => Some(Mouse::Click {
+            x: mouse.column,
+            y: mouse.row,
+        }),
+        MouseEventKind::ScrollDown => Some(Mouse::Scroll {
+            x: mouse.column,
+            y: mouse.row,
+            down: true,
+        }),
+        MouseEventKind::ScrollUp => Some(Mouse::Scroll {
+            x: mouse.column,
+            y: mouse.row,
+            down: false,
+        }),
+        MouseEventKind::Moved => Some(Mouse::Move {
+            x: mouse.column,
+            y: mouse.row,
+        }),
+        _ => None,
+    }
+}
+
+struct TerminalGuard {
+    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+}
+
+impl TerminalGuard {
+    fn enter() -> Result<Self> {
+        enable_raw_mode().context("failed to enable raw mode")?;
+        let mut stdout = io::stdout();
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            crossterm::event::EnableMouseCapture,
+            cursor::Hide,
+            terminal::SetTitle("Weathered Launcher")
+        )
+        .context("failed to enter the terminal UI")?;
+        let terminal = Terminal::new(CrosstermBackend::new(stdout))
+            .context("failed to start the terminal UI")?;
+        Ok(Self { terminal })
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            io::stdout(),
+            LeaveAlternateScreen,
+            crossterm::event::DisableMouseCapture,
+            cursor::Show
+        );
+    }
+}
+
+impl App {
+    fn sync_profiles_from_disk(&mut self) {
+        let microsoft = AccountStore::load()
+            .map(|store| {
+                store
+                    .accounts
+                    .into_iter()
+                    .map(|account| Profile {
+                        name: account.username,
+                        detail: "microsoft".into(),
+                        offline: false,
+                        account_uuid: account.uuid,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        self.replace_profiles(microsoft);
+    }
+}
