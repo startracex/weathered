@@ -9,18 +9,23 @@
 
 pub mod assets;
 pub mod auth;
+pub mod catalog;
 pub mod config;
+pub mod content;
 pub mod download;
 pub mod error;
 pub mod install;
+pub mod instance;
 pub mod java;
 pub mod launch;
 pub mod library;
 pub mod manifest;
+pub mod modpack;
 pub mod paths;
 pub mod platform;
 pub mod progress;
 pub mod rules;
+pub mod store;
 pub mod version;
 
 pub use error::{Error, Result};

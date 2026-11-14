@@ -108,43 +108,67 @@ fn draw_footer(frame: &mut Frame, app: &App) {
 
 fn draw_launch(frame: &mut Frame, app: &App) {
     frame.render_widget(panel("Account"), app.screen.left);
-    frame.render_widget(panel("Play"), app.screen.right);
+    frame.render_widget(panel("Instances"), app.screen.right);
     draw_account_card(frame, app);
 
-    for (offset, rect) in app.screen.version_rows.iter().copied().enumerate() {
-        let index = app.version_scroll + offset;
-        let Some(version) = app.installed.get(index) else {
-            continue;
-        };
-        let selected = index == app.version_selected;
-        let style = row_style(selected, hot(app, rect));
-        let mark = if selected { "▸" } else { " " };
-        let label = format!(" {mark} {:<18} {}", version.id, version.kind);
-        frame.render_widget(
-            Paragraph::new(fit(&label, rect.width as usize)).style(style),
-            rect,
-        );
-    }
-    if app.installed.is_empty() {
-        let note = Rect::new(
-            app.screen.version_list.x,
-            app.screen.version_list.y,
-            app.screen.version_list.width,
-            1,
-        );
-        frame.render_widget(
-            Paragraph::new("  No versions yet. Open Download.")
-                .style(theme::muted().bg(theme::SURFACE)),
-            note,
-        );
+    if app.creator.is_some() {
+        draw_creator(frame, app);
+    } else {
+        for (offset, rect) in app.screen.version_rows.iter().copied().enumerate() {
+            let index = app.version_scroll + offset;
+            let Some(instance) = app.instances.get(index) else {
+                continue;
+            };
+            let selected = index == app.version_selected;
+            let style = row_style(selected, hot(app, rect));
+            let mark = if selected { "▸" } else { " " };
+            let label = format!(
+                " {mark} {:<16} {:<10} {}",
+                instance.name, instance.game_version, instance.loader
+            );
+            frame.render_widget(
+                Paragraph::new(fit(&label, rect.width as usize)).style(style),
+                rect,
+            );
+        }
+        if app.instances.is_empty() {
+            let note = Rect::new(
+                app.screen.version_list.x,
+                app.screen.version_list.y,
+                app.screen.version_list.width,
+                1,
+            );
+            frame.render_widget(
+                Paragraph::new("  No instances yet.").style(theme::muted().bg(theme::SURFACE)),
+                note,
+            );
+        }
+        if app.screen.new_instance.height > 0 {
+            let style = if hot(app, app.screen.new_instance) {
+                theme::selected()
+            } else {
+                theme::hover()
+            };
+            frame.render_widget(
+                Paragraph::new(fit(
+                    " + New instance",
+                    app.screen.new_instance.width as usize,
+                ))
+                .style(style),
+                app.screen.new_instance,
+            );
+        }
     }
 
     let running = app.game_running;
     let preparing = app.job.as_ref().is_some_and(|job| job.launching) && !running;
     if app.screen.launch_button.y > app.screen.version_list.y {
-        let caption = match app.selected_version() {
-            Some(version) => format!("{}   ·   {}", version.id, app.memory),
-            None => "Install a version to play".into(),
+        let caption = match app.selected_instance() {
+            Some(instance) => format!(
+                "{}   ·   {}   ·   {}",
+                instance.name, instance.game_version, app.memory
+            ),
+            None => "Create an instance to play".into(),
         };
         let width = app.screen.right.width.saturating_sub(2);
         let x = app.screen.right.x.saturating_add(1);
@@ -158,7 +182,7 @@ fn draw_launch(frame: &mut Frame, app: &App) {
         ("STOP", theme::selected())
     } else if preparing {
         ("PREPARING", theme::disabled_button())
-    } else if app.selected_version().is_none() {
+    } else if app.selected_instance().is_none() {
         ("NO VERSION", theme::disabled_button())
     } else if hot(app, app.screen.launch_button) {
         (
@@ -193,6 +217,48 @@ fn draw_launch(frame: &mut Frame, app: &App) {
         frame.render_widget(
             Paragraph::new(lines).style(theme::muted().bg(theme::SURFACE)),
             app.screen.log,
+        );
+    }
+}
+
+fn draw_creator(frame: &mut Frame, app: &App) {
+    let title = match app.creator {
+        Some(super::model::CreatorStep::Pick) => "Pick downloaded",
+        _ => "New instance",
+    };
+    let heading = Rect::new(
+        app.screen.version_list.x,
+        app.screen.version_list.y,
+        app.screen.version_list.width,
+        1,
+    );
+    if app.screen.version_rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new(fit(title, heading.width as usize))
+                .style(theme::muted().bg(theme::SURFACE)),
+            heading,
+        );
+    }
+    for (offset, rect) in app.screen.version_rows.iter().copied().enumerate() {
+        let selected = offset == app.creator_selected;
+        let style = row_style(selected, hot(app, rect));
+        let mark = if selected { "▸" } else { " " };
+        let label = match app.creator {
+            Some(super::model::CreatorStep::Source) => match offset {
+                0 => "From downloaded",
+                1 => "Download new",
+                _ => "Import modpack",
+            },
+            Some(super::model::CreatorStep::Pick) => app
+                .catalog_items
+                .get(offset)
+                .map(|item| item.name.as_str())
+                .unwrap_or(""),
+            None => "",
+        };
+        frame.render_widget(
+            Paragraph::new(fit(&format!(" {mark} {label}"), rect.width as usize)).style(style),
+            rect,
         );
     }
 }
@@ -260,9 +326,15 @@ fn draw_account_card(frame: &mut Frame, app: &App) {
 }
 
 fn draw_download(frame: &mut Frame, app: &App) {
-    for (index, category) in [Category::Release, Category::Snapshot, Category::Old]
-        .into_iter()
-        .enumerate()
+    for (index, category) in [
+        Category::Release,
+        Category::Snapshot,
+        Category::Old,
+        Category::Fabric,
+        Category::Quilt,
+    ]
+    .into_iter()
+    .enumerate()
     {
         let Some(rect) = app.screen.download_tabs.get(index).copied() else {
             continue;
@@ -327,10 +399,10 @@ fn draw_download(frame: &mut Frame, app: &App) {
         };
         let selected = index == app.download_selected;
         let style = row_style(selected, hot(app, rect) && !button_hot(app, offset));
-        let status = if app.installed_ids.contains(&entry.id) {
-            "installed"
+        let status = if app.in_store(&entry.id) {
+            "in store"
         } else {
-            "not installed"
+            "not stored"
         };
         let mark = if selected { "▸" } else { " " };
         let label = format!(" {mark} {:<20} {:<12} {}", entry.id, entry.released, status);
@@ -342,7 +414,7 @@ fn draw_download(frame: &mut Frame, app: &App) {
             let busy = app.job.as_ref().is_some_and(|job| job.version == entry.id);
             let caption = if busy {
                 "wait"
-            } else if app.installed_ids.contains(&entry.id) {
+            } else if app.in_store(&entry.id) {
                 "reinstall"
             } else {
                 "install"
@@ -432,8 +504,8 @@ fn draw_more(frame: &mut Frame, app: &App) {
         )),
         Line::from("A Minecraft: Java Edition launcher, named for weathered copper."),
         Line::from(""),
-        Line::from("The Launch page picks an installed version and an account."),
-        Line::from("Download installs a release, snapshot, or old version."),
+        Line::from("Launch selects an instance. New instance copies mods into that instance."),
+        Line::from("Download stores vanilla, Fabric, or Quilt once in the shared store."),
         Line::from("Settings stores the game directory, memory, Java, and username."),
         Line::from(""),
         Line::from("Mouse: click tabs, rows, and buttons. The wheel scrolls lists."),

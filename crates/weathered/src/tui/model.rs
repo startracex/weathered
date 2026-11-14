@@ -53,6 +53,8 @@ pub enum Category {
     Release,
     Snapshot,
     Old,
+    Fabric,
+    Quilt,
 }
 
 impl Category {
@@ -61,6 +63,16 @@ impl Category {
             Self::Release => "Release",
             Self::Snapshot => "Snapshot",
             Self::Old => "Old",
+            Self::Fabric => "Fabric",
+            Self::Quilt => "Quilt",
+        }
+    }
+
+    pub fn loader(self) -> &'static str {
+        match self {
+            Self::Fabric => "fabric",
+            Self::Quilt => "quilt",
+            _ => "vanilla",
         }
     }
 
@@ -69,6 +81,7 @@ impl Category {
             Self::Release => kind == "release",
             Self::Snapshot => kind == "snapshot",
             Self::Old => kind == "old_beta" || kind == "old_alpha",
+            Self::Fabric | Self::Quilt => kind == "release",
         }
     }
 }
@@ -116,7 +129,17 @@ pub enum Mouse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     None,
-    Install { version: String },
+    Install {
+        version: String,
+        loader: String,
+        create_instance: bool,
+    },
+    CreateInstance {
+        catalog_id: String,
+    },
+    ImportPack {
+        path: String,
+    },
     Launch,
     StopGame,
     Save,
@@ -181,6 +204,33 @@ pub struct Installed {
     pub kind: String,
 }
 
+/// One row on the Launch page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceRow {
+    pub id: String,
+    pub name: String,
+    pub game_version: String,
+    pub loader: String,
+    pub legacy: bool,
+}
+
+/// One downloaded profile that can become an instance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogRow {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub game_version: String,
+    pub launchable: bool,
+}
+
+/// New-instance wizard step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreatorStep {
+    Source,
+    Pick,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Profile {
     pub name: String,
@@ -219,6 +269,7 @@ pub enum Field {
     JavaPath,
     ClientId,
     Search,
+    PackPath,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -265,6 +316,11 @@ pub struct App {
     pub detected: Vec<DetectedJava>,
     pub installed: Vec<Installed>,
     pub installed_ids: HashSet<String>,
+    pub instances: Vec<InstanceRow>,
+    pub catalog_items: Vec<CatalogRow>,
+    pub creator: Option<CreatorStep>,
+    pub creator_selected: usize,
+    pub pending_create: bool,
     pub version_selected: usize,
     pub version_scroll: usize,
     pub version_window: usize,
@@ -305,6 +361,11 @@ impl App {
             detected: Vec::new(),
             installed: Vec::new(),
             installed_ids: HashSet::new(),
+            instances: Vec::new(),
+            catalog_items: Vec::new(),
+            creator: None,
+            creator_selected: 0,
+            pending_create: false,
             version_selected: 0,
             version_scroll: 0,
             version_window: 8,
@@ -349,6 +410,29 @@ impl App {
             },
         ];
         app.rebuild_installed_ids();
+        app.instances = vec![
+            InstanceRow {
+                id: "vanilla".into(),
+                name: "Vanilla".into(),
+                game_version: "1.21.1".into(),
+                loader: "vanilla".into(),
+                legacy: false,
+            },
+            InstanceRow {
+                id: "beta".into(),
+                name: "Beta".into(),
+                game_version: "b1.7.3".into(),
+                loader: "vanilla".into(),
+                legacy: false,
+            },
+        ];
+        app.catalog_items = vec![CatalogRow {
+            id: "vanilla-1.21.1".into(),
+            name: "1.21.1".into(),
+            kind: "vanilla".into(),
+            game_version: "1.21.1".into(),
+            launchable: true,
+        }];
         app.catalog_ready = true;
         app.catalog = vec![
             CatalogEntry {
@@ -473,13 +557,48 @@ impl App {
         self.installed = scan_installed(&self.game_dir);
         self.rebuild_installed_ids();
         self.sort_installed();
-        if !self.installed.is_empty() && self.version_selected >= self.installed.len() {
-            self.version_selected = 0;
-        }
     }
 
-    pub fn selected_version(&self) -> Option<&Installed> {
-        self.installed.get(self.version_selected)
+    pub fn selected_instance(&self) -> Option<&InstanceRow> {
+        self.instances.get(self.version_selected)
+    }
+
+    pub fn in_store(&self, version_id: &str) -> bool {
+        let kind = self.category.loader();
+        self.catalog_items
+            .iter()
+            .any(|item| item.kind == kind && item.game_version == version_id)
+    }
+
+    /// Reload instances and the download catalog from the data directory.
+    pub fn reload_local(&mut self) {
+        let layout = weathered_core::paths::DataLayout::new(&self.game_dir);
+        let _ = weathered_core::instance::migrate_legacy(&layout);
+        self.instances = weathered_core::instance::list(&layout)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| InstanceRow {
+                id: item.id,
+                name: item.name,
+                game_version: item.game_version,
+                loader: item.loader,
+                legacy: item.legacy,
+            })
+            .collect();
+        self.catalog_items = weathered_core::catalog::list(&layout)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| CatalogRow {
+                id: item.id,
+                name: item.name,
+                kind: item.kind,
+                game_version: item.game_version,
+                launchable: item.launchable,
+            })
+            .collect();
+        if !self.instances.is_empty() && self.version_selected >= self.instances.len() {
+            self.version_selected = 0;
+        }
     }
 
     pub fn selected_profile(&self) -> Option<&Profile> {
@@ -500,6 +619,14 @@ impl App {
         }
         if self.editing.is_some() {
             return self.on_edit_key(key);
+        }
+        if key == Key::Esc && self.creator.is_some() {
+            self.creator = None;
+            return Effect::None;
+        }
+        if key == Key::Char('n') && self.page == Page::Launch && self.creator.is_none() {
+            self.open_creator();
+            return Effect::None;
         }
         match key {
             Key::Char('q') => {
@@ -596,10 +723,11 @@ impl App {
                 }
                 if ok {
                     self.reload_installed();
-                    if let Some(index) = self.installed.iter().position(|item| item.id == version) {
-                        self.version_selected = index;
-                    }
-                    self.note(format!("Installed {version}. {detail}"), false);
+                    self.reload_local();
+                    self.pending_create = false;
+                    self.creator = None;
+                    self.page = Page::Launch;
+                    self.note(format!("Stored {version}. {detail}"), false);
                 } else {
                     self.note(format!("Install {version} failed: {detail}"), true);
                 }
@@ -678,12 +806,16 @@ impl App {
                     delta.signum(),
                 );
             }
+            Page::Launch if self.creator.is_some() => {
+                let len = self.creator_len();
+                bump(&mut self.creator_selected, len, delta.signum());
+            }
             Page::Launch => {
                 self.focus = Focus::Versions;
                 slide(
                     &mut self.version_selected,
                     &mut self.version_scroll,
-                    self.installed.len(),
+                    self.instances.len(),
                     self.version_window,
                     delta,
                 );
@@ -722,7 +854,13 @@ impl App {
     }
 
     fn shift_category(&mut self, delta: isize) {
-        let order = [Category::Release, Category::Snapshot, Category::Old];
+        let order = [
+            Category::Release,
+            Category::Snapshot,
+            Category::Old,
+            Category::Fabric,
+            Category::Quilt,
+        ];
         let index = order
             .iter()
             .position(|item| *item == self.category)
@@ -735,6 +873,9 @@ impl App {
     }
 
     fn activate(&mut self) -> Effect {
+        if self.creator.is_some() && self.page == Page::Launch {
+            return self.activate_creator();
+        }
         match self.page {
             Page::Launch if self.focus == Focus::Accounts => Effect::None,
             Page::Launch => self.request_launch(),
@@ -771,6 +912,14 @@ impl App {
                 self.focus = Focus::Accounts;
                 self.profile_selected = index;
                 Effect::None
+            }
+            Click::NewInstance => {
+                self.open_creator();
+                Effect::None
+            }
+            Click::Creator(index) => {
+                self.creator_selected = index;
+                self.activate_creator()
             }
             Click::Version(index) => {
                 self.page = Page::Launch;
@@ -847,7 +996,7 @@ impl App {
             slide(
                 &mut self.version_selected,
                 &mut self.version_scroll,
-                self.installed.len(),
+                self.instances.len(),
                 self.version_window,
                 delta,
             );
@@ -883,19 +1032,20 @@ impl App {
             self.note("Wait for the current task to finish", true);
             return Effect::None;
         }
-        let Some(version) = self.selected_version().map(|item| item.id.clone()) else {
-            self.note("Install a version on the Download page first", true);
+        let Some(instance) = self.selected_instance() else {
+            self.note("Create an instance first", true);
             return Effect::None;
         };
+        let name = instance.name.clone();
         self.job = Some(Job {
-            version: version.clone(),
+            version: name.clone(),
             stage: "preparing".to_string(),
             completed: 0,
             total: 0,
             detail: "Resolving files".into(),
             launching: true,
         });
-        self.note(format!("Preparing {version}"), false);
+        self.note(format!("Preparing {name}"), false);
         Effect::Launch
     }
 
@@ -916,8 +1066,76 @@ impl App {
             detail: "Queued".into(),
             launching: false,
         });
-        self.note(format!("Installing {id}"), false);
-        Effect::Install { version: id }
+        let loader = self.category.loader().to_string();
+        let create_instance = self.pending_create;
+        self.pending_create = false;
+        self.note(format!("Downloading {id}"), false);
+        Effect::Install {
+            version: id,
+            loader,
+            create_instance,
+        }
+    }
+
+    fn open_creator(&mut self) {
+        self.creator = Some(CreatorStep::Source);
+        self.creator_selected = 0;
+        self.page = Page::Launch;
+        self.focus = Focus::Versions;
+        self.note("New instance", false);
+    }
+
+    fn creator_len(&self) -> usize {
+        match self.creator {
+            Some(CreatorStep::Source) => 3,
+            Some(CreatorStep::Pick) => self.catalog_items.len(),
+            None => 0,
+        }
+    }
+
+    fn activate_creator(&mut self) -> Effect {
+        match self.creator {
+            Some(CreatorStep::Source) => match self.creator_selected {
+                0 => {
+                    if self.catalog_items.is_empty() {
+                        self.note("Download a version first", true);
+                        Effect::None
+                    } else {
+                        self.creator = Some(CreatorStep::Pick);
+                        self.creator_selected = 0;
+                        Effect::None
+                    }
+                }
+                1 => {
+                    self.creator = None;
+                    self.pending_create = true;
+                    self.page = Page::Download;
+                    self.focus = Focus::DownloadList;
+                    self.note(
+                        "Download a version. An instance is created when it finishes.",
+                        false,
+                    );
+                    Effect::None
+                }
+                _ => {
+                    self.begin_edit(Field::PackPath, String::new());
+                    Effect::None
+                }
+            },
+            Some(CreatorStep::Pick) => {
+                let Some(item) = self.catalog_items.get(self.creator_selected) else {
+                    return Effect::None;
+                };
+                if !item.launchable {
+                    self.note(format!("{} cannot be launched yet", item.name), true);
+                    return Effect::None;
+                }
+                let catalog_id = item.id.clone();
+                self.creator = None;
+                Effect::CreateInstance { catalog_id }
+            }
+            None => Effect::None,
+        }
     }
 
     fn activate_setting(&mut self, index: usize) -> Effect {
@@ -932,7 +1150,7 @@ impl App {
                     Field::Username => self.username.clone(),
                     Field::JavaPath => self.java_path.clone(),
                     Field::ClientId => self.client_id_input.clone(),
-                    Field::Search => self.query.clone(),
+                    Field::Search | Field::PackPath => self.query.clone(),
                 };
                 self.begin_edit(field, current);
                 Effect::None
@@ -1063,11 +1281,21 @@ impl App {
         }
         self.editing = None;
         match editor.field {
+            Field::PackPath => {
+                let path = editor.buffer.trim().to_string();
+                if path.is_empty() {
+                    self.note("Enter the path to a .mrpack file", true);
+                    return Effect::None;
+                }
+                self.creator = None;
+                return Effect::ImportPack { path };
+            }
             Field::GameDir => {
                 self.game_dir = PathBuf::from(editor.buffer.trim());
                 self.version_selected = 0;
                 self.version_scroll = 0;
                 self.reload_installed();
+                self.reload_local();
             }
             Field::Memory => self.memory = editor.buffer.trim().to_string(),
             Field::Username => {
@@ -1162,6 +1390,8 @@ pub enum Click {
     Page(Page),
     Account(usize),
     Version(usize),
+    NewInstance,
+    Creator(usize),
     LaunchButton,
     Category(Category),
     DownloadRow(usize),
@@ -1271,6 +1501,7 @@ pub struct Screen {
     pub version_list: Rect,
     pub version_rows: Vec<Rect>,
     pub launch_button: Rect,
+    pub new_instance: Rect,
     pub progress: Rect,
     pub log: Rect,
     pub download_tabs: Vec<Rect>,
@@ -1415,31 +1646,54 @@ fn layout_launch(app: &App, screen: &mut Screen) {
     } else {
         0
     };
+    let new_h = if app.creator.is_none() { 1 } else { 0 };
     let list_h = right_inner
         .height
         .saturating_sub(button_band)
-        .saturating_sub(log_h);
+        .saturating_sub(log_h)
+        .saturating_sub(new_h);
     screen.version_list = Rect::new(right_inner.x, right_inner.y, right_inner.width, list_h);
-    let band_y = right_inner.y.saturating_add(list_h);
-    let band = Rect::new(right_inner.x, band_y, right_inner.width, button_band);
-    screen.launch_button = centered(band, 24.min(band.width.saturating_sub(2)), 3);
-    if app.game_running {
+    if new_h > 0 {
+        screen.new_instance = Rect::new(
+            right_inner.x,
+            right_inner.y.saturating_add(list_h),
+            right_inner.width,
+            1,
+        );
         screen.zones.push(Zone {
-            rect: screen.launch_button,
-            action: Click::Stop,
-        });
-    } else {
-        screen.zones.push(Zone {
-            rect: screen.launch_button,
-            action: Click::LaunchButton,
+            rect: screen.new_instance,
+            action: Click::NewInstance,
         });
     }
-    screen.version_rows = rows(screen.version_list, app.installed.len(), app.version_scroll);
+    let band_y = right_inner.y.saturating_add(list_h).saturating_add(new_h);
+    let band = Rect::new(right_inner.x, band_y, right_inner.width, button_band);
+    screen.launch_button = centered(band, 24.min(band.width.saturating_sub(2)), 3);
+    if app.creator.is_none() {
+        if app.game_running {
+            screen.zones.push(Zone {
+                rect: screen.launch_button,
+                action: Click::Stop,
+            });
+        } else {
+            screen.zones.push(Zone {
+                rect: screen.launch_button,
+                action: Click::LaunchButton,
+            });
+        }
+    }
+    let list_len = if app.creator.is_some() {
+        app.creator_len()
+    } else {
+        app.instances.len()
+    };
+    screen.version_rows = rows(screen.version_list, list_len, app.version_scroll);
     for (offset, rect) in screen.version_rows.iter().copied().enumerate() {
-        screen.zones.push(Zone {
-            rect,
-            action: Click::Version(app.version_scroll + offset),
-        });
+        let action = if app.creator.is_some() {
+            Click::Creator(offset)
+        } else {
+            Click::Version(app.version_scroll + offset)
+        };
+        screen.zones.push(Zone { rect, action });
     }
     if log_h > 0 {
         screen.log = Rect::new(
@@ -1464,7 +1718,13 @@ fn layout_download(app: &App, screen: &mut Screen) {
     let progress_h = if app.job.is_some() { 3 } else { 0 };
     screen.download_tabs = Vec::new();
     let mut x = body.x.saturating_add(1);
-    for category in [Category::Release, Category::Snapshot, Category::Old] {
+    for category in [
+        Category::Release,
+        Category::Snapshot,
+        Category::Old,
+        Category::Fabric,
+        Category::Quilt,
+    ] {
         let width = (category.label().len() as u16).saturating_add(2);
         let rect = Rect::new(x, body.y, width, 1);
         screen.zones.push(Zone {
@@ -1733,7 +1993,29 @@ mod tests {
         assert_eq!(
             effect,
             Effect::Install {
-                version: "1.20.4".into()
+                version: "1.20.4".into(),
+                loader: "vanilla".into(),
+                create_instance: false,
+            }
+        );
+    }
+
+    #[test]
+    fn new_instance_can_be_created_from_a_downloaded_profile() {
+        let mut app = App::preview();
+        app.screen = layout(&app, Rect::new(0, 0, 100, 36));
+        let button = app.screen.new_instance;
+        app.on_mouse(Mouse::Click {
+            x: button.x + 1,
+            y: button.y,
+        });
+        assert_eq!(app.creator, Some(CreatorStep::Source));
+        assert_eq!(app.on_key(Key::Enter), Effect::None);
+        assert_eq!(app.creator, Some(CreatorStep::Pick));
+        assert_eq!(
+            app.on_key(Key::Enter),
+            Effect::CreateInstance {
+                catalog_id: "vanilla-1.21.1".into(),
             }
         );
     }

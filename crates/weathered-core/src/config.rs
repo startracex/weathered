@@ -30,6 +30,9 @@ pub struct Config {
     /// Offline player name used by the terminal UI.
     #[serde(default)]
     pub offline_username: String,
+    /// Concurrent downloads. Zero uses 16.
+    #[serde(default)]
+    pub download_jobs: u32,
 }
 
 impl Config {
@@ -78,6 +81,15 @@ impl Config {
         }
         std::fs::rename(&tmp, &path).io_at(&path)?;
         Ok(())
+    }
+
+    /// Download concurrency. Zero or missing means 16.
+    pub fn jobs(&self) -> usize {
+        if self.download_jobs == 0 {
+            16
+        } else {
+            self.download_jobs as usize
+        }
     }
 
     /// Return the game client id, creating and saving one on first use.

@@ -18,7 +18,7 @@ use crate::progress::{ProgressEvent, ProgressSink};
 
 /// Largest single file Weathered will accept. Larger than any current client
 /// jar or Java runtime file, and small enough to reject a runaway response.
-const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
+pub(crate) const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Largest JSON document Weathered will buffer.
 const MAX_JSON_BYTES: usize = 20 * 1024 * 1024;

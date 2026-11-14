@@ -279,7 +279,7 @@ fn ensure_installed(
     )))
 }
 
-fn game_assets_dir(paths: &GamePaths, index_name: &str) -> PathBuf {
+pub(crate) fn game_assets_dir(paths: &GamePaths, index_name: &str) -> PathBuf {
     if index_name.is_empty() {
         return paths.assets();
     }
@@ -297,7 +297,7 @@ fn game_assets_dir(paths: &GamePaths, index_name: &str) -> PathBuf {
     paths.assets()
 }
 
-fn logging_argument(version: &VersionInfo, paths: &GamePaths) -> Option<String> {
+pub(crate) fn logging_argument(version: &VersionInfo, paths: &GamePaths) -> Option<String> {
     let logging = version.logging.as_ref()?.client.as_ref()?;
     let path = paths.log_config(&logging.file.id);
     if !path.is_file() {

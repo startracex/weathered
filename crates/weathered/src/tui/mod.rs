@@ -32,11 +32,13 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use weathered_core::auth::{AccountStore, MicrosoftAuth};
 use weathered_core::config::{resolve_ms_client_id, Config};
+use weathered_core::content::{self, Loader};
 use weathered_core::download::build_http_client;
-use weathered_core::install::{install_version, InstallOptions};
+use weathered_core::instance;
 use weathered_core::java::{self, JavaMode};
-use weathered_core::launch::{prepare_launch, spawn_captured, LaunchRequest};
+use weathered_core::launch::{spawn_captured, LaunchRequest};
 use weathered_core::manifest;
+use weathered_core::paths::DataLayout;
 use weathered_core::paths::GamePaths;
 use weathered_core::platform::OsInfo;
 use weathered_core::progress::ProgressSink;
@@ -67,6 +69,7 @@ pub async fn run(game_dir: Option<PathBuf>) -> Result<i32> {
     app.client_id_input = config.ms_client_id.trim().to_string();
     app.sync_profiles_from_disk();
     app.reload_installed();
+    app.reload_local();
     app.note("Loading version list...", false);
 
     let (tx, mut rx) = mpsc::channel::<Msg>(512);
@@ -144,8 +147,25 @@ async fn dispatch(
             app.note("Loading version list...", false);
             spawn_catalog(tx.clone(), app.game_dir.clone());
         }
-        Effect::Install { version } => {
-            spawn_install(tx.clone(), app.game_dir.clone(), version);
+        Effect::Install {
+            version,
+            loader,
+            create_instance,
+        } => {
+            spawn_install(
+                tx.clone(),
+                app.game_dir.clone(),
+                version,
+                loader,
+                create_instance,
+                config.jobs(),
+            );
+        }
+        Effect::CreateInstance { catalog_id } => {
+            spawn_create(tx.clone(), app.game_dir.clone(), catalog_id);
+        }
+        Effect::ImportPack { path } => {
+            spawn_import(tx.clone(), app.game_dir.clone(), path, config.jobs());
         }
         Effect::Launch => {
             if let Some(previous) = launch_control.take() {
@@ -158,14 +178,14 @@ async fn dispatch(
                 .filter(|profile| !profile.offline)
                 .map(|profile| profile.account_uuid.clone())
                 .unwrap_or_default();
-            let version = app
-                .selected_version()
+            let instance_id = app
+                .selected_instance()
                 .map(|item| item.id.clone())
                 .unwrap_or_default();
             spawn_launch(
                 tx.clone(),
                 LaunchParams {
-                    version,
+                    instance_id,
                     game_dir: app.game_dir.clone(),
                     memory: app.memory.clone(),
                     username: app.username.clone(),
@@ -212,7 +232,7 @@ fn persist(app: &App, config: &mut Config) -> weathered_core::Result<()> {
 }
 
 struct LaunchParams {
-    version: String,
+    instance_id: String,
     game_dir: PathBuf,
     memory: String,
     username: String,
@@ -293,43 +313,57 @@ fn spawn_javas(tx: mpsc::Sender<Msg>, game_dir: PathBuf) {
     });
 }
 
-fn spawn_install(tx: mpsc::Sender<Msg>, game_dir: PathBuf, version: String) {
+fn spawn_install(
+    tx: mpsc::Sender<Msg>,
+    game_dir: PathBuf,
+    version: String,
+    loader: String,
+    create_instance: bool,
+    jobs: usize,
+) {
     let progress_tx = tx.clone();
     let version_for_progress = version.clone();
     tokio::spawn(async move {
         let sink = ProgressSink::new(move |event| {
-            let detail = std::path::Path::new(&event.detail)
-                .file_name()
-                .map(|name| name.to_string_lossy().to_string())
-                .unwrap_or(event.detail);
             let _ = progress_tx.try_send(Msg::Progress {
                 version: version_for_progress.clone(),
                 stage: event.stage,
                 completed: event.completed,
                 total: event.total,
-                detail,
+                detail: event.detail,
                 launching: false,
             });
         });
         let outcome = async {
             let client = build_http_client()?;
-            let paths = GamePaths::new(&game_dir);
-            let report = install_version(
+            let layout = DataLayout::new(&game_dir);
+            let parsed = Loader::parse(&loader)?;
+            let os = OsInfo::current();
+            let item = content::download(
                 &client,
-                &paths,
-                &InstallOptions {
-                    version: version.clone(),
-                    os: OsInfo::current(),
-                    concurrency: 32,
-                    java: JavaMode::Auto,
+                &layout,
+                content::DownloadRequest {
+                    version: &version,
+                    loader: parsed,
+                    loader_version: None,
+                    os: &os,
+                    concurrency: jobs,
+                    java_mode: JavaMode::Auto,
                 },
                 &sink,
             )
             .await?;
-            Ok::<_, weathered_core::Error>(format!(
-                "{} libraries, {} assets",
-                report.libraries, report.assets
-            ))
+            let mut detail = format!("stored {}", item.id);
+            if create_instance {
+                let name = if item.kind == "vanilla" {
+                    item.game_version.clone()
+                } else {
+                    format!("{} {}", item.kind, item.game_version)
+                };
+                let instance = instance::create(&layout, &name, &item.id, "", "")?;
+                detail = format!("instance {}", instance.name);
+            }
+            Ok::<_, weathered_core::Error>(detail)
         }
         .await;
         let (ok, detail) = match outcome {
@@ -346,9 +380,100 @@ fn spawn_install(tx: mpsc::Sender<Msg>, game_dir: PathBuf, version: String) {
     });
 }
 
+fn spawn_create(tx: mpsc::Sender<Msg>, game_dir: PathBuf, catalog_id: String) {
+    tokio::task::spawn_blocking(move || {
+        let layout = DataLayout::new(&game_dir);
+        let item = match weathered_core::catalog::CatalogItem::load(&layout, &catalog_id) {
+            Ok(item) => item,
+            Err(err) => {
+                let _ = tx.blocking_send(Msg::Notice {
+                    text: err.to_string(),
+                    error: true,
+                });
+                return;
+            }
+        };
+        match instance::create(&layout, &item.name, &catalog_id, "", "") {
+            Ok(instance) => {
+                let _ = tx.blocking_send(Msg::InstallFinished {
+                    version: instance.game_version,
+                    ok: true,
+                    detail: format!("instance {}", instance.name),
+                });
+            }
+            Err(err) => {
+                let _ = tx.blocking_send(Msg::Notice {
+                    text: err.to_string(),
+                    error: true,
+                });
+            }
+        }
+    });
+}
+
+fn spawn_import(tx: mpsc::Sender<Msg>, game_dir: PathBuf, path: String, jobs: usize) {
+    tokio::spawn(async move {
+        let sink = ProgressSink::new({
+            let tx = tx.clone();
+            move |event| {
+                let _ = tx.try_send(Msg::Progress {
+                    version: "modpack".into(),
+                    stage: event.stage,
+                    completed: event.completed,
+                    total: event.total,
+                    detail: event.detail,
+                    launching: false,
+                });
+            }
+        });
+        let client = match build_http_client() {
+            Ok(client) => client,
+            Err(err) => {
+                let _ = tx
+                    .send(Msg::Notice {
+                        text: err.to_string(),
+                        error: true,
+                    })
+                    .await;
+                return;
+            }
+        };
+        let layout = DataLayout::new(&game_dir);
+        match instance::import_mrpack(
+            &client,
+            &layout,
+            PathBuf::from(&path).as_path(),
+            None,
+            &OsInfo::current(),
+            jobs,
+            &sink,
+        )
+        .await
+        {
+            Ok(instance) => {
+                let _ = tx
+                    .send(Msg::InstallFinished {
+                        version: instance.game_version,
+                        ok: true,
+                        detail: format!("imported {}", instance.name),
+                    })
+                    .await;
+            }
+            Err(err) => {
+                let _ = tx
+                    .send(Msg::Notice {
+                        text: err.to_string(),
+                        error: true,
+                    })
+                    .await;
+            }
+        }
+    });
+}
+
 fn spawn_launch(tx: mpsc::Sender<Msg>, params: LaunchParams, control: LaunchControl) {
     let progress_tx = tx.clone();
-    let version_for_progress = params.version.clone();
+    let version_for_progress = params.instance_id.clone();
     tokio::spawn(async move {
         let sink = ProgressSink::new(move |event| {
             let _ = progress_tx.try_send(Msg::Progress {
@@ -365,7 +490,7 @@ fn spawn_launch(tx: mpsc::Sender<Msg>, params: LaunchParams, control: LaunchCont
                 return Err(weathered_core::Error::message("launch cancelled"));
             }
             let client = build_http_client()?;
-            let paths = GamePaths::new(&params.game_dir);
+            let layout = DataLayout::new(&params.game_dir);
             let mut config = Config::load()?;
             let client_id = config.ensure_client_id();
             let session = if params.offline {
@@ -373,11 +498,12 @@ fn spawn_launch(tx: mpsc::Sender<Msg>, params: LaunchParams, control: LaunchCont
             } else {
                 microsoft_session(&client, &params.account_uuid, &config).await?
             };
-            let plan = prepare_launch(
+            let plan = instance::prepare_launch(
                 &client,
-                &paths,
+                &layout,
+                &params.instance_id,
                 LaunchRequest {
-                    version_id: params.version.clone(),
+                    version_id: params.instance_id.clone(),
                     session,
                     java: if params.java_path.is_empty() {
                         None

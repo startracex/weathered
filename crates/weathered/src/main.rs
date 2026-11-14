@@ -11,12 +11,13 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use weathered_core::auth::{AccountStore, MicrosoftAuth, Session};
 use weathered_core::config::{resolve_ms_client_id, Config};
+use weathered_core::content::{self, Loader};
 use weathered_core::download::build_http_client;
-use weathered_core::install::{install_version, InstallOptions};
+use weathered_core::instance::{self};
 use weathered_core::java::{self, JavaMode};
 use weathered_core::launch::{prepare_launch, spawn, LaunchRequest};
 use weathered_core::manifest::{self, VersionKind};
-use weathered_core::paths::GamePaths;
+use weathered_core::paths::{DataLayout, GamePaths};
 use weathered_core::platform::OsInfo;
 use weathered_core::progress::{ProgressEvent, ProgressSink};
 use weathered_core::rules::FeatureSet;
@@ -29,12 +30,17 @@ mod tui;
     name = "weathered",
     version,
     about = "Weathered Launcher for Minecraft: Java Edition",
-    after_help = "Examples:\n  weathered\n  weathered tui\n  weathered list\n  weathered install 1.21.1\n  weathered launch 1.21.1 --username Steve\n  weathered login --client-id <azure-app-id>"
+    after_help = "Examples:\n  weathered\n  weathered download 1.21.1\n  weathered download 1.21.1 --loader fabric\n  weathered instance create --name Skyblock 1.21.1 --loader fabric\n  weathered instance import pack.mrpack\n  weathered launch Skyblock --username Steve"
 )]
 struct Cli {
-    /// Game directory. Defaults to $WEATHERED_GAME_DIR or the platform data directory.
+    /// Data directory. Holds the store, instances, and any legacy game files.
+    /// Defaults to $WEATHERED_GAME_DIR or the platform data directory.
     #[arg(long, global = true, value_name = "DIR")]
     game_dir: Option<PathBuf>,
+
+    /// Concurrent downloads. Defaults to 16, or download_jobs in the config.
+    #[arg(long, global = true, value_name = "N")]
+    jobs: Option<usize>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -54,21 +60,46 @@ enum Command {
         #[arg(long)]
         search: Option<String>,
     },
-    /// Download a version, its libraries, natives, and assets.
+    /// Download a version into the shared store. Does not create an instance.
     Install {
-        /// Version id, or `release` / `snapshot` for the latest of that channel.
+        /// Version id, or `release` / `snapshot`. For Forge or NeoForge, the loader version.
         version: String,
+        /// `vanilla`, `fabric`, `quilt`, `forge`, or `neoforge`.
+        #[arg(long, default_value = "vanilla")]
+        loader: String,
+        /// Loader build. Fabric and Quilt default to the newest stable build.
+        #[arg(long)]
+        loader_version: Option<String>,
         /// Do not download a Java runtime.
         #[arg(long)]
         no_java: bool,
         /// Download Mojang's Java runtime even when a matching JDK is already installed.
         #[arg(long, conflicts_with = "no_java")]
         download_java: bool,
-        /// Concurrent downloads.
-        #[arg(long, default_value_t = 32, value_name = "N")]
-        jobs: usize,
     },
-    /// Launch an installed version.
+    /// Alias of install.
+    Download {
+        /// Version id, or a Forge/NeoForge version.
+        version: String,
+        /// `vanilla`, `fabric`, `quilt`, `forge`, or `neoforge`.
+        #[arg(long, default_value = "vanilla")]
+        loader: String,
+        /// Loader build. Fabric and Quilt default to the newest stable build.
+        #[arg(long)]
+        loader_version: Option<String>,
+        /// Do not download a Java runtime.
+        #[arg(long)]
+        no_java: bool,
+        /// Download Mojang's Java runtime even when a matching JDK is already installed.
+        #[arg(long, conflicts_with = "no_java")]
+        download_java: bool,
+    },
+    /// Create, list, import, or delete instances.
+    Instance {
+        #[command(subcommand)]
+        action: InstanceCmd,
+    },
+    /// Launch an instance. A legacy version id still launches the old game directory.
     Launch(Box<LaunchArgs>),
     /// Sign in with a Microsoft account using the device-code flow.
     Login {
@@ -89,7 +120,7 @@ enum Command {
 
 #[derive(Debug, clap::Args)]
 struct LaunchArgs {
-    /// Version id, or `release` / `snapshot`.
+    /// Instance name or id. A version id launches a legacy install when no instance matches.
     version: String,
     /// Offline username. Omit this to use a saved Microsoft account.
     #[arg(long, conflicts_with = "account")]
@@ -133,6 +164,45 @@ struct LaunchArgs {
     /// Print the launch command before starting the game.
     #[arg(long)]
     verbose: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum InstanceCmd {
+    /// List instances.
+    List,
+    /// Create an instance from the store, downloading the profile first if needed.
+    Create {
+        /// Display name.
+        #[arg(long)]
+        name: String,
+        /// Catalog id or Minecraft version.
+        version: String,
+        /// `vanilla`, `fabric`, or `quilt`.
+        #[arg(long, default_value = "vanilla")]
+        loader: String,
+        /// Loader build. Defaults to the newest stable Fabric or Quilt loader.
+        #[arg(long)]
+        loader_version: Option<String>,
+        /// Heap override stored on the instance, such as `4G`.
+        #[arg(long)]
+        memory: Option<String>,
+        /// Java binary stored on the instance.
+        #[arg(long)]
+        java: Option<PathBuf>,
+    },
+    /// Import a Modrinth `.mrpack`.
+    Import {
+        /// Path to the `.mrpack` file.
+        pack: PathBuf,
+        /// Instance name. Defaults to the pack name.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Delete an instance. A legacy instance only removes its metadata.
+    Delete {
+        /// Instance name or id.
+        instance: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -192,7 +262,11 @@ async fn run() -> Result<i32> {
         None | Some(Command::Tui) => return tui::run(cli.game_dir).await,
         Some(command) => command,
     };
-    let paths = GamePaths::new(game_dir(cli.game_dir));
+    let paths = GamePaths::new(game_dir(cli.game_dir.clone()));
+    let layout = DataLayout::new(paths.root.clone());
+    let jobs = cli
+        .jobs
+        .unwrap_or_else(|| Config::load().map(|config| config.jobs()).unwrap_or(16));
     match command {
         Command::Tui => unreachable!(),
         Command::List {
@@ -202,16 +276,39 @@ async fn run() -> Result<i32> {
         } => cmd_list(&paths, kind, limit, search.as_deref()).await,
         Command::Install {
             version,
+            loader,
+            loader_version,
             no_java,
             download_java,
-            jobs,
+        }
+        | Command::Download {
+            version,
+            loader,
+            loader_version,
+            no_java,
+            download_java,
         } => {
-            cmd_install(&paths, &version, no_java, download_java, jobs).await?;
+            cmd_download(
+                &layout,
+                &version,
+                &loader,
+                loader_version.as_deref(),
+                no_java,
+                download_java,
+                jobs,
+            )
+            .await?;
+            Ok(0)
+        }
+        Command::Instance { action } => {
+            cmd_instance(&layout, action, jobs).await?;
             Ok(0)
         }
         Command::Launch(args) => {
             cmd_launch(LaunchCli {
                 paths: &paths,
+                layout: &layout,
+                jobs,
                 version: args.version,
                 username: args.username,
                 account: args.account,
@@ -295,9 +392,11 @@ async fn cmd_list(
     Ok(0)
 }
 
-async fn cmd_install(
-    paths: &GamePaths,
+async fn cmd_download(
+    layout: &DataLayout,
     version: &str,
+    loader: &str,
+    loader_version: Option<&str>,
     no_java: bool,
     download_java: bool,
     jobs: usize,
@@ -309,40 +408,172 @@ async fn cmd_install(
     } else {
         JavaMode::Auto
     };
-    println!("Installing {version} into {}", paths.root.display());
+    let parsed = Loader::parse(loader)?;
+    println!(
+        "Downloading {version} ({}) into {}",
+        parsed.as_str(),
+        layout.store_root().display()
+    );
     let client = build_http_client()?;
-    let report = install_version(
+    let os = OsInfo::current();
+    let item = content::download(
         &client,
-        paths,
-        &InstallOptions {
-            version: version.to_string(),
-            os: OsInfo::current(),
+        layout,
+        content::DownloadRequest {
+            version,
+            loader: parsed,
+            loader_version,
+            os: &os,
             concurrency: jobs,
-            java: java_mode,
+            java_mode,
         },
         &cli_progress(),
     )
     .await?;
-    if report.used_cached_manifest {
-        eprintln!("warning: the version manifest came from the local cache");
-    }
     println!();
-    println!("Installed {} ({})", report.version_id, report.version_type);
-    println!("  directory: {}", paths.root.display());
-    println!("  client:    {}", report.client_jar.display());
-    println!("  libraries: {} on the classpath", report.libraries);
-    println!("  natives:   {} extracted", report.natives);
-    println!("  assets:    {}", report.assets);
-    println!(
-        "  files:     {} downloaded, {} already valid",
-        report.files_downloaded, report.files_cached
-    );
-    println!("  java:      {}", report.java_note);
+    println!("Stored {} ({})", item.name, item.id);
+    if item.launchable {
+        println!(
+            "Create an instance with `{LAUNCHER_NAME} instance create --name <name> {}`",
+            item.id
+        );
+    } else {
+        println!("{}", item.note);
+    }
+    Ok(())
+}
+
+async fn download_for_instance(
+    client: &reqwest::Client,
+    layout: &DataLayout,
+    version: &str,
+    loader: Loader,
+    loader_version: Option<&str>,
+    jobs: usize,
+) -> Result<weathered_core::catalog::CatalogItem> {
+    let os = OsInfo::current();
+    content::download(
+        client,
+        layout,
+        content::DownloadRequest {
+            version,
+            loader,
+            loader_version,
+            os: &os,
+            concurrency: jobs,
+            java_mode: JavaMode::Auto,
+        },
+        &cli_progress(),
+    )
+    .await
+    .map_err(Into::into)
+}
+
+async fn cmd_instance(layout: &DataLayout, action: InstanceCmd, jobs: usize) -> Result<()> {
+    let _ = instance::migrate_legacy(layout)?;
+    match action {
+        InstanceCmd::List => {
+            let items = instance::list(layout)?;
+            if items.is_empty() {
+                println!(
+                    "No instances. Download a version, then run `{LAUNCHER_NAME} instance create`."
+                );
+                return Ok(());
+            }
+            println!("{:<16} {:<16} {:<10} LOADER", "ID", "NAME", "VERSION");
+            for item in items {
+                let loader = if item.loader_version.is_empty() {
+                    item.loader.clone()
+                } else {
+                    format!("{} {}", item.loader, item.loader_version)
+                };
+                println!(
+                    "{:<16} {:<16} {:<10} {loader}",
+                    item.id, item.name, item.game_version
+                );
+            }
+        }
+        InstanceCmd::Create {
+            name,
+            version,
+            loader,
+            loader_version,
+            memory,
+            java,
+        } => {
+            let parsed = Loader::parse(&loader)?;
+            let client = build_http_client()?;
+            let item = if let Some(existing) = weathered_core::catalog::find(layout, &version)? {
+                if existing.kind == parsed.as_str()
+                    || (parsed == Loader::Vanilla && existing.id == version)
+                {
+                    existing
+                } else {
+                    download_for_instance(
+                        &client,
+                        layout,
+                        &version,
+                        parsed,
+                        loader_version.as_deref(),
+                        jobs,
+                    )
+                    .await?
+                }
+            } else {
+                download_for_instance(
+                    &client,
+                    layout,
+                    &version,
+                    parsed,
+                    loader_version.as_deref(),
+                    jobs,
+                )
+                .await?
+            };
+            let instance = instance::create(
+                layout,
+                &name,
+                &item.id,
+                memory.as_deref().unwrap_or(""),
+                java.as_deref()
+                    .map(|path| path.display().to_string())
+                    .as_deref()
+                    .unwrap_or(""),
+            )?;
+            println!(
+                "Created instance {} ({}) at {}",
+                instance.name, instance.id, instance.game_dir
+            );
+        }
+        InstanceCmd::Import { pack, name } => {
+            let client = build_http_client()?;
+            let instance = instance::import_mrpack(
+                &client,
+                layout,
+                &pack,
+                name.as_deref(),
+                &OsInfo::current(),
+                jobs,
+                &cli_progress(),
+            )
+            .await?;
+            println!(
+                "Imported {} ({}) for {} {}",
+                instance.name, instance.id, instance.loader, instance.game_version
+            );
+        }
+        InstanceCmd::Delete { instance } => {
+            let removed = instance::delete(layout, &instance)?;
+            println!("Deleted instance {} ({})", removed.name, removed.id);
+        }
+    }
     Ok(())
 }
 
 struct LaunchCli<'a> {
     paths: &'a GamePaths,
+    layout: &'a DataLayout,
+    jobs: usize,
     version: String,
     username: Option<String>,
     account: Option<String>,
@@ -387,33 +618,40 @@ async fn cmd_launch(args: LaunchCli<'_>) -> Result<i32> {
     };
 
     let client = build_http_client()?;
-    let plan = prepare_launch(
-        &client,
-        args.paths,
-        LaunchRequest {
-            version_id: args.version,
-            session,
-            java: args.java,
-            memory: args.memory,
-            os: OsInfo::current(),
-            features,
-            client_id,
-            quick_play_path: args.quick_play_path.unwrap_or_default(),
-            quick_play_singleplayer: args.quick_play_singleplayer.unwrap_or_default(),
-            quick_play_multiplayer: args.quick_play_multiplayer.unwrap_or_default(),
-            quick_play_realms: args.quick_play_realms.unwrap_or_default(),
-            width: args.width,
-            height: args.height,
-            java_mode: if args.no_java {
-                JavaMode::Skip
-            } else {
-                JavaMode::Auto
-            },
-            concurrency: 32,
+    let _ = instance::migrate_legacy(args.layout)?;
+    let request = LaunchRequest {
+        version_id: args.version.clone(),
+        session,
+        java: args.java,
+        memory: args.memory,
+        os: OsInfo::current(),
+        features,
+        client_id,
+        quick_play_path: args.quick_play_path.unwrap_or_default(),
+        quick_play_singleplayer: args.quick_play_singleplayer.unwrap_or_default(),
+        quick_play_multiplayer: args.quick_play_multiplayer.unwrap_or_default(),
+        quick_play_realms: args.quick_play_realms.unwrap_or_default(),
+        width: args.width,
+        height: args.height,
+        java_mode: if args.no_java {
+            JavaMode::Skip
+        } else {
+            JavaMode::Auto
         },
-        &cli_progress(),
-    )
-    .await?;
+        concurrency: args.jobs,
+    };
+    let plan = if instance::find(args.layout, &args.version)?.is_some() {
+        instance::prepare_launch(
+            &client,
+            args.layout,
+            &args.version,
+            request,
+            &cli_progress(),
+        )
+        .await?
+    } else {
+        prepare_launch(&client, args.paths, request, &cli_progress()).await?
+    };
 
     if let Some(warning) = &plan.java_warning {
         eprintln!("warning: {warning}");
@@ -616,49 +854,62 @@ fn valid_memory(memory: &str) -> bool {
 }
 
 fn cli_progress() -> ProgressSink {
-    let last = Mutex::new(None::<(String, u64, Instant)>);
+    let last = Mutex::new(None::<Instant>);
     let tty = io::stderr().is_terminal();
     ProgressSink::new(move |event: ProgressEvent| {
         let mut last = last.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let stage_changed = last
-            .as_ref()
-            .map(|(stage, _, _)| stage != &event.stage)
-            .unwrap_or(true);
         let due = last
-            .as_ref()
-            .map(|(_, _, when)| when.elapsed().as_millis() >= 200)
+            .map(|when| when.elapsed().as_millis() >= 100)
             .unwrap_or(true);
-        let milestone = event.completed == event.total
-            || event.completed == 1
-            || event.completed.is_multiple_of(50);
-        if !tty && !stage_changed && !milestone {
+        let finished = event.total > 0 && event.completed >= event.total;
+        if !finished && !due {
             return;
         }
-        if tty && !stage_changed && !due && event.completed != event.total {
-            return;
-        }
-        *last = Some((event.stage.clone(), event.completed, Instant::now()));
-        let detail = shorten(&event.detail, 72);
+        *last = Some(Instant::now());
+        let line = format_bar(&event);
         if tty {
-            let _ = write!(
-                io::stderr(),
-                "\r\x1b[2K{:<12} {:>5}/{}  {}",
-                event.stage,
-                event.completed,
-                event.total,
-                detail
-            );
-            if event.completed == event.total {
+            let _ = write!(io::stderr(), "\r\x1b[2K{line}");
+            if finished {
                 let _ = writeln!(io::stderr());
             }
             let _ = io::stderr().flush();
-        } else {
-            eprintln!(
-                "{:<12} {:>5}/{}  {}",
-                event.stage, event.completed, event.total, detail
-            );
+        } else if finished || event.completed == 0 || event.completed.is_multiple_of(1024 * 1024) {
+            eprintln!("{line}");
         }
     })
+}
+
+fn format_bar(event: &ProgressEvent) -> String {
+    let percent = event
+        .completed
+        .saturating_mul(100)
+        .checked_div(event.total)
+        .unwrap_or(0)
+        .min(100);
+    let width = 24usize;
+    let filled = (width as u64 * percent / 100) as usize;
+    let bar = format!("{}{}", "█".repeat(filled), "░".repeat(width - filled));
+    let detail = shorten(&event.detail, 48);
+    format!(
+        "[{bar}] {percent:>3}%  {}/{}  {detail}",
+        format_bytes(event.completed),
+        format_bytes(event.total)
+    )
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 fn shorten(text: &str, max: usize) -> String {
