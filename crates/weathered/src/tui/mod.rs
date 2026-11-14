@@ -22,23 +22,23 @@ use crossterm::event::{
     MouseEventKind,
 };
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use crossterm::{cursor, execute, terminal};
 use futures::StreamExt;
 use model::{App, DetectedJava, Effect, Key, Mouse, Msg, Profile};
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use weathered_core::auth::{AccountStore, MicrosoftAuth};
 use weathered_core::cancel::CancelFlag;
-use weathered_core::config::{resolve_ms_client_id, Config};
+use weathered_core::config::{Config, resolve_ms_client_id};
 use weathered_core::content::{self, Loader};
 use weathered_core::download::build_http_client;
 use weathered_core::instance;
 use weathered_core::java::{self, JavaMode};
-use weathered_core::launch::{spawn_captured, LaunchRequest};
+use weathered_core::launch::{LaunchRequest, spawn_captured};
 use weathered_core::manifest;
 use weathered_core::paths::DataLayout;
 use weathered_core::paths::GamePaths;
@@ -87,7 +87,9 @@ pub async fn run(game_dir: Option<PathBuf>) -> Result<i32> {
     let mut events = EventStream::new();
     let mut launch_control: Option<LaunchControl> = None;
     let mut login_task: Option<JoinHandle<()>> = None;
-    let mut download_task: Option<DownloadTask> = None;
+    weathered_core::store::DownloadSlots::install(config.jobs());
+    let mut download_tasks: Vec<DownloadTask> = Vec::new();
+    let mut picker_task: Option<DownloadTask> = None;
 
     loop {
         guard.terminal.draw(|frame| view::draw(frame, &mut app))?;
@@ -100,13 +102,13 @@ pub async fn run(game_dir: Option<PathBuf>) -> Result<i32> {
                     Some(Ok(Event::Key(key))) => {
                         if let Some(mapped) = map_key(key) {
                             let effect = app.on_key(mapped);
-                            dispatch(&mut app, effect, &mut config, &tx, &mut launch_control, &mut login_task, &mut download_task).await;
+                            dispatch(&mut app, effect, &mut config, &tx, &mut launch_control, &mut login_task, &mut download_tasks, &mut picker_task).await;
                         }
                     }
                     Some(Ok(Event::Mouse(mouse))) => {
                         if let Some(mapped) = map_mouse(mouse) {
                             let effect = app.on_mouse(mapped);
-                            dispatch(&mut app, effect, &mut config, &tx, &mut launch_control, &mut login_task, &mut download_task).await;
+                            dispatch(&mut app, effect, &mut config, &tx, &mut launch_control, &mut login_task, &mut download_tasks, &mut picker_task).await;
                         }
                     }
                     Some(Ok(Event::Resize(_, _))) => {}
@@ -128,13 +130,15 @@ pub async fn run(game_dir: Option<PathBuf>) -> Result<i32> {
     if let Some(task) = login_task.take() {
         task.abort();
     }
-    stop_download(&mut download_task);
+    stop_all_downloads(&mut download_tasks);
+    stop_download(&mut picker_task);
     if let Some(control) = launch_control.take() {
         control.cancel();
     }
     Ok(0)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     app: &mut App,
     effect: Effect,
@@ -142,16 +146,18 @@ async fn dispatch(
     tx: &mpsc::Sender<Msg>,
     launch_control: &mut Option<LaunchControl>,
     login_task: &mut Option<JoinHandle<()>>,
-    download_task: &mut Option<DownloadTask>,
+    download_tasks: &mut Vec<DownloadTask>,
+    picker_task: &mut Option<DownloadTask>,
 ) {
     match effect {
         Effect::None => {}
         Effect::Quit => {
-            stop_download(download_task);
+            stop_all_downloads(download_tasks);
+            stop_download(picker_task);
             app.quit = true;
         }
-        Effect::CancelJob => {
-            stop_download(download_task);
+        Effect::CancelJob { id } => {
+            stop_one_download(download_tasks, id);
         }
         Effect::Save => {
             if let Err(err) = persist(app, config) {
@@ -164,16 +170,17 @@ async fn dispatch(
             spawn_catalog(tx.clone(), app.game_dir.clone());
         }
         Effect::Install {
+            id,
             version,
             loader,
             loader_version,
             create_instance,
         } => {
-            stop_download(download_task);
             let cancel = CancelFlag::new();
             let handle = spawn_install(
                 tx.clone(),
                 app.game_dir.clone(),
+                id,
                 version,
                 loader,
                 loader_version,
@@ -181,21 +188,25 @@ async fn dispatch(
                 config.jobs(),
                 cancel.clone(),
             );
-            *download_task = Some(DownloadTask { cancel, handle });
+            download_tasks.push(DownloadTask { id, cancel, handle });
         }
         Effect::OpenPicker {
             version,
             loader,
             create_instance,
         } => {
-            stop_download(download_task);
+            stop_download(picker_task);
             let cancel = CancelFlag::new();
             let handle =
                 spawn_loader_list(tx.clone(), version, loader, create_instance, cancel.clone());
-            *download_task = Some(DownloadTask { cancel, handle });
+            *picker_task = Some(DownloadTask {
+                id: 0,
+                cancel,
+                handle,
+            });
         }
         Effect::ClosePicker => {
-            stop_download(download_task);
+            stop_download(picker_task);
         }
         Effect::DeleteInstance => {
             let layout = DataLayout::new(&app.game_dir);
@@ -292,17 +303,17 @@ async fn dispatch(
         Effect::CreateInstance { catalog_id } => {
             spawn_create(tx.clone(), app.game_dir.clone(), catalog_id);
         }
-        Effect::ImportPack { path } => {
-            stop_download(download_task);
+        Effect::ImportPack { id, path } => {
             let cancel = CancelFlag::new();
             let handle = spawn_import(
                 tx.clone(),
                 app.game_dir.clone(),
+                id,
                 path,
                 config.jobs(),
                 cancel.clone(),
             );
-            *download_task = Some(DownloadTask { cancel, handle });
+            download_tasks.push(DownloadTask { id, cancel, handle });
         }
         Effect::Launch => {
             if let Some(previous) = launch_control.take() {
@@ -319,6 +330,13 @@ async fn dispatch(
                 .selected_instance()
                 .map(|item| item.id.clone())
                 .unwrap_or_default();
+            let launch_id = app
+                .jobs
+                .iter()
+                .rev()
+                .find(|job| job.launching)
+                .map(|job| job.id)
+                .unwrap_or(0);
             spawn_launch(
                 tx.clone(),
                 LaunchParams {
@@ -331,6 +349,7 @@ async fn dispatch(
                     account_uuid,
                 },
                 control.clone(),
+                launch_id,
             );
             *launch_control = Some(control);
         }
@@ -456,12 +475,28 @@ fn spawn_javas(tx: mpsc::Sender<Msg>, game_dir: PathBuf) {
 }
 
 struct DownloadTask {
+    id: u64,
     cancel: CancelFlag,
     handle: JoinHandle<()>,
 }
 
 fn stop_download(task: &mut Option<DownloadTask>) {
     if let Some(task) = task.take() {
+        task.cancel.cancel();
+        task.handle.abort();
+    }
+}
+
+fn stop_one_download(tasks: &mut Vec<DownloadTask>, id: u64) {
+    if let Some(index) = tasks.iter().position(|task| task.id == id) {
+        let task = tasks.remove(index);
+        task.cancel.cancel();
+        task.handle.abort();
+    }
+}
+
+fn stop_all_downloads(tasks: &mut Vec<DownloadTask>) {
+    for task in tasks.drain(..) {
         task.cancel.cancel();
         task.handle.abort();
     }
@@ -506,6 +541,7 @@ fn spawn_loader_list(
 fn spawn_install(
     tx: mpsc::Sender<Msg>,
     game_dir: PathBuf,
+    id: u64,
     version: String,
     loader: String,
     loader_version: Option<String>,
@@ -518,6 +554,7 @@ fn spawn_install(
     tokio::spawn(async move {
         let sink = ProgressSink::new(move |event| {
             let _ = progress_tx.try_send(Msg::Progress {
+                id,
                 version: version_for_progress.clone(),
                 stage: event.stage,
                 completed: event.completed,
@@ -567,6 +604,7 @@ fn spawn_install(
         };
         let _ = tx
             .send(Msg::InstallFinished {
+                id,
                 version,
                 ok,
                 detail,
@@ -591,6 +629,7 @@ fn spawn_create(tx: mpsc::Sender<Msg>, game_dir: PathBuf, catalog_id: String) {
         match instance::create(&layout, &item.name, &catalog_id, "", "") {
             Ok(instance) => {
                 let _ = tx.blocking_send(Msg::InstallFinished {
+                    id: 0,
                     version: instance.game_version,
                     ok: true,
                     detail: format!("instance {}", instance.name),
@@ -609,6 +648,7 @@ fn spawn_create(tx: mpsc::Sender<Msg>, game_dir: PathBuf, catalog_id: String) {
 fn spawn_import(
     tx: mpsc::Sender<Msg>,
     game_dir: PathBuf,
+    id: u64,
     path: String,
     jobs: usize,
     cancel: CancelFlag,
@@ -618,6 +658,7 @@ fn spawn_import(
             let tx = tx.clone();
             move |event| {
                 let _ = tx.try_send(Msg::Progress {
+                    id,
                     version: "modpack".into(),
                     stage: event.stage,
                     completed: event.completed,
@@ -655,6 +696,7 @@ fn spawn_import(
             Ok(instance) => {
                 let _ = tx
                     .send(Msg::InstallFinished {
+                        id,
                         version: instance.game_version,
                         ok: true,
                         detail: format!("imported {}", instance.name),
@@ -674,12 +716,13 @@ fn spawn_import(
     })
 }
 
-fn spawn_launch(tx: mpsc::Sender<Msg>, params: LaunchParams, control: LaunchControl) {
+fn spawn_launch(tx: mpsc::Sender<Msg>, params: LaunchParams, control: LaunchControl, id: u64) {
     let progress_tx = tx.clone();
     let version_for_progress = params.instance_id.clone();
     tokio::spawn(async move {
         let sink = ProgressSink::new(move |event| {
             let _ = progress_tx.try_send(Msg::Progress {
+                id,
                 version: version_for_progress.clone(),
                 stage: event.stage,
                 completed: event.completed,
@@ -775,11 +818,12 @@ fn spawn_launch(tx: mpsc::Sender<Msg>, params: LaunchParams, control: LaunchCont
         .await;
         match started {
             Ok(()) => {
-                let _ = tx.send(Msg::GameStarted).await;
+                let _ = tx.send(Msg::GameStarted { id }).await;
             }
             Err(err) => {
                 let _ = tx
                     .send(Msg::LaunchFailed {
+                        id,
                         detail: err.to_string(),
                     })
                     .await;
@@ -912,10 +956,10 @@ impl LaunchControl {
     }
 
     fn kill(&self) {
-        if let Ok(mut guard) = self.inner.child.lock() {
-            if let Some(child) = guard.as_mut() {
-                let _ = child.kill();
-            }
+        if let Ok(mut guard) = self.inner.child.lock()
+            && let Some(child) = guard.as_mut()
+        {
+            let _ = child.kill();
         }
     }
 
@@ -1165,11 +1209,12 @@ mod tests {
         ));
         let (path, file) = create_launch_log(&root).unwrap();
         assert!(path.starts_with(root.join("logs")));
-        assert!(path
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .starts_with("launch-"));
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("launch-")
+        );
         append_log(&Mutex::new(file), "log4j example");
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("log4j example"));

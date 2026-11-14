@@ -7,15 +7,15 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use weathered_core::auth::{AccountStore, MicrosoftAuth, Session};
-use weathered_core::config::{resolve_ms_client_id, Config};
+use weathered_core::config::{Config, resolve_ms_client_id};
 use weathered_core::content::{self, Loader};
 use weathered_core::download::build_http_client;
 use weathered_core::instance::{self};
 use weathered_core::java::{self, JavaMode};
-use weathered_core::launch::{prepare_launch, spawn, LaunchRequest};
+use weathered_core::launch::{LaunchRequest, prepare_launch, spawn};
 use weathered_core::manifest::{self, VersionKind};
 use weathered_core::paths::{DataLayout, GamePaths};
 use weathered_core::platform::OsInfo;

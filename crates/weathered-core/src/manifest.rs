@@ -113,15 +113,15 @@ impl VersionManifest {
         self.versions
             .iter()
             .filter(|entry| {
-                if let Some(kinds) = kinds {
-                    if !kinds.iter().any(|kind| entry.version_type == kind.as_str()) {
-                        return false;
-                    }
+                if let Some(kinds) = kinds
+                    && !kinds.iter().any(|kind| entry.version_type == kind.as_str())
+                {
+                    return false;
                 }
-                if let Some(needle) = &needle {
-                    if !entry.id.to_ascii_lowercase().contains(needle) {
-                        return false;
-                    }
+                if let Some(needle) = &needle
+                    && !entry.id.to_ascii_lowercase().contains(needle)
+                {
+                    return false;
                 }
                 true
             })

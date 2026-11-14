@@ -16,11 +16,11 @@ use crate::catalog::CatalogItem;
 use crate::content::{self, Loader};
 use crate::error::{Error, IoResultExt, Result};
 use crate::java::{self, JavaMode};
-use crate::launch::{self, build_launch_plan, LaunchPlan, LaunchRequest, LaunchSpec};
-use crate::library::{self, plan_libraries, NativeJar};
+use crate::launch::{self, LaunchPlan, LaunchRequest, LaunchSpec, build_launch_plan};
+use crate::library::{self, NativeJar, plan_libraries};
 use crate::manifest::VersionManifest;
 use crate::modpack::{self, MrPack};
-use crate::paths::{validate_version_id, DataLayout, GamePaths};
+use crate::paths::{DataLayout, GamePaths, validate_version_id};
 use crate::platform::OsInfo;
 use crate::progress::ProgressSink;
 use crate::rules::FeatureSet;
@@ -597,29 +597,28 @@ pub async fn prepare_launch(
     .await
     .map_err(|err| Error::message(format!("could not extract natives: {err}")))??;
 
-    if let Some(index_ref) = resolved.info.asset_index.clone() {
-        if let Some(sha512) = store.lookup_sha1(&index_ref.sha1)? {
-            let index_path = store.object_path(&sha512)?;
-            let bytes = std::fs::read(&index_path).map_err(|err| Error::io(&index_path, err))?;
-            let store = store.clone();
-            let layout = layout.clone();
-            let index_id = index_ref.id.clone();
-            tokio::task::spawn_blocking(move || {
-                content::publish_assets(&store, &layout, &index_id, &bytes, &CancelFlag::new())
-            })
-            .await
-            .map_err(|err| Error::message(format!("could not link assets: {err}")))??;
-        }
+    if let Some(index_ref) = resolved.info.asset_index.clone()
+        && let Some(sha512) = store.lookup_sha1(&index_ref.sha1)?
+    {
+        let index_path = store.object_path(&sha512)?;
+        let bytes = std::fs::read(&index_path).map_err(|err| Error::io(&index_path, err))?;
+        let store = store.clone();
+        let layout = layout.clone();
+        let index_id = index_ref.id.clone();
+        tokio::task::spawn_blocking(move || {
+            content::publish_assets(&store, &layout, &index_id, &bytes, &CancelFlag::new())
+        })
+        .await
+        .map_err(|err| Error::message(format!("could not link assets: {err}")))??;
     }
     if let Some(logging) = resolved
         .info
         .logging
         .clone()
         .and_then(|logging| logging.client)
+        && let Some(sha512) = store.lookup_sha1(&logging.file.sha1)?
     {
-        if let Some(sha512) = store.lookup_sha1(&logging.file.sha1)? {
-            store.copy_to(&sha512, &paths.log_config(&logging.file.id))?;
-        }
+        store.copy_to(&sha512, &paths.log_config(&logging.file.id))?;
     }
 
     let data_paths = GamePaths::new(&layout.root);
@@ -743,19 +742,18 @@ async fn copy_pack_files(
 }
 
 fn locate_pack_file(store: &Store, file: &crate::modpack::MrFile) -> Result<String> {
-    if let Some(sha512) = file.sha512.as_deref() {
-        if store
+    if let Some(sha512) = file.sha512.as_deref()
+        && store
             .object_path(sha512)
             .map(|path| path.is_file())
             .unwrap_or(false)
-        {
-            return Ok(sha512.to_ascii_lowercase());
-        }
+    {
+        return Ok(sha512.to_ascii_lowercase());
     }
-    if let Some(sha1) = file.sha1.as_deref() {
-        if let Some(found) = store.lookup_sha1(sha1)? {
-            return Ok(found);
-        }
+    if let Some(sha1) = file.sha1.as_deref()
+        && let Some(found) = store.lookup_sha1(sha1)?
+    {
+        return Ok(found);
     }
     for url in &file.downloads {
         if let Some(record) = store.lookup_url(url)? {
@@ -788,10 +786,10 @@ fn classpath_from_store(
                 path.display()
             )));
         };
-        if let Some(sha1) = &file.sha1 {
-            if let Some(sha512) = store.lookup_sha1(sha1)? {
-                return store.object_path(&sha512);
-            }
+        if let Some(sha1) = &file.sha1
+            && let Some(sha512) = store.lookup_sha1(sha1)?
+        {
+            return store.object_path(&sha512);
         }
         if let Some(record) = store.lookup_url(&file.url)? {
             return store.object_path(&record.sha512);

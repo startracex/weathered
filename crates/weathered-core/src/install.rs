@@ -1,7 +1,7 @@
 //! Download a Minecraft version into a game directory.
 
 use crate::assets::{self, reconstruct_assets};
-use crate::download::{self, sha1_hex, RemoteFile};
+use crate::download::{self, RemoteFile, sha1_hex};
 use crate::error::{Error, Result};
 use crate::java::{self, JavaInstallation, JavaMode};
 use crate::library::{self, plan_libraries};

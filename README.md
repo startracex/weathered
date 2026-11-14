@@ -16,18 +16,18 @@ Synergies AB.
 - Stores the client jar, libraries, assets, loader files, and modpack files once, keyed by SHA-512.
 - Downloads vanilla, Fabric, and Quilt profiles into that store. Forge and NeoForge installers can be stored, but they are not launched yet.
 - Creates isolated instances from a downloaded profile, from a new download, or from a Modrinth `.mrpack`.
-- Downloads run concurrently, up to a configurable limit, and report one overall progress bar.
+- Downloads run concurrently, up to a configurable limit shared by every install, and report each job plus one overall progress bar.
 - Applies library and argument rules for Windows, macOS, and Linux, including architecture and feature flags.
 - Merges `inheritsFrom` versions: child libraries are prepended, and argument lists are concatenated.
 - Builds the modern `arguments` block and the legacy `minecraftArguments` string, including classpath and natives.
 - Finds a system JDK (`PATH`, `JAVA_HOME`, and common install locations) or downloads the Mojang Java runtime the version asks for.
 - Launches offline with a username. The offline UUID matches Minecraft's `OfflinePlayer:<name>` scheme.
 - Microsoft account login (device code, Xbox Live, XSTS, Minecraft Services) behind `weathered-core::auth::microsoft`. The Azure client id is not built in; you supply one.
-- A full-screen terminal UI (`weathered` or `weathered tui`) with Launch, Download, Settings, and More pages. The Launch page lists instances and a New instance button. Tabs, lists, and buttons are clickable, and the mouse wheel scrolls. Downloads show one overall progress bar.
+- A full-screen terminal UI (`weathered` or `weathered tui`) with Launch, Download, Settings, and More pages. The Launch page lists instances and a New instance button. Tabs, lists, and buttons are clickable, and the mouse wheel scrolls. Several installs can run at once and show their own progress plus one overall bar.
 
 ## Build
 
-Install a current stable Rust toolchain (1.89 or newer), then:
+Install a current stable Rust toolchain (1.89 or newer; the workspace uses Rust 2024), then:
 
 ```sh
 cargo build --release
@@ -97,11 +97,11 @@ If the data directory already contains `versions/<id>/<id>.jar` from an earlier 
 
 The layout follows Plain Craft Launcher: a top bar for Launch, Download, Settings, and More; a launch page with the account on the left and the instance list on the right; a download page split into release, snapshot, old, Fabric, Quilt, Forge, and NeoForge; and a settings page for the data directory, Java, memory, JVM arguments, offline username, and Microsoft sign-in. The screen is dark, with a weathered-copper teal for the selection and a greener Launch control.
 
-The footer lists `[Q][E] pages` with `[W][A][S][D] move`, then that page's actions, then the Ctrl combinations. On an instance row, left and right switch only between Launch and Edit. The focused button is the gold label, such as `>Launch<`, and a newly selected row starts on Launch. At startup that is the default instance, so Enter starts the game and the large Launch button is on screen. Moving to Edit hides that large button. The path in the top bar opens the data directory. Tab reaches it and Enter opens it. Text fields still accept `q`, `e`, `w`, `s`, `a`, and `d` as letters. While a field is open, the characters you type stay on screen with a cursor. Enter saves the field and Esc discards it. Ctrl+C quits.
+The footer lists `[Q][E] pages` with `[W][A][S][D] move`, then that page's actions, then the Ctrl combinations. Letter shortcuts ignore Caps Lock. On an instance row, left and right switch only between Launch and Edit. The focused button is the gold label, such as `>Launch<`, and a newly selected row starts on Launch. Clicking the name selects that row. Clicking `[Launch]` starts the game, and clicking `[Edit]` opens the editor. At startup the default instance's Launch button is focused, so Enter starts the game. Several versions can download at once, sharing one file-concurrency limit. Esc cancels the latest job. A download does not block launching a different instance. The path in the top bar opens the data directory. Tab reaches it and Enter opens it. Text fields still accept `q`, `e`, `w`, `s`, `a`, and `d` as letters, including their case. While a field is open, the characters you type stay on screen with a cursor. Enter saves the field and Esc discards it. Ctrl+C quits.
 
 The search box on Download stays hidden until Ctrl+F, and it is the only extra row between the category tabs and the version list. The first Esc clears that search. A later Esc cancels a download, closes the loader picker, or leaves the edit page. `O` cycles the instance list between name, creation time, and last played, and cycles the download list between newest, oldest, version name, and stored-first. The version panel title shows the current download order. Both choices are saved. The default instance stays pinned at the top.
 
-Each instance row ends with Launch and Edit. The focused one is drawn in gold, and the row name is not a separate stop. The large Launch button sits under the list only while Launch is focused on the default instance. Edit is its own page, with the account panel left off. It renames the instance, edits the description, sets or clears the default, deletes the instance, and sets Java, minimum memory, maximum memory, and JVM arguments. An empty override shows `inherit global` and uses the settings page value. Clearing the field returns it to that inherited value. Open folder opens the instance game directory in the system file manager. Actions run immediately. Delete removes only that instance directory. The shared store stays. Game output is written to `<data>/logs/launch-<timestamp>.log`. If the game crashes, the status line gives that path and any new file in the instance `crash-reports` directory. Fabric, Quilt, Forge, and NeoForge installs open a loader-version list first. The newest stable or recommended build is selected. `B` shows unstable builds.
+Each instance row ends with Launch and Edit. The focused one is drawn in gold, and the row name is not a separate stop. Clicking the name selects the row. Clicking Launch starts the game. Edit is its own page, with the account panel left off. It renames the instance, edits the description, sets or clears the default, deletes the instance, and sets Java, minimum memory, maximum memory, and JVM arguments. An empty override shows `inherit global` and uses the settings page value. Clearing the field returns it to that inherited value. Open folder opens the instance game directory in the system file manager. Actions run immediately. Delete removes only that instance directory. The shared store stays. Game output is written to `<data>/logs/launch-<timestamp>.log`. If the game crashes, the status line gives that path and any new file in the instance `crash-reports` directory. Fabric, Quilt, Forge, and NeoForge installs open a loader-version list first. The newest stable or recommended build is selected. `B` shows unstable builds.
 
 ```sh
 weathered --game-dir ~/.local/share/weathered
@@ -116,8 +116,7 @@ A rendered Launch page:
 │ S  Steve                     │ │ ▸ Vanilla  1.21.1  vanilla  [Launch] [Edit] │
 │    offline                   │ │   Beta     b1.7.3   vanilla  [Launch] [Edit] │
 │ Profiles                     │ │ + New instance                               │
-│ ▸ Steve          offline     │ │              Vanilla  ·  1.21.1  ·  2G        │
-│                              │ │                   LAUNCH                      │
+│ ▸ Steve          offline     │ │                                              │
 ╰──────────────────────────────╯ ╰───────────────────────────────────────────────╯
  Ready  ·  [Q][E] pages [W][A][S][D] move  Enter launch  O sort  N new  Ctrl+C quit
 ```

@@ -9,7 +9,7 @@ use crate::download::RemoteFile;
 use crate::error::{Error, IoResultExt, Result};
 use crate::paths::{portable, safe_rel_path};
 use crate::platform::{Arch, OsInfo};
-use crate::rules::{rules_allow, FeatureSet};
+use crate::rules::{FeatureSet, rules_allow};
 use crate::version::Library;
 
 const LIBRARIES_BASE: &str = "https://libraries.minecraft.net/";
@@ -75,7 +75,7 @@ pub fn parse_maven(name: &str) -> Result<MavenCoord> {
         _ => {
             return Err(Error::Maven {
                 name: name.to_string(),
-            })
+            });
         }
     };
     if group.is_empty() || artifact.is_empty() || version.is_empty() {
@@ -149,13 +149,13 @@ pub fn plan_libraries(
                     &library.name,
                 )?;
                 classpath.push(dest.clone());
-                if let Some(classifier) = coord.classifier.as_deref() {
-                    if native_matches(classifier, os) {
-                        natives.push(NativeJar {
-                            jar: dest,
-                            exclude: excludes(library),
-                        });
-                    }
+                if let Some(classifier) = coord.classifier.as_deref()
+                    && native_matches(classifier, os)
+                {
+                    natives.push(NativeJar {
+                        jar: dest,
+                        exclude: excludes(library),
+                    });
                 }
             }
         } else {
@@ -515,10 +515,11 @@ mod tests {
         assert_eq!(plan.natives.len(), 1);
         assert!(portable(&plan.natives[0].jar).ends_with("natives-linux.jar"));
         assert_eq!(plan.natives[0].exclude, vec!["META-INF/".to_string()]);
-        assert!(plan
-            .downloads
-            .iter()
-            .any(|file| file.sha1.as_deref() == Some("linux")));
+        assert!(
+            plan.downloads
+                .iter()
+                .any(|file| file.sha1.as_deref() == Some("linux"))
+        );
         assert!(!plan.downloads.iter().any(|file| file.url.contains("objc")));
 
         let windows = plan_libraries(
@@ -630,14 +631,16 @@ mod tests {
         .unwrap();
         assert_eq!(mac.natives.len(), 1);
         assert!(portable(&mac.natives[0].jar).contains("natives-macos-arm64"));
-        assert!(mac
-            .classpath
-            .iter()
-            .any(|path| portable(path).contains("natives-macos.jar")));
-        assert!(mac
-            .classpath
-            .iter()
-            .any(|path| portable(path).contains("natives-macos-arm64.jar")));
+        assert!(
+            mac.classpath
+                .iter()
+                .any(|path| portable(path).contains("natives-macos.jar"))
+        );
+        assert!(
+            mac.classpath
+                .iter()
+                .any(|path| portable(path).contains("natives-macos-arm64.jar"))
+        );
     }
 
     #[test]

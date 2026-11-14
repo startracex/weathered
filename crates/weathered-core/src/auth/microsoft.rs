@@ -280,10 +280,10 @@ impl MicrosoftAuth {
             source,
         })?;
         if !status.is_success() {
-            if let Ok(failure) = serde_json::from_slice::<XboxError>(&bytes) {
-                if let Some(code) = failure.xerr {
-                    return Err(Error::auth(xbox_error_message(code)));
-                }
+            if let Ok(failure) = serde_json::from_slice::<XboxError>(&bytes)
+                && let Some(code) = failure.xerr
+            {
+                return Err(Error::auth(xbox_error_message(code)));
             }
             return Err(Error::auth(format!(
                 "Xbox authentication failed with HTTP {status}: {}",

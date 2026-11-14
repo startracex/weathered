@@ -7,9 +7,9 @@ use serde::Deserialize;
 use crate::download::{self, sha1_hex};
 use crate::error::{Error, IoResultExt, Result};
 use crate::manifest::VersionManifest;
-use crate::paths::{validate_version_id, GamePaths};
+use crate::paths::{GamePaths, validate_version_id};
 use crate::platform::OsInfo;
-use crate::rules::{rules_allow, FeatureSet, Rule};
+use crate::rules::{FeatureSet, Rule, rules_allow};
 
 /// A resolved version, including every parent it inherits from.
 #[derive(Debug, Clone)]
@@ -592,10 +592,12 @@ mod tests {
         )
         .unwrap();
         assert!(legacy.arguments.is_none());
-        assert!(legacy
-            .minecraft_arguments
-            .unwrap()
-            .contains("${auth_player_name}"));
+        assert!(
+            legacy
+                .minecraft_arguments
+                .unwrap()
+                .contains("${auth_player_name}")
+        );
     }
 
     #[test]

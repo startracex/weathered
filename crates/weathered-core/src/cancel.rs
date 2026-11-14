@@ -4,8 +4,8 @@
 //! dropped instead of waiting out its timeout. Blocking loops call
 //! [`CancelFlag::is_cancelled`].
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::Notify;
 

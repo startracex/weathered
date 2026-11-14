@@ -14,7 +14,7 @@ use crate::paths::GamePaths;
 use crate::platform::OsInfo;
 use crate::progress::ProgressSink;
 use crate::rules::FeatureSet;
-use crate::version::{self, resolve_argument_list, VersionInfo};
+use crate::version::{self, VersionInfo, resolve_argument_list};
 use crate::{LAUNCHER_NAME, LAUNCHER_VERSION};
 
 /// Everything required to build a command line.
@@ -284,14 +284,14 @@ pub(crate) fn game_assets_dir(paths: &GamePaths, index_name: &str) -> PathBuf {
         return paths.assets();
     }
     let index_path = paths.asset_index(index_name);
-    if let Ok(bytes) = std::fs::read(&index_path) {
-        if let Ok(index) = serde_json::from_slice::<AssetIndex>(&bytes) {
-            if index.map_to_resources {
-                return paths.resources();
-            }
-            if index.virtual_assets {
-                return paths.virtual_assets(index_name);
-            }
+    if let Ok(bytes) = std::fs::read(&index_path)
+        && let Ok(index) = serde_json::from_slice::<AssetIndex>(&bytes)
+    {
+        if index.map_to_resources {
+            return paths.resources();
+        }
+        if index.virtual_assets {
+            return paths.virtual_assets(index_name);
         }
     }
     paths.assets()
@@ -762,18 +762,21 @@ mod tests {
         assert_eq!(plan.main_class, "net.minecraft.client.main.Main");
         assert_eq!(plan.jvm_args[0], "-Xmx2G");
         let natives = PathBuf::from("/natives").display().to_string();
-        assert!(plan
-            .jvm_args
-            .iter()
-            .any(|arg| arg == &format!("-Djava.library.path={natives}")));
-        assert!(plan
-            .jvm_args
-            .iter()
-            .any(|arg| arg == "-Dminecraft.launcher.brand=weathered"));
-        assert!(plan
-            .jvm_args
-            .iter()
-            .any(|arg| arg == "-Dminecraft.launcher.version=0.1.0"));
+        assert!(
+            plan.jvm_args
+                .iter()
+                .any(|arg| arg == &format!("-Djava.library.path={natives}"))
+        );
+        assert!(
+            plan.jvm_args
+                .iter()
+                .any(|arg| arg == "-Dminecraft.launcher.brand=weathered")
+        );
+        assert!(
+            plan.jvm_args
+                .iter()
+                .any(|arg| arg == "-Dminecraft.launcher.version=0.1.0")
+        );
         assert!(plan.jvm_args.iter().any(|arg| arg == "-cp"));
         let classpath = plan
             .jvm_args
@@ -784,10 +787,12 @@ mod tests {
         assert!(classpath.contains(&library));
         assert!(classpath.contains(':'));
         assert!(!classpath.contains(';'));
-        assert!(!plan
-            .jvm_args
-            .iter()
-            .any(|arg| arg.contains("XstartOnFirstThread")));
+        assert!(
+            !plan
+                .jvm_args
+                .iter()
+                .any(|arg| arg.contains("XstartOnFirstThread"))
+        );
         assert!(!plan.jvm_args.iter().any(|arg| arg.contains("HeapDump")));
         assert!(!plan.jvm_args.iter().any(|arg| arg.contains("Windows 10")));
         assert!(!plan.jvm_args.iter().any(|arg| arg == "-Xss1M"));
@@ -799,10 +804,11 @@ mod tests {
         assert_eq!(plan.game_args[3], "1.21.1");
         assert_eq!(plan.game_args[4], "--gameDir");
         assert_eq!(plan.game_args[5], game_dir);
-        assert!(plan
-            .game_args
-            .iter()
-            .any(|arg| arg == "5627dd98-e6be-3c21-b8a8-e92344183641"));
+        assert!(
+            plan.game_args
+                .iter()
+                .any(|arg| arg == "5627dd98-e6be-3c21-b8a8-e92344183641")
+        );
         assert!(plan.game_args.iter().any(|arg| arg == "0"));
         assert!(plan.game_args.iter().any(|arg| arg == "legacy"));
         assert!(!plan.game_args.iter().any(|arg| arg == "--demo"));
@@ -813,14 +819,16 @@ mod tests {
     fn windows_10_and_32_bit_rules() {
         let windows_10 = OsInfo::new(OsName::Windows, Arch::X86_64, "10.0.19045.3803");
         let plan = build_launch_plan(spec_for(MODERN, windows_10, FeatureSet::default())).unwrap();
-        assert!(plan
-            .jvm_args
-            .iter()
-            .any(|arg| arg == "-XX:HeapDumpPath=heapdump"));
-        assert!(plan
-            .jvm_args
-            .iter()
-            .any(|arg| arg == "-Dos.name=Windows 10"));
+        assert!(
+            plan.jvm_args
+                .iter()
+                .any(|arg| arg == "-XX:HeapDumpPath=heapdump")
+        );
+        assert!(
+            plan.jvm_args
+                .iter()
+                .any(|arg| arg == "-Dos.name=Windows 10")
+        );
         assert!(plan.jvm_args.iter().any(|arg| arg == "-Dos.version=10.0"));
         assert!(!plan.jvm_args.iter().any(|arg| arg == "-Xss1M"));
         let classpath = plan
@@ -832,10 +840,11 @@ mod tests {
 
         let windows_7 = OsInfo::new(OsName::Windows, Arch::X86, "6.1.7601");
         let plan = build_launch_plan(spec_for(MODERN, windows_7, FeatureSet::default())).unwrap();
-        assert!(plan
-            .jvm_args
-            .iter()
-            .any(|arg| arg == "-XX:HeapDumpPath=heapdump"));
+        assert!(
+            plan.jvm_args
+                .iter()
+                .any(|arg| arg == "-XX:HeapDumpPath=heapdump")
+        );
         assert!(!plan.jvm_args.iter().any(|arg| arg.contains("Windows 10")));
         assert!(plan.jvm_args.iter().any(|arg| arg == "-Xss1M"));
     }
@@ -855,10 +864,11 @@ mod tests {
         spec.width = Some(854);
         spec.height = Some(480);
         let plan = build_launch_plan(spec).unwrap();
-        assert!(plan
-            .jvm_args
-            .iter()
-            .any(|arg| arg == "-XstartOnFirstThread"));
+        assert!(
+            plan.jvm_args
+                .iter()
+                .any(|arg| arg == "-XstartOnFirstThread")
+        );
         assert!(!plan.jvm_args.iter().any(|arg| arg == "-Xss1M"));
         assert!(plan.game_args.iter().any(|arg| arg == "--demo"));
         let width = plan
@@ -896,10 +906,11 @@ mod tests {
             PathBuf::from("/resources").display().to_string()
         );
         let natives = PathBuf::from("/natives").display().to_string();
-        assert!(plan
-            .jvm_args
-            .iter()
-            .any(|arg| arg == &format!("-Djava.library.path={natives}")));
+        assert!(
+            plan.jvm_args
+                .iter()
+                .any(|arg| arg == &format!("-Djava.library.path={natives}"))
+        );
         assert!(plan.jvm_args.iter().any(|arg| arg == "-cp"));
     }
 

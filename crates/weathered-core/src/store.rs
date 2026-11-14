@@ -4,8 +4,10 @@
 //! An index records `sha1 -> sha512` and `url -> sha512` so a later download can
 //! see that the bytes are already present before opening a connection.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use sha1::{Digest, Sha1};
 use sha2::{Sha256, Sha512};
@@ -63,6 +65,59 @@ pub struct UrlRecord {
     pub sha1: String,
     /// URL the bytes were fetched from.
     pub url: String,
+}
+
+/// Shared cap on in-flight file downloads for every install running in this process.
+#[derive(Clone)]
+pub struct DownloadSlots {
+    inner: Arc<tokio::sync::Semaphore>,
+}
+
+static DOWNLOAD_SLOTS: Mutex<Option<DownloadSlots>> = Mutex::new(None);
+
+impl DownloadSlots {
+    /// Remember a process-wide limit. Later [`Store::fetch_all`] calls share it.
+    pub fn install(permits: usize) {
+        let slots = Self {
+            inner: Arc::new(tokio::sync::Semaphore::new(permits.max(1))),
+        };
+        *DOWNLOAD_SLOTS.lock().unwrap_or_else(|err| err.into_inner()) = Some(slots);
+    }
+
+    fn current() -> Option<Self> {
+        DOWNLOAD_SLOTS
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
+    }
+
+    async fn acquire(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.inner
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap_or_else(|_| unreachable!("download semaphore is not closed"))
+    }
+}
+
+fn url_gate(url: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static GATES: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    let mut gates = GATES.lock().unwrap_or_else(|err| err.into_inner());
+    gates
+        .entry(url.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+fn object_gate(sha512: &str) -> Arc<Mutex<()>> {
+    static GATES: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    let mut gates = GATES.lock().unwrap_or_else(|err| err.into_inner());
+    gates
+        .entry(sha512.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
 }
 
 /// Root of `store/`.
@@ -270,7 +325,7 @@ impl Store {
                     let object = tokio::select! {
                         biased;
                         () = cancel.cancelled() => return Err(Error::message("cancelled")),
-                        result = store.fetch_one(&client, &request) => result?,
+                        result = store.fetch_one(&client, &request, &cancel) => result?,
                     };
                     if !object.cached {
                         downloaded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -306,55 +361,54 @@ impl Store {
     }
 
     fn cached_object(&self, request: &BlobRequest) -> Result<Option<StoredObject>> {
-        if let Some(sha512) = request.sha512.as_deref() {
-            if let Ok(path) = self.object_path(sha512) {
-                if path.is_file() {
-                    let size = std::fs::metadata(&path).io_at(&path)?.len();
-                    let sha1 = request
-                        .sha1
-                        .clone()
-                        .unwrap_or_else(|| lookup_sha1_of_sha512(self, sha512).unwrap_or_default());
-                    if !request.url.is_empty() && !sha1.is_empty() {
-                        self.write_url_index(&request.url, sha512, &sha1)?;
-                    }
-                    return Ok(Some(StoredObject {
-                        sha512: normalize_hex(sha512, 128, "sha512")?,
-                        sha1,
-                        path,
-                        size,
-                        cached: true,
-                    }));
-                }
+        if let Some(sha512) = request.sha512.as_deref()
+            && let Ok(path) = self.object_path(sha512)
+            && path.is_file()
+        {
+            let size = std::fs::metadata(&path).io_at(&path)?.len();
+            let sha1 = request
+                .sha1
+                .clone()
+                .unwrap_or_else(|| lookup_sha1_of_sha512(self, sha512).unwrap_or_default());
+            if !request.url.is_empty() && !sha1.is_empty() {
+                self.write_url_index(&request.url, sha512, &sha1)?;
             }
+            return Ok(Some(StoredObject {
+                sha512: normalize_hex(sha512, 128, "sha512")?,
+                sha1,
+                path,
+                size,
+                cached: true,
+            }));
         }
-        if let Some(sha1) = request.sha1.as_deref() {
-            if let Some(sha512) = self.lookup_sha1(sha1)? {
-                let path = self.object_path(&sha512)?;
-                let size = std::fs::metadata(&path).io_at(&path)?.len();
-                if !request.url.is_empty() {
-                    self.write_url_index(&request.url, &sha512, sha1)?;
-                }
-                return Ok(Some(StoredObject {
-                    sha512,
-                    sha1: normalize_hex(sha1, 40, "sha1")?,
-                    path,
-                    size,
-                    cached: true,
-                }));
+        if let Some(sha1) = request.sha1.as_deref()
+            && let Some(sha512) = self.lookup_sha1(sha1)?
+        {
+            let path = self.object_path(&sha512)?;
+            let size = std::fs::metadata(&path).io_at(&path)?.len();
+            if !request.url.is_empty() {
+                self.write_url_index(&request.url, &sha512, sha1)?;
             }
+            return Ok(Some(StoredObject {
+                sha512,
+                sha1: normalize_hex(sha1, 40, "sha1")?,
+                path,
+                size,
+                cached: true,
+            }));
         }
-        if !request.url.is_empty() {
-            if let Some(record) = self.lookup_url(&request.url)? {
-                let path = self.object_path(&record.sha512)?;
-                let size = std::fs::metadata(&path).io_at(&path)?.len();
-                return Ok(Some(StoredObject {
-                    sha512: record.sha512,
-                    sha1: record.sha1,
-                    path,
-                    size,
-                    cached: true,
-                }));
-            }
+        if !request.url.is_empty()
+            && let Some(record) = self.lookup_url(&request.url)?
+        {
+            let path = self.object_path(&record.sha512)?;
+            let size = std::fs::metadata(&path).io_at(&path)?.len();
+            return Ok(Some(StoredObject {
+                sha512: record.sha512,
+                sha1: record.sha1,
+                path,
+                size,
+                cached: true,
+            }));
         }
         Ok(None)
     }
@@ -363,6 +417,7 @@ impl Store {
         &self,
         client: &reqwest::Client,
         request: &BlobRequest,
+        cancel: &CancelFlag,
     ) -> Result<StoredObject> {
         if let Some(object) = self.cached_object(request)? {
             return Ok(object);
@@ -372,6 +427,20 @@ impl Store {
                 "file is not in the store and no download URL was provided",
             ));
         }
+        let gate = url_gate(&request.url);
+        let _guard = gate.lock().await;
+        if let Some(object) = self.cached_object(request)? {
+            return Ok(object);
+        }
+        let _permit = if let Some(slots) = DownloadSlots::current() {
+            Some(tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Err(Error::message("cancelled")),
+                permit = slots.acquire() => permit,
+            })
+        } else {
+            None
+        };
         let response = client
             .get(&request.url)
             .send()
@@ -448,6 +517,8 @@ impl Store {
         bytes: &[u8],
         url: Option<&str>,
     ) -> Result<StoredObject> {
+        let gate = object_gate(sha512);
+        let _guard = gate.lock().unwrap_or_else(|err| err.into_inner());
         let path = self.object_path(sha512)?;
         let cached = path.is_file();
         if !cached {
@@ -678,14 +749,16 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(cached.cached);
-        assert!(store
-            .ingest(
-                b"nope",
-                Some("a9993e364706816aba3e25717850c26c9cd0d89d"),
-                None,
-                None
-            )
-            .is_err());
+        assert!(
+            store
+                .ingest(
+                    b"nope",
+                    Some("a9993e364706816aba3e25717850c26c9cd0d89d"),
+                    None,
+                    None
+                )
+                .is_err()
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -752,6 +825,30 @@ mod tests {
         let finished = events.lock().unwrap().last().cloned().unwrap();
         assert_eq!(finished.detail, "already stored");
         assert_eq!(finished.completed, finished.total);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_ingests_of_the_same_bytes_store_one_object() {
+        let root = std::env::temp_dir().join(format!(
+            "weathered-store-race-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = Store::open(&root).unwrap();
+        let bytes = b"same-bytes";
+        let left = store.clone();
+        let right = store.clone();
+        let first = std::thread::spawn(move || left.ingest(bytes, None, None, None).unwrap());
+        let second = std::thread::spawn(move || right.ingest(bytes, None, None, None).unwrap());
+        let first = first.join().unwrap();
+        let second = second.join().unwrap();
+        assert_eq!(first.sha512, second.sha512);
+        assert!(first.cached || second.cached);
+        assert_eq!(store.object_count(), 1);
         let _ = std::fs::remove_dir_all(root);
     }
 }

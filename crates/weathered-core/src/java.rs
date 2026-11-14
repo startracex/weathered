@@ -6,9 +6,9 @@ use std::process::Command;
 
 use serde::Deserialize;
 
-use crate::download::{self, sha1_hex, RemoteFile};
+use crate::download::{self, RemoteFile, sha1_hex};
 use crate::error::{Error, IoResultExt, Result};
-use crate::paths::{safe_rel_path, GamePaths};
+use crate::paths::{GamePaths, safe_rel_path};
 use crate::platform::{Arch, OsInfo, OsName};
 use crate::progress::ProgressSink;
 use crate::version::JavaVersionSpec;
@@ -155,10 +155,10 @@ pub async fn resolve_java(
 
     if request.mode != JavaMode::ForceDownload {
         if let Some(spec) = request.spec {
-            if let Some(vendored) = find_vendored(paths, &spec.component, request.os) {
-                if vendored.major == spec.major_version {
-                    return Ok((vendored, download::DownloadStats::default()));
-                }
+            if let Some(vendored) = find_vendored(paths, &spec.component, request.os)
+                && vendored.major == spec.major_version
+            {
+                return Ok((vendored, download::DownloadStats::default()));
             }
             if let Some(system) = select_major(&detect_system_javas(), spec.major_version) {
                 return Ok((system, download::DownloadStats::default()));
@@ -475,11 +475,7 @@ fn java_on_path() -> Option<PathBuf> {
 }
 
 fn java_exe() -> &'static str {
-    if cfg!(windows) {
-        "java.exe"
-    } else {
-        "java"
-    }
+    if cfg!(windows) { "java.exe" } else { "java" }
 }
 
 fn search_roots() -> Vec<PathBuf> {

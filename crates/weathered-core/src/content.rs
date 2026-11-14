@@ -171,22 +171,21 @@ async fn download_vanilla(
         )
         .await?;
     request.cancel.check()?;
-    if let Some(index_ref) = resolved.info.asset_index.clone() {
-        if let Some(sha512) = store.lookup_sha1(&index_ref.sha1)? {
-            emit_stage(progress, "assets", "linking assets");
-            let index_path = store.object_path(&sha512)?;
-            let index_bytes =
-                std::fs::read(&index_path).map_err(|err| Error::io(&index_path, err))?;
-            let store = store.clone();
-            let layout = layout.clone();
-            let index_id = index_ref.id.clone();
-            let cancel = request.cancel.clone();
-            tokio::task::spawn_blocking(move || {
-                publish_assets(&store, &layout, &index_id, &index_bytes, &cancel)
-            })
-            .await
-            .map_err(|err| Error::message(format!("could not link assets: {err}")))??;
-        }
+    if let Some(index_ref) = resolved.info.asset_index.clone()
+        && let Some(sha512) = store.lookup_sha1(&index_ref.sha1)?
+    {
+        emit_stage(progress, "assets", "linking assets");
+        let index_path = store.object_path(&sha512)?;
+        let index_bytes = std::fs::read(&index_path).map_err(|err| Error::io(&index_path, err))?;
+        let store = store.clone();
+        let layout = layout.clone();
+        let index_id = index_ref.id.clone();
+        let cancel = request.cancel.clone();
+        tokio::task::spawn_blocking(move || {
+            publish_assets(&store, &layout, &index_id, &index_bytes, &cancel)
+        })
+        .await
+        .map_err(|err| Error::message(format!("could not link assets: {err}")))??;
     }
     if request.java_mode != JavaMode::Skip {
         request.cancel.check()?;
@@ -607,15 +606,14 @@ fn version_blobs(version: &VersionInfo, os: &OsInfo) -> Result<Vec<BlobRequest>>
         .downloads
         .as_ref()
         .and_then(|downloads| downloads.client.as_ref())
+        && let Some(url) = artifact.url()
     {
-        if let Some(url) = artifact.url() {
-            requests.push(BlobRequest {
-                url: url.to_string(),
-                sha1: artifact.sha1.clone(),
-                sha512: None,
-                size: artifact.size,
-            });
-        }
+        requests.push(BlobRequest {
+            url: url.to_string(),
+            sha1: artifact.sha1.clone(),
+            sha512: None,
+            size: artifact.size,
+        });
     }
     let libraries = version.libraries.clone().unwrap_or_default();
     let plan = plan_libraries(

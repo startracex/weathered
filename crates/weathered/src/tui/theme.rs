@@ -15,7 +15,6 @@ pub const MUTED: Color = Color::Rgb(140, 158, 150);
 pub const ACCENT: Color = Color::Rgb(118, 196, 172);
 pub const ON_ACCENT: Color = Color::Rgb(12, 28, 26);
 pub const LAUNCH: Color = Color::Rgb(72, 176, 128);
-pub const ON_LAUNCH: Color = Color::Rgb(8, 28, 20);
 pub const DANGER: Color = Color::Rgb(214, 92, 78);
 
 pub fn base() -> Style {
@@ -62,13 +61,6 @@ pub fn row_button() -> Style {
         .fg(TEXT)
         .bg(Color::Rgb(8, 12, 12))
         .remove_modifier(Modifier::BOLD)
-}
-
-pub fn launch_button() -> Style {
-    Style::default()
-        .fg(ON_LAUNCH)
-        .bg(LAUNCH)
-        .add_modifier(Modifier::BOLD)
 }
 
 pub fn disabled_button() -> Style {

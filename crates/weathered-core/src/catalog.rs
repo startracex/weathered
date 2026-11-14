@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, IoResultExt, Result};
-use crate::paths::{validate_version_id, DataLayout};
+use crate::paths::{DataLayout, validate_version_id};
 
 /// One downloaded game or loader profile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -222,11 +222,11 @@ pub fn forge_builds_for_game(
             recommended: is_recommended || (recommended.is_none() && is_latest),
         });
     }
-    if !builds.iter().any(|build| build.recommended) {
-        if let Some(first) = builds.first_mut() {
-            first.recommended = true;
-            first.stable = true;
-        }
+    if !builds.iter().any(|build| build.recommended)
+        && let Some(first) = builds.first_mut()
+    {
+        first.recommended = true;
+        first.stable = true;
     }
     builds
 }
@@ -372,9 +372,11 @@ mod tests {
         ];
         let builds = forge_builds_for_game("1.21.1", &versions, &promos);
         assert_eq!(builds.len(), 3);
-        assert!(builds
-            .iter()
-            .any(|build| build.version == "1.21.1-52.0.1" && build.recommended));
+        assert!(
+            builds
+                .iter()
+                .any(|build| build.version == "1.21.1-52.0.1" && build.recommended)
+        );
         assert_eq!(visible_builds(&builds, false).len(), 2);
         let neo = neoforge_builds_for_game(
             "1.21.1",

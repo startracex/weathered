@@ -5,7 +5,6 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use ratatui::layout::Rect;
 
@@ -145,6 +144,7 @@ pub enum Mouse {
 pub enum Effect {
     None,
     Install {
+        id: u64,
         version: String,
         loader: String,
         loader_version: Option<String>,
@@ -165,9 +165,12 @@ pub enum Effect {
         catalog_id: String,
     },
     ImportPack {
+        id: u64,
         path: String,
     },
-    CancelJob,
+    CancelJob {
+        id: u64,
+    },
     Launch,
     StopGame,
     Save,
@@ -187,6 +190,7 @@ pub enum Msg {
     },
     Javas(Vec<DetectedJava>),
     Progress {
+        id: u64,
         version: String,
         stage: String,
         completed: u64,
@@ -195,6 +199,7 @@ pub enum Msg {
         launching: bool,
     },
     InstallFinished {
+        id: u64,
         version: String,
         ok: bool,
         detail: String,
@@ -219,9 +224,12 @@ pub enum Msg {
         error: String,
     },
     /// The game process is on screen and the Launch button should become Stop.
-    GameStarted,
+    GameStarted {
+        id: u64,
+    },
     /// Preparing the launch command failed before the process existed.
     LaunchFailed {
+        id: u64,
         detail: String,
     },
 }
@@ -392,12 +400,14 @@ pub struct DetectedJava {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Job {
+    pub id: u64,
     pub version: String,
     pub stage: String,
     pub completed: u64,
     pub total: u64,
     pub detail: String,
     pub launching: bool,
+    pub create_instance: bool,
 }
 
 impl Job {
@@ -483,8 +493,9 @@ pub struct App {
     pub draft: Option<InstanceDraft>,
     pub startup_select: bool,
     pub pending_create: bool,
-    /// Late progress from a cancelled task must not lock the screen again.
-    pub ignore_job: bool,
+    /// Ids whose late progress must be ignored.
+    pub cancelled_jobs: HashSet<u64>,
+    next_job_id: u64,
     pub version_selected: usize,
     pub version_scroll: usize,
     pub version_window: usize,
@@ -498,7 +509,7 @@ pub struct App {
     pub download_scroll: usize,
     pub download_window: usize,
     pub setting_selected: usize,
-    pub job: Option<Job>,
+    pub jobs: Vec<Job>,
     pub status: String,
     pub status_error: bool,
     pub editing: Option<Editor>,
@@ -509,7 +520,6 @@ pub struct App {
     pub screen: Screen,
     pub hover: Option<(u16, u16)>,
     pub quit: bool,
-    last_version_click: Option<(usize, Instant)>,
 }
 
 impl App {
@@ -540,7 +550,8 @@ impl App {
             draft: None,
             startup_select: true,
             pending_create: false,
-            ignore_job: false,
+            cancelled_jobs: HashSet::new(),
+            next_job_id: 1,
             version_selected: 0,
             version_scroll: 0,
             version_window: 8,
@@ -554,7 +565,7 @@ impl App {
             download_scroll: 0,
             download_window: 12,
             setting_selected: 0,
-            job: None,
+            jobs: Vec::new(),
             status: "Ready".into(),
             status_error: false,
             editing: None,
@@ -564,7 +575,6 @@ impl App {
             screen: Screen::default(),
             hover: None,
             quit: false,
-            last_version_click: None,
         };
         app.sync_offline_profile();
         app
@@ -684,10 +694,10 @@ impl App {
             .get(self.download_selected)
             .map(|entry| entry.id.clone());
         self.download_sort = self.download_sort.next();
-        if let Some(id) = keep {
-            if let Some(index) = self.filtered().iter().position(|entry| entry.id == id) {
-                self.download_selected = index;
-            }
+        if let Some(id) = keep
+            && let Some(index) = self.filtered().iter().position(|entry| entry.id == id)
+        {
+            self.download_selected = index;
         }
         self.clamp_download();
     }
@@ -826,10 +836,10 @@ impl App {
                 legacy: item.legacy,
             })
             .collect();
-        if let Some(id) = keep {
-            if let Some(index) = self.instances.iter().position(|item| item.id == id) {
-                self.version_selected = index;
-            }
+        if let Some(id) = keep
+            && let Some(index) = self.instances.iter().position(|item| item.id == id)
+        {
+            self.version_selected = index;
         }
         self.catalog_items = weathered_core::catalog::list(&layout)
             .unwrap_or_default()
@@ -850,7 +860,8 @@ impl App {
         }
     }
 
-    /// The pinned default is selected, so the large Launch button belongs on screen.
+    /// The pinned default instance is the current selection.
+    #[cfg(test)]
     pub fn selected_is_default(&self) -> bool {
         self.selected_instance().is_some_and(|item| {
             !self.default_instance.is_empty() && item.id == self.default_instance
@@ -886,6 +897,10 @@ impl App {
         if self.editing.is_some() {
             return self.on_edit_key(key);
         }
+        let key = match key {
+            Key::Char(ch) => Key::Char(ch.to_ascii_lowercase()),
+            other => other,
+        };
         if self.search_open && key == Key::Esc {
             self.clear_search();
             return Effect::None;
@@ -893,7 +908,7 @@ impl App {
         if self.picker.is_some() {
             return self.on_picker_key(key);
         }
-        if key == Key::Esc && self.job.is_some() {
+        if key == Key::Esc && !self.jobs.is_empty() {
             return self.cancel_job();
         }
         if key == Key::Esc && self.creator.is_some() {
@@ -1024,37 +1039,44 @@ impl App {
                 }
             }
             Msg::Progress {
+                id,
                 version,
                 stage,
                 completed,
                 total,
                 detail,
                 launching,
-            } if !self.ignore_job => {
-                self.job = Some(Job {
-                    version,
-                    stage,
-                    completed,
-                    total,
-                    detail,
-                    launching,
-                });
+            } => {
+                if self.cancelled_jobs.contains(&id) {
+                    return;
+                }
+                if let Some(job) = self.jobs.iter_mut().find(|job| job.id == id) {
+                    job.version = version;
+                    job.stage = stage;
+                    job.completed = completed;
+                    job.total = total;
+                    job.detail = detail;
+                    job.launching = launching;
+                }
             }
             Msg::InstallFinished {
+                id,
                 version,
                 ok,
                 detail,
-            } if !self.ignore_job => {
-                if self.job.as_ref().is_some_and(|job| job.version == version) {
-                    self.job = None;
+            } => {
+                self.jobs.retain(|job| job.id != id);
+                if self.cancelled_jobs.contains(&id) {
+                    return;
                 }
                 if ok {
                     self.reload_installed();
                     self.reload_local();
-                    self.pending_create = false;
-                    self.creator = None;
-                    self.page = Page::Launch;
                     self.note(format!("Stored {version}. {detail}"), false);
+                    if self.jobs.iter().all(|job| job.launching) && detail.contains("instance") {
+                        self.page = Page::Launch;
+                        self.focus = Focus::RowLaunch;
+                    }
                 } else {
                     self.note(format!("Install {version} failed: {detail}"), true);
                 }
@@ -1065,7 +1087,7 @@ impl App {
                 crash_report,
             } => {
                 self.game_running = false;
-                self.job = None;
+                self.jobs.retain(|job| !job.launching);
                 if self.stop_requested {
                     self.stop_requested = false;
                     self.note("Stopped", false);
@@ -1085,21 +1107,22 @@ impl App {
                     self.note(detail, true);
                 }
             }
-            Msg::GameStarted if !self.ignore_job => {
+            Msg::GameStarted { id } => {
+                if self.cancelled_jobs.contains(&id) {
+                    return;
+                }
+                self.jobs.retain(|job| job.id != id);
                 self.game_running = true;
                 self.note("Game is running", false);
             }
-            Msg::LaunchFailed { detail } if !self.ignore_job => {
-                self.game_running = false;
-                if self.job.as_ref().is_some_and(|job| job.launching) {
-                    self.job = None;
+            Msg::LaunchFailed { id, detail } => {
+                self.jobs.retain(|job| job.id != id);
+                if self.cancelled_jobs.contains(&id) {
+                    return;
                 }
+                self.game_running = false;
                 self.note(detail, true);
             }
-            Msg::Progress { .. }
-            | Msg::InstallFinished { .. }
-            | Msg::GameStarted
-            | Msg::LaunchFailed { .. } => {}
         }
     }
 
@@ -1125,10 +1148,10 @@ impl App {
             }
             Key::Down => {
                 let len = self.picker_visible().len();
-                if let Some(picker) = self.picker.as_mut() {
-                    if picker.selected + 1 < len {
-                        picker.selected += 1;
-                    }
+                if let Some(picker) = self.picker.as_mut()
+                    && picker.selected + 1 < len
+                {
+                    picker.selected += 1;
                 }
                 Effect::None
             }
@@ -1188,16 +1211,9 @@ impl App {
         let loader_version = Some(build.version.clone());
         let create_instance = picker.create_instance;
         self.picker = None;
-        self.ignore_job = false;
-        self.job = Some(Job {
-            version: version.clone(),
-            stage: "starting".into(),
-            completed: 0,
-            total: 1,
-            detail: "Queued".into(),
-            launching: false,
-        });
+        let id = self.start_job(version.clone(), false, create_instance);
         Effect::Install {
+            id,
             version,
             loader,
             loader_version,
@@ -1399,18 +1415,9 @@ impl App {
             }
             Click::Version(index) => {
                 self.page = Page::Launch;
-                self.focus = Focus::RowLaunch;
-                let now = Instant::now();
-                let double = self.last_version_click.is_some_and(|(previous, when)| {
-                    previous == index && now.duration_since(when) < Duration::from_millis(400)
-                });
                 self.version_selected = index;
-                self.last_version_click = Some((index, now));
-                if double {
-                    self.request_launch()
-                } else {
-                    Effect::None
-                }
+                self.focus = Focus::RowLaunch;
+                Effect::None
             }
             Click::RowEdit(index) => {
                 self.page = Page::Launch;
@@ -1427,14 +1434,6 @@ impl App {
             Click::OpenDataDir => {
                 self.focus = Focus::DataDir;
                 Effect::OpenDataDir
-            }
-            Click::LaunchButton => {
-                self.focus = Focus::RowLaunch;
-                if self.game_running {
-                    Effect::StopGame
-                } else {
-                    self.request_launch()
-                }
             }
             Click::Category(category) => {
                 self.page = Page::Download;
@@ -1483,7 +1482,6 @@ impl App {
                 self.login = None;
                 Effect::CancelLogin
             }
-            Click::Stop => Effect::StopGame,
         }
     }
 
@@ -1523,70 +1521,85 @@ impl App {
         }
     }
 
+    fn start_job(&mut self, version: String, launching: bool, create_instance: bool) -> u64 {
+        let id = self.next_job_id;
+        self.next_job_id = self.next_job_id.saturating_add(1);
+        self.jobs.push(Job {
+            id,
+            version,
+            stage: if launching {
+                "preparing".into()
+            } else {
+                "starting".into()
+            },
+            completed: 0,
+            total: if launching { 0 } else { 1 },
+            detail: if launching {
+                "Resolving files".into()
+            } else {
+                "Queued".into()
+            },
+            launching,
+            create_instance,
+        });
+        id
+    }
+
     fn request_launch(&mut self) -> Effect {
         if self.game_running {
             return Effect::StopGame;
         }
-        if self.job.is_some() {
-            self.note(
-                "Wait for the current task to finish, or press Esc to cancel",
-                true,
-            );
+        if self.jobs.iter().any(|job| job.launching) {
+            self.note("A launch is already being prepared", true);
             return Effect::None;
         }
-        self.ignore_job = false;
         let Some(instance) = self.selected_instance() else {
             self.note("Create an instance first", true);
             return Effect::None;
         };
+        if self.jobs.iter().any(|job| {
+            job.create_instance
+                && !job.launching
+                && (job.version == instance.game_version || job.version == instance.id)
+        }) {
+            self.note("That instance is still being installed", true);
+            return Effect::None;
+        }
         let name = instance.name.clone();
-        self.job = Some(Job {
-            version: name.clone(),
-            stage: "preparing".to_string(),
-            completed: 0,
-            total: 0,
-            detail: "Resolving files".into(),
-            launching: true,
-        });
+        let _id = self.start_job(name.clone(), true, false);
         self.note(format!("Preparing {name}"), false);
         Effect::Launch
     }
 
     fn request_install(&mut self, index: usize) -> Effect {
-        if self.job.is_some() {
-            self.note(
-                "A download or launch is already running. Press Esc to cancel",
-                true,
-            );
-            return Effect::None;
-        }
-        self.ignore_job = false;
-        let Some(id) = self.filtered().get(index).map(|entry| entry.id.clone()) else {
+        let Some(version) = self.filtered().get(index).map(|entry| entry.id.clone()) else {
             return Effect::None;
         };
+        if self
+            .jobs
+            .iter()
+            .any(|job| !job.launching && job.version == version)
+        {
+            self.note(format!("{version} is already downloading"), false);
+            return Effect::None;
+        }
         self.download_selected = index;
-        self.job = Some(Job {
-            version: id.clone(),
-            stage: "starting".to_string(),
-            completed: 0,
-            total: 1,
-            detail: "Queued".into(),
-            launching: false,
-        });
         let loader = self.category.loader().to_string();
         let create_instance = self.pending_create;
         self.pending_create = false;
         if loader == "vanilla" {
-            self.note(format!("Downloading {id}"), false);
+            let id = self.start_job(version.clone(), false, create_instance);
+            self.note(format!("Downloading {version}"), false);
             Effect::Install {
-                version: id,
+                id,
+                version,
                 loader,
                 loader_version: None,
                 create_instance,
             }
         } else {
             self.picker = Some(LoaderPicker {
-                game_version: id.clone(),
+                game_version: version.clone(),
                 loader: loader.clone(),
                 builds: Vec::new(),
                 show_unstable: false,
@@ -1595,9 +1608,9 @@ impl App {
                 error: String::new(),
                 create_instance,
             });
-            self.note(format!("Loading {loader} versions for {id}"), false);
+            self.note(format!("Loading {loader} versions for {version}"), false);
             Effect::OpenPicker {
-                version: id,
+                version,
                 loader,
                 create_instance,
             }
@@ -1927,7 +1940,8 @@ impl App {
                     return Effect::None;
                 }
                 self.creator = None;
-                return Effect::ImportPack { path };
+                let id = self.start_job("modpack".into(), false, true);
+                return Effect::ImportPack { id, path };
             }
             Field::GameDir => {
                 self.game_dir = PathBuf::from(editor.buffer.trim());
@@ -2041,25 +2055,41 @@ impl App {
     }
 
     fn cancel_job(&mut self) -> Effect {
-        let launching = self.job.as_ref().is_some_and(|job| job.launching) || self.game_running;
-        self.job = None;
-        self.ignore_job = true;
-        if launching {
+        let Some(job) = self.jobs.pop() else {
+            return Effect::None;
+        };
+        self.cancelled_jobs.insert(job.id);
+        if job.launching {
             self.game_running = false;
+            self.stop_requested = true;
             self.note("Stopped", false);
             Effect::StopGame
         } else {
-            self.note("Cancelled", false);
-            Effect::CancelJob
+            self.note(format!("Cancelled {}", job.version), false);
+            Effect::CancelJob { id: job.id }
         }
     }
 
     pub fn mark_game_stopped(&mut self) {
         self.stop_requested = true;
         self.game_running = false;
-        if self.job.as_ref().is_some_and(|job| job.launching) {
-            self.job = None;
+        if let Some(job) = self.jobs.iter().rev().find(|job| job.launching) {
+            self.cancelled_jobs.insert(job.id);
         }
+        self.jobs.retain(|job| !job.launching);
+    }
+
+    pub fn overall_progress(&self) -> (u64, u64) {
+        let mut done = 0u64;
+        let mut total = 0u64;
+        for job in &self.jobs {
+            if job.launching {
+                continue;
+            }
+            done += job.completed;
+            total += job.total.max(job.completed).max(1);
+        }
+        (done, total)
     }
 }
 
@@ -2071,7 +2101,6 @@ pub enum Click {
     Version(usize),
     NewInstance,
     Creator(usize),
-    LaunchButton,
     RowLaunch(usize),
     RowEdit(usize),
     Category(Category),
@@ -2085,7 +2114,6 @@ pub enum Click {
     CancelLogin,
     CancelJob,
     OpenDataDir,
-    Stop,
 }
 
 /// Versions that already have both a json file and a client jar.
@@ -2208,7 +2236,6 @@ pub struct Screen {
     pub account_list: Rect,
     pub version_list: Rect,
     pub version_rows: Vec<Rect>,
-    pub launch_button: Rect,
     pub row_launch: Vec<Rect>,
     pub row_edit: Vec<Rect>,
     pub new_instance: Rect,
@@ -2359,18 +2386,10 @@ fn layout_launch(app: &App, screen: &mut Screen) {
     }
 
     let right_inner = inner(screen.right);
-    let show_big =
-        app.creator.is_none() && app.selected_is_default() && app.focus == Focus::RowLaunch;
-    let progress_h = if app.job.is_some() { 2 } else { 0 };
-    let button_band = if show_big {
-        5.min(right_inner.height.saturating_sub(3))
-    } else {
-        0
-    };
+    let progress_h = job_band(app);
     let new_h = if app.creator.is_none() { 1 } else { 0 };
     let list_h = right_inner
         .height
-        .saturating_sub(button_band)
         .saturating_sub(progress_h)
         .saturating_sub(new_h);
     screen.version_list = Rect::new(right_inner.x, right_inner.y, right_inner.width, list_h);
@@ -2384,20 +2403,6 @@ fn layout_launch(app: &App, screen: &mut Screen) {
         screen.zones.push(Zone {
             rect: screen.new_instance,
             action: Click::NewInstance,
-        });
-    }
-    let band_y = right_inner.y.saturating_add(list_h).saturating_add(new_h);
-    let band = Rect::new(right_inner.x, band_y, right_inner.width, button_band);
-    if show_big {
-        screen.launch_button = centered(band, 24.min(band.width.saturating_sub(2)), 3);
-        let action = if app.game_running {
-            Click::Stop
-        } else {
-            Click::LaunchButton
-        };
-        screen.zones.push(Zone {
-            rect: screen.launch_button,
-            action,
         });
     }
     let list_len = if app.creator.is_some() {
@@ -2419,11 +2424,12 @@ fn layout_launch(app: &App, screen: &mut Screen) {
             continue;
         }
         let index = app.version_scroll + offset;
-        screen.zones.push(Zone {
-            rect,
-            action: Click::Version(index),
-        });
         if let Some((launch, edit)) = row_action_rects(rect) {
+            let name_w = launch.x.saturating_sub(rect.x);
+            screen.zones.push(Zone {
+                rect: Rect::new(rect.x, rect.y, name_w, 1),
+                action: Click::Version(index),
+            });
             screen.zones.push(Zone {
                 rect: launch,
                 action: Click::RowLaunch(index),
@@ -2435,20 +2441,32 @@ fn layout_launch(app: &App, screen: &mut Screen) {
             screen.row_launch.push(launch);
             screen.row_edit.push(edit);
         } else {
+            screen.zones.push(Zone {
+                rect,
+                action: Click::Version(index),
+            });
             screen.row_launch.push(Rect::default());
             screen.row_edit.push(Rect::default());
         }
     }
     if progress_h > 0 {
-        let progress_y = if show_big {
-            band.y.saturating_add(band.height)
-        } else {
-            right_inner.y.saturating_add(list_h).saturating_add(new_h)
-        };
         place_cancel(
             screen,
-            Rect::new(right_inner.x, progress_y, right_inner.width, progress_h),
+            Rect::new(
+                right_inner.x,
+                right_inner.y.saturating_add(list_h).saturating_add(new_h),
+                right_inner.width,
+                progress_h,
+            ),
         );
+    }
+}
+
+fn job_band(app: &App) -> u16 {
+    if app.jobs.is_empty() {
+        0
+    } else {
+        2 + (app.jobs.len().min(3) as u16)
     }
 }
 
@@ -2477,7 +2495,7 @@ fn row_action_rects(rect: Rect) -> Option<(Rect, Rect)> {
 
 fn layout_download(app: &App, screen: &mut Screen) {
     let body = screen.body;
-    let progress_h = if app.job.is_some() { 3 } else { 0 };
+    let progress_h = job_band(app);
     screen.download_tabs = Vec::new();
     let mut x = body.x.saturating_add(1);
     for category in [
@@ -2699,17 +2717,6 @@ pub fn newest_crash_report(game_dir: &Path, since: std::time::SystemTime) -> Opt
     best.map(|(_, path)| path)
 }
 
-fn centered(area: Rect, width: u16, height: u16) -> Rect {
-    let width = width.min(area.width);
-    let height = height.min(area.height);
-    Rect::new(
-        area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2881,14 +2888,7 @@ mod tests {
     fn ctrl_f_opens_search_and_the_first_escape_clears_it() {
         let mut app = App::preview();
         app.page = Page::Download;
-        app.job = Some(Job {
-            version: "1.21.1".into(),
-            stage: "assets".into(),
-            completed: 1,
-            total: 4,
-            detail: "working".into(),
-            launching: false,
-        });
+        app.start_job("1.21.1".into(), false, false);
         assert!(!app.search_open);
         app.on_key(Key::CtrlF);
         assert!(app.search_open);
@@ -2896,8 +2896,8 @@ mod tests {
         assert_eq!(app.on_key(Key::Esc), Effect::None);
         assert!(!app.search_open);
         assert!(app.query.is_empty());
-        assert!(app.job.is_some());
-        assert_eq!(app.on_key(Key::Esc), Effect::CancelJob);
+        assert!(!app.jobs.is_empty());
+        assert!(matches!(app.on_key(Key::Esc), Effect::CancelJob { .. }));
     }
 
     #[test]
@@ -3017,7 +3017,9 @@ mod tests {
     fn progress_updates_without_leaving_the_page() {
         let mut app = App::preview();
         app.page = Page::Download;
+        let id = app.start_job("1.20.4".into(), false, false);
         app.on_msg(Msg::Progress {
+            id,
             version: "1.20.4".into(),
             stage: "assets".into(),
             completed: 50,
@@ -3026,7 +3028,7 @@ mod tests {
             launching: false,
         });
         assert_eq!(app.page, Page::Download);
-        assert_eq!(app.job.as_ref().map(Job::percent), Some(25));
+        assert_eq!(app.jobs.first().map(Job::percent), Some(25));
     }
 
     #[test]
@@ -3044,7 +3046,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "weathered-scan-{}-{}",
             std::process::id(),
-            Instant::now().elapsed().as_nanos()
+            std::time::Instant::now().elapsed().as_nanos()
         ));
         let version = root.join("versions").join("1.2.3");
         std::fs::create_dir_all(&version).unwrap();
@@ -3079,14 +3081,21 @@ mod tests {
         app.page = Page::Launch;
         app.focus = Focus::RowLaunch;
         app.screen = layout(&app, Rect::new(0, 0, 100, 36));
-        assert!(app.screen.launch_button.height >= 3);
-        assert!(app.screen.launch_button.width >= 20);
+        let name = app.screen.version_rows[0];
+        let launch = app.screen.row_launch[0];
+        let name_effect = app.on_mouse(Mouse::Click {
+            x: name.x + 1,
+            y: name.y,
+        });
+        assert_eq!(name_effect, Effect::None);
+        assert_eq!(app.focus, Focus::RowLaunch);
+        assert!(app.jobs.is_empty());
         let effect = app.on_mouse(Mouse::Click {
-            x: app.screen.launch_button.x + 1,
-            y: app.screen.launch_button.y + 1,
+            x: launch.x + 1,
+            y: launch.y,
         });
         assert_eq!(effect, Effect::Launch);
-        assert!(app.job.is_some());
+        assert!(app.jobs.iter().any(|job| job.launching));
     }
 
     #[test]
@@ -3100,34 +3109,28 @@ mod tests {
             x: button.x + 1,
             y: button.y,
         });
-        assert_eq!(
+        assert!(matches!(
             effect,
             Effect::Install {
-                version: "1.20.4".into(),
-                loader: "vanilla".into(),
+                version,
+                loader,
                 loader_version: None,
                 create_instance: false,
-            }
-        );
+                ..
+            } if version == "1.20.4" && loader == "vanilla"
+        ));
     }
 
     #[test]
     fn escape_cancels_a_running_download_and_unlocks_the_ui() {
         let mut app = App::preview();
         app.page = Page::Download;
-        app.job = Some(Job {
-            version: "26.3".into(),
-            stage: "download".into(),
-            completed: 10,
-            total: 10,
-            detail: "already stored".into(),
-            launching: false,
-        });
+        app.start_job("26.3".into(), false, false);
         assert_eq!(app.on_key(Key::CtrlC), Effect::Quit);
         app.quit = false;
-        assert!(app.job.is_some());
-        assert_eq!(app.on_key(Key::Esc), Effect::CancelJob);
-        assert!(app.job.is_none());
+        assert!(!app.jobs.is_empty());
+        assert!(matches!(app.on_key(Key::Esc), Effect::CancelJob { .. }));
+        assert!(app.jobs.is_empty());
         app.screen = layout(&app, Rect::new(0, 0, 100, 36));
         let button = app.screen.install_buttons[0];
         let effect = app.on_mouse(Mouse::Click {
@@ -3135,15 +3138,34 @@ mod tests {
             y: button.y,
         });
         assert!(matches!(effect, Effect::Install { .. }));
-        assert!(app.job.is_some());
+        assert_eq!(app.jobs.len(), 1);
+        let again = app.on_mouse(Mouse::Click {
+            x: app.screen.install_buttons[1].x + 1,
+            y: app.screen.install_buttons[1].y,
+        });
+        assert!(matches!(again, Effect::Install { .. }));
+        assert_eq!(app.jobs.len(), 2);
         app.screen = layout(&app, Rect::new(0, 0, 100, 36));
         assert!(app.screen.cancel.width >= 8);
         let effect = app.on_mouse(Mouse::Click {
             x: app.screen.cancel.x + 1,
             y: app.screen.cancel.y,
         });
-        assert_eq!(effect, Effect::CancelJob);
-        assert!(app.job.is_none());
+        assert!(matches!(effect, Effect::CancelJob { .. }));
+        assert_eq!(app.jobs.len(), 1);
+    }
+
+    #[test]
+    fn uppercase_shortcuts_match_lowercase_outside_text_fields() {
+        let mut app = App::preview();
+        app.on_key(Key::Char('S'));
+        assert_eq!(app.version_selected, 1);
+        app.on_key(Key::Char('W'));
+        assert_eq!(app.version_selected, 0);
+        app.begin_edit(Field::Rename, String::new());
+        app.on_key(Key::Char('W'));
+        assert_eq!(app.editing.unwrap().buffer, "W");
+        assert_eq!(app.version_selected, 0);
     }
 
     #[test]

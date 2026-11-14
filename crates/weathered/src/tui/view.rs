@@ -1,12 +1,12 @@
 //! Paint the terminal UI.
 
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
-use ratatui::Frame;
 
-use super::model::{contains, layout, App, Category, Field, Focus, Page, SettingKind};
+use super::model::{App, Category, Field, Focus, Page, SettingKind, contains, layout, percent};
 use super::theme::{self, ACCENT, BG, BORDER, LAUNCH, ON_ACCENT, TEXT};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -72,8 +72,8 @@ fn draw_header(frame: &mut Frame, app: &App) {
         &app.game_dir.display().to_string(),
         app.screen.data_path.width as usize,
     );
-    let path_style = if app.focus == Focus::DataDir || hot(app, app.screen.data_path) {
-        theme::selected()
+    let path_style = if app.focus == Focus::DataDir {
+        theme::muted().add_modifier(Modifier::UNDERLINED)
     } else {
         theme::muted()
     };
@@ -149,7 +149,7 @@ fn key_hints(app: &App) -> String {
     if app.picker.is_some() {
         return format!("{movement}  Enter choose  B unstable  Esc close  Ctrl+C quit");
     }
-    if app.job.is_some() {
+    if !app.jobs.is_empty() {
         format!("{movement}  {actions}  Esc cancel  {ctrl}")
     } else if app.search_open {
         format!("{movement}  Esc clear  {ctrl}")
@@ -268,49 +268,7 @@ fn draw_launch(frame: &mut Frame, app: &App) {
         }
     }
 
-    if app.screen.launch_button.height > 0 {
-        let running = app.game_running;
-        let preparing = app.job.as_ref().is_some_and(|job| job.launching) && !running;
-        if app.screen.launch_button.y > app.screen.version_list.y {
-            let caption = match app.selected_instance() {
-                Some(instance) => format!(
-                    "{}   ·   {}   ·   {}",
-                    instance.name, instance.game_version, app.memory
-                ),
-                None => "Create an instance to play".into(),
-            };
-            let width = app.screen.right.width.saturating_sub(2);
-            let x = app.screen.right.x.saturating_add(1);
-            frame.render_widget(
-                Paragraph::new(center(&caption, width as usize))
-                    .style(theme::muted().bg(theme::SURFACE)),
-                Rect::new(x, app.screen.launch_button.y.saturating_sub(1), width, 1),
-            );
-        }
-        let (label, style) = if running {
-            ("STOP", theme::selected())
-        } else if preparing {
-            ("PREPARING", theme::disabled_button())
-        } else if app.focus == Focus::RowLaunch || hot(app, app.screen.launch_button) {
-            (
-                "LAUNCH",
-                theme::launch_button().add_modifier(Modifier::REVERSED),
-            )
-        } else {
-            ("LAUNCH", theme::launch_button())
-        };
-        paint_button(frame, app.screen.launch_button, label, style);
-    }
-
-    if let Some(job) = &app.job {
-        draw_job(
-            frame,
-            app.screen.progress,
-            &job.stage,
-            job.percent(),
-            &job.detail,
-        );
-    }
+    draw_jobs(frame, app);
 }
 
 enum ButtonFace {
@@ -698,7 +656,10 @@ fn draw_download(frame: &mut Frame, app: &App) {
             rect,
         );
         if let Some(button) = app.screen.install_buttons.get(offset).copied() {
-            let busy = app.job.as_ref().is_some_and(|job| job.version == entry.id);
+            let busy = app
+                .jobs
+                .iter()
+                .any(|job| !job.launching && job.version == entry.id);
             let caption = if busy {
                 "wait"
             } else if app.in_store(&entry.id) {
@@ -732,14 +693,57 @@ fn draw_download(frame: &mut Frame, app: &App) {
             app.screen.download_list,
         );
     }
-    if let Some(job) = &app.job {
-        draw_job(
-            frame,
-            app.screen.progress,
-            &job.stage,
-            job.percent(),
-            &job.detail,
+    draw_jobs(frame, app);
+}
+
+fn draw_jobs(frame: &mut Frame, app: &App) {
+    if app.jobs.is_empty() || app.screen.progress.height == 0 {
+        return;
+    }
+    let mut y = app.screen.progress.y;
+    let width = app.screen.progress.width;
+    let x = app.screen.progress.x;
+    for job in app
+        .jobs
+        .iter()
+        .rev()
+        .take(3)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        if y >= app
+            .screen
+            .progress
+            .y
+            .saturating_add(app.screen.progress.height)
+        {
+            break;
+        }
+        let line = format!(" {} {}%  {}", job.version, job.percent(), job.detail);
+        frame.render_widget(
+            Paragraph::new(fit(&line, width as usize)).style(theme::muted().bg(theme::SURFACE)),
+            Rect::new(x, y, width, 1),
         );
+        y = y.saturating_add(1);
+    }
+    let (done, total) = app.overall_progress();
+    let bar_area = Rect::new(
+        x,
+        y,
+        width,
+        app.screen
+            .progress
+            .height
+            .saturating_sub(y.saturating_sub(app.screen.progress.y)),
+    );
+    if bar_area.height > 0 {
+        let stage = if app.jobs.len() == 1 {
+            app.jobs[0].stage.as_str()
+        } else {
+            "downloads"
+        };
+        draw_job(frame, bar_area, stage, percent(done, total), "");
     }
 }
 
@@ -881,18 +885,6 @@ fn draw_job(frame: &mut Frame, rect: Rect, stage: &str, percent: u16, detail: &s
     }
 }
 
-fn paint_button(frame: &mut Frame, rect: Rect, label: &str, style: Style) {
-    if rect.width == 0 || rect.height == 0 {
-        return;
-    }
-    frame.render_widget(Block::default().style(style), rect);
-    let mid = rect.y + rect.height / 2;
-    frame.render_widget(
-        Paragraph::new(center(label, rect.width as usize)).style(style),
-        Rect::new(rect.x, mid, rect.width, 1),
-    );
-}
-
 fn panel(title: &str) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
@@ -1004,8 +996,8 @@ fn shorten(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn frame_text(buffer: &ratatui::buffer::Buffer) -> String {
         let mut out = String::new();
@@ -1030,8 +1022,11 @@ mod tests {
         assert!(text.contains("Download"), "{text}");
         assert!(text.contains("Settings"), "{text}");
         assert!(text.contains("More"), "{text}");
-        assert!(text.contains("LAUNCH"), "{text}");
-        assert!(text.contains("[Launch]"), "{text}");
+        assert!(!text.contains("LAUNCH"), "{text}");
+        assert!(
+            text.contains("[Launch]") || text.contains(">Launch<"),
+            "{text}"
+        );
         assert!(text.contains("[Edit]"), "{text}");
         assert!(text.contains("[Q][E] pages"), "{text}");
         assert!(text.contains("[W][A][S][D] move"), "{text}");
@@ -1049,13 +1044,15 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::preview();
         app.page = Page::Download;
-        app.job = Some(super::super::model::Job {
+        app.jobs.push(super::super::model::Job {
+            id: 1,
             version: "1.20.4".into(),
             stage: "assets".into(),
             completed: 1200,
             total: 3890,
             detail: "icons/icon.png".into(),
             launching: false,
+            create_instance: false,
         });
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let text = frame_text(terminal.backend().buffer());
@@ -1184,14 +1181,6 @@ mod tests {
         assert!(text.contains("[Launch]"), "{text}");
         assert!(text.contains("[Edit]"), "{text}");
         assert!(!text.contains("LAUNCH"), "{text}");
-        assert_eq!(app.screen.launch_button.height, 0);
-        app.version_selected = 0;
-        app.focus = Focus::RowEdit;
-        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        assert_eq!(app.screen.launch_button.height, 0);
-        app.focus = Focus::RowLaunch;
-        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        assert!(app.screen.launch_button.height >= 3);
     }
 
     #[test]

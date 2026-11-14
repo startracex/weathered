@@ -5,8 +5,8 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -240,10 +240,10 @@ async fn file_is_valid(file: &RemoteFile) -> Result<bool> {
         if !meta.is_file() {
             return Ok(false);
         }
-        if let Some(size) = size {
-            if meta.len() != size {
-                return Ok(false);
-            }
+        if let Some(size) = size
+            && meta.len() != size
+        {
+            return Ok(false);
         }
         if let Some(expected) = expected {
             let actual = hash_file(&dest)?;
@@ -275,10 +275,10 @@ async fn download_once(client: &reqwest::Client, file: &RemoteFile) -> Result<()
     }
 
     let tmp = part_path(&file.dest);
-    if let Some(parent) = tmp.parent() {
-        if !parent.as_os_str().is_empty() {
-            tokio::fs::create_dir_all(parent).await.io_at(parent)?;
-        }
+    if let Some(parent) = tmp.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        tokio::fs::create_dir_all(parent).await.io_at(parent)?;
     }
     let mut output = tokio::fs::File::create(&tmp).await.io_at(&tmp)?;
     let mut hasher = Sha1::new();
@@ -314,14 +314,14 @@ async fn download_once(client: &reqwest::Client, file: &RemoteFile) -> Result<()
                 actual,
             });
         }
-    } else if let Some(size) = file.size {
-        if downloaded != size {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            return Err(Error::message(format!(
-                "size mismatch for {}: expected {size} bytes, got {downloaded}",
-                file.dest.display()
-            )));
-        }
+    } else if let Some(size) = file.size
+        && downloaded != size
+    {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(Error::message(format!(
+            "size mismatch for {}: expected {size} bytes, got {downloaded}",
+            file.dest.display()
+        )));
     }
 
     if file.executable {
@@ -332,10 +332,10 @@ async fn download_once(client: &reqwest::Client, file: &RemoteFile) -> Result<()
 
 /// Write `bytes` to `path` via a temporary file.
 pub async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            tokio::fs::create_dir_all(parent).await.io_at(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        tokio::fs::create_dir_all(parent).await.io_at(parent)?;
     }
     let tmp = part_path(path);
     tokio::fs::write(&tmp, bytes).await.io_at(&tmp)?;
@@ -363,10 +363,10 @@ fn part_path(path: &Path) -> PathBuf {
 }
 
 async fn replace_file(tmp: &Path, dest: &Path) -> Result<()> {
-    if let Some(parent) = dest.parent() {
-        if !parent.as_os_str().is_empty() {
-            tokio::fs::create_dir_all(parent).await.io_at(parent)?;
-        }
+    if let Some(parent) = dest.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        tokio::fs::create_dir_all(parent).await.io_at(parent)?;
     }
     #[cfg(windows)]
     if tokio::fs::try_exists(dest).await.unwrap_or(false) {
