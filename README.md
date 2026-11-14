@@ -97,11 +97,11 @@ If the data directory already contains `versions/<id>/<id>.jar` from an earlier 
 
 The layout follows Plain Craft Launcher: a top bar for Launch, Download, Settings, and More; a launch page with the account on the left and the instance list on the right; a download page split into release, snapshot, old, Fabric, Quilt, Forge, and NeoForge; and a settings page for the data directory, Java, memory, JVM arguments, offline username, and Microsoft sign-in. The screen is dark, with a weathered-copper teal for the selection and a greener Launch control.
 
-`[Q]` and `[E]` switch those pages. `[W]` and `[S]` move up and down. `[A]` and `[D]` move left and right, the same as the arrow keys. On an instance row they move between the row, its Launch button, and its Edit button. `1`–`4` also switch pages. Enter activates the focused control. At startup the default instance is selected and its large Launch button is focused, so Enter starts the game. Text fields still accept `q`, `e`, `w`, `s`, `a`, and `d` as letters. While a field is open, the characters you type stay on screen with a cursor. Enter saves the field and Esc discards it. Ctrl+C quits.
+The footer groups `[W][A][S][D] move`, then the single-key actions for that page, then the Ctrl combinations. On an instance row, left and right move between the row, its Launch button, and its Edit button. The focused button is a gold bold label such as `>Launch<`. The other button stays a dark `[Launch]` or `[Edit]` chip. `1`–`4` also switch pages. Enter activates the focused control. At startup the default instance is selected and its large Launch button is focused, so Enter starts the game. Text fields still accept `q`, `e`, `w`, `s`, `a`, and `d` as letters. While a field is open, the characters you type stay on screen with a cursor. Enter saves the field and Esc discards it. Ctrl+C quits.
 
-The search box on Download stays hidden until Ctrl+F. The first Esc clears that search. A later Esc cancels a download, closes the loader picker, or leaves the edit page. `O` cycles the instance list between name, creation time, and last played. The choice is saved. The default instance stays pinned at the top.
+The search box on Download stays hidden until Ctrl+F, and it is the only extra row between the category tabs and the version list. The first Esc clears that search. A later Esc cancels a download, closes the loader picker, or leaves the edit page. `O` cycles the instance list between name, creation time, and last played, and cycles the download list between newest, oldest, version name, and stored-first. The version panel title shows the current download order. Both choices are saved. The default instance stays pinned at the top.
 
-Each instance row ends with Launch and Edit. The large Launch button sits under the list only while the default instance is selected, and it launches that default. Edit is its own page, with the account panel left off. It renames the instance, edits the description, sets or clears the default, deletes the instance, and sets Java, minimum memory, maximum memory, and JVM arguments. An empty override shows `inherit global` and uses the settings page value. Clearing the field returns it to that inherited value. Open folder opens the instance game directory in the system file manager. Actions run immediately. Delete removes only that instance directory. The shared store stays. Game output is written to `<data>/logs/launch-<timestamp>.log`. If the game crashes, the status line gives that path and any new file in the instance `crash-reports` directory. Fabric, Quilt, Forge, and NeoForge installs open a loader-version list first. The newest stable or recommended build is selected. `B` shows unstable builds.
+Each instance row ends with Launch and Edit. The focused one is drawn in gold. The large Launch button sits under the list only while the default instance is selected, and it launches that default. Edit is its own page, with the account panel left off. It renames the instance, edits the description, sets or clears the default, deletes the instance, and sets Java, minimum memory, maximum memory, and JVM arguments. An empty override shows `inherit global` and uses the settings page value. Clearing the field returns it to that inherited value. Open folder opens the instance game directory in the system file manager. Actions run immediately. Delete removes only that instance directory. The shared store stays. Game output is written to `<data>/logs/launch-<timestamp>.log`. If the game crashes, the status line gives that path and any new file in the instance `crash-reports` directory. Fabric, Quilt, Forge, and NeoForge installs open a loader-version list first. The newest stable or recommended build is selected. `B` shows unstable builds.
 
 ```sh
 weathered --game-dir ~/.local/share/weathered
@@ -119,14 +119,14 @@ A rendered Launch page:
 │ ▸ Steve          offline     │ │              Vanilla  ·  1.21.1  ·  2G        │
 │                              │ │                   LAUNCH                      │
 ╰──────────────────────────────╯ ╰───────────────────────────────────────────────╯
- Ready  ·  [Q]/[E] pages  [W]/[S] move  [A]/[D] sideways  Ctrl+C quit
+ Ready  ·  [W][A][S][D] move  Enter launch  O sort  [Q][E] pages  Ctrl+C quit
 ```
 
 Download progress stays on screen while files are fetched:
 
 ```text
   Release   Snapshot   Old
-╭ Versions ──────────────────────────────────────────────────────────────────────╮
+╭ Versions · newest ─────────────────────────────────────────────────────────────╮
 │ ▸ 1.21.1               2024-08-08   in store                        reinstall  │
 │   1.20.4               2023-12-07   not stored                      install    │
 ╰────────────────────────────────────────────────────────────────────────────────╯

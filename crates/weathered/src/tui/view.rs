@@ -115,17 +115,45 @@ fn draw_nav(frame: &mut Frame, app: &App) {
     }
 }
 
+fn key_hints(app: &App) -> String {
+    if app.editing.is_some() {
+        return "[W][A][S][D] type  Enter save  Esc cancel  Ctrl+C quit".into();
+    }
+    if app.picker.is_some() {
+        return "[W][S] move  Enter choose  B unstable  Esc close  Ctrl+C quit".into();
+    }
+    let movement = match app.page {
+        Page::Settings | Page::Edit => "[W][S] move",
+        _ => "[W][A][S][D] move",
+    };
+    let actions = match app.page {
+        Page::Launch => "Enter launch  O sort  N new  [Q][E] pages",
+        Page::Download => "Enter install  O sort  [Q][E] pages",
+        Page::Settings => "Enter edit  [Q][E] pages",
+        Page::Edit => "Enter change  Esc back",
+        Page::More => "Enter refresh  [Q][E] pages",
+    };
+    let ctrl = if app.page == Page::Download {
+        "Ctrl+F search  Ctrl+C quit"
+    } else {
+        "Ctrl+C quit"
+    };
+    if app.job.is_some() {
+        format!("{movement}  Esc cancel  {ctrl}")
+    } else if app.search_open {
+        format!("{movement}  Esc clear  {ctrl}")
+    } else {
+        format!("{movement}  {actions}  {ctrl}")
+    }
+}
+
 fn draw_footer(frame: &mut Frame, app: &App) {
     let style = if app.status_error {
         theme::danger()
     } else {
         theme::muted()
     };
-    let hints = if app.job.is_some() {
-        "esc cancel   Ctrl+C quit"
-    } else {
-        "[Q]/[E] pages  [W]/[S] move  [A]/[D] sideways  Ctrl+F search  O sort  Ctrl+C quit"
-    };
+    let hints = key_hints(app);
     let width = app.screen.footer.width as usize;
     let text = if app.status.is_empty() {
         hints.to_string()
@@ -189,13 +217,15 @@ fn draw_launch(frame: &mut Frame, app: &App) {
                 frame,
                 launch,
                 "[Launch]",
-                (app.focus == Focus::RowLaunch && selected) || hot(app, launch),
+                ">Launch<",
+                button_face(app.focus == Focus::RowLaunch && selected, hot(app, launch)),
             );
             paint_row_button(
                 frame,
                 edit,
                 "[Edit]",
-                (app.focus == Focus::RowEdit && selected) || hot(app, edit),
+                ">Edit<",
+                button_face(app.focus == Focus::RowEdit && selected, hot(app, edit)),
             );
         }
         if app.instances.is_empty() {
@@ -272,14 +302,36 @@ fn draw_launch(frame: &mut Frame, app: &App) {
     }
 }
 
-fn paint_row_button(frame: &mut Frame, rect: Rect, label: &str, active: bool) {
+enum ButtonFace {
+    Idle,
+    Hover,
+    Focused,
+}
+
+fn button_face(focused: bool, hovered: bool) -> ButtonFace {
+    if focused {
+        ButtonFace::Focused
+    } else if hovered {
+        ButtonFace::Hover
+    } else {
+        ButtonFace::Idle
+    }
+}
+
+fn paint_row_button(
+    frame: &mut Frame,
+    rect: Rect,
+    idle: &str,
+    focused_label: &str,
+    face: ButtonFace,
+) {
     if rect.width == 0 || rect.height == 0 {
         return;
     }
-    let style = if active {
-        theme::selected()
-    } else {
-        Style::default().fg(ON_ACCENT).bg(ACCENT)
+    let (label, style) = match face {
+        ButtonFace::Focused => (focused_label, theme::focused_control()),
+        ButtonFace::Hover => (idle, theme::hover().add_modifier(Modifier::BOLD)),
+        ButtonFace::Idle => (idle, theme::row_button()),
     };
     frame.render_widget(
         Paragraph::new(fit(label, rect.width as usize)).style(style),
@@ -610,24 +662,10 @@ fn draw_download(frame: &mut Frame, app: &App) {
             app.screen.search,
         );
     }
-    let columns = Rect::new(
-        app.screen.download_list.x,
-        app.screen.download_list.y.saturating_sub(1),
-        app.screen.download_list.width,
-        1,
-    );
-    frame.render_widget(
-        Paragraph::new(fit(
-            "  version               released      status",
-            columns.width as usize,
-        ))
-        .style(theme::muted()),
-        columns,
-    );
-
     let outer = expand(app.screen.download_list);
     if outer.height > 0 {
-        frame.render_widget(panel("Versions"), outer);
+        let title = format!("Versions · {}", app.download_sort.label());
+        frame.render_widget(panel(&title), outer);
     }
     let filtered = app.filtered();
     for (offset, rect) in app.screen.download_rows.iter().copied().enumerate() {
@@ -988,7 +1026,9 @@ mod tests {
         assert!(text.contains("LAUNCH"), "{text}");
         assert!(text.contains("[Launch]"), "{text}");
         assert!(text.contains("[Edit]"), "{text}");
-        assert!(!text.contains("EDIT"), "{text}");
+        assert!(text.contains("[W][A][S][D] move"), "{text}");
+        assert!(text.contains("O sort"), "{text}");
+        assert!(text.contains("Ctrl+C quit"), "{text}");
         assert!(text.contains("Steve"), "{text}");
         assert!(text.contains("1.21.1"), "{text}");
         assert!(text.contains("q quit") || text.contains("quit"), "{text}");
@@ -1016,6 +1056,50 @@ mod tests {
         assert!(text.contains("1.21.1"), "{text}");
         assert!(text.contains("assets 30%"), "{text}");
         assert!(text.contains('█'), "{text}");
+        assert!(text.contains("Versions · newest"), "{text}");
+        assert_eq!(
+            expand(app.screen.download_list).y,
+            app.screen.download_tabs[0].y + 1
+        );
+    }
+
+    #[test]
+    fn focused_row_button_uses_a_different_face() {
+        let backend = TestBackend::new(100, 36);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::preview();
+        app.focus = Focus::RowLaunch;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let text = frame_text(&buffer);
+        assert!(text.contains(">Launch<"), "{text}");
+        assert!(text.contains("[Edit]"), "{text}");
+        let launch = app.screen.row_launch[0];
+        let edit = app.screen.row_edit[0];
+        let launch_style = buffer[(launch.x, launch.y)].style();
+        let edit_style = buffer[(edit.x, edit.y)].style();
+        assert_ne!(launch_style.bg, edit_style.bg);
+        assert!(launch_style.add_modifier.contains(Modifier::BOLD));
+        assert!(!edit_style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn search_is_the_only_row_between_tabs_and_versions() {
+        let backend = TestBackend::new(100, 36);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::preview();
+        app.page = Page::Download;
+        app.search_open = true;
+        app.query = "1.20".into();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(
+            app.screen.search.y,
+            app.screen.download_tabs[0].y.saturating_add(1)
+        );
+        assert_eq!(
+            expand(app.screen.download_list).y,
+            app.screen.download_tabs[0].y + 2
+        );
     }
 
     #[test]

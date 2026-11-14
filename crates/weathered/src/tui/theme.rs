@@ -48,6 +48,22 @@ pub fn hover() -> Style {
     Style::default().fg(TEXT).bg(SURFACE_2)
 }
 
+/// Keyboard focus on a row button. Warm gold, so it is not the row highlight.
+pub fn focused_control() -> Style {
+    Style::default()
+        .fg(Color::Rgb(24, 16, 4))
+        .bg(Color::Rgb(255, 196, 64))
+        .add_modifier(Modifier::BOLD)
+}
+
+/// A row button that is visible on both the teal selection and a plain row.
+pub fn row_button() -> Style {
+    Style::default()
+        .fg(TEXT)
+        .bg(Color::Rgb(8, 12, 12))
+        .remove_modifier(Modifier::BOLD)
+}
+
 pub fn launch_button() -> Style {
     Style::default()
         .fg(ON_LAUNCH)

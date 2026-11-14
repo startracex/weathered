@@ -303,6 +303,48 @@ impl SortMode {
     }
 }
 
+/// How the download version list is ordered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadSort {
+    /// Release date, newest first.
+    Newest,
+    /// Release date, oldest first.
+    Oldest,
+    /// Version name, low to high.
+    Name,
+    /// Versions already in the store, then newest.
+    Stored,
+}
+
+impl DownloadSort {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Newest => Self::Oldest,
+            Self::Oldest => Self::Name,
+            Self::Name => Self::Stored,
+            Self::Stored => Self::Newest,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Newest => "newest",
+            Self::Oldest => "oldest",
+            Self::Name => "name",
+            Self::Stored => "stored",
+        }
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "oldest" => Self::Oldest,
+            "name" => Self::Name,
+            "stored" => Self::Stored,
+            _ => Self::Newest,
+        }
+    }
+}
+
 /// Editable copy of one instance. Empty override fields inherit globals.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstanceDraft {
@@ -432,6 +474,7 @@ pub struct App {
     pub picker: Option<LoaderPicker>,
     pub search_open: bool,
     pub sort_mode: SortMode,
+    pub download_sort: DownloadSort,
     pub default_instance: String,
     pub memory_min: String,
     pub jvm_args: String,
@@ -488,6 +531,7 @@ impl App {
             picker: None,
             search_open: false,
             sort_mode: SortMode::Name,
+            download_sort: DownloadSort::Newest,
             default_instance: String::new(),
             memory_min: String::new(),
             jvm_args: String::new(),
@@ -603,11 +647,47 @@ impl App {
 
     pub fn filtered(&self) -> Vec<&CatalogEntry> {
         let query = self.query.to_ascii_lowercase();
-        self.catalog
+        let mut items: Vec<&CatalogEntry> = self
+            .catalog
             .iter()
             .filter(|entry| self.category.matches(&entry.kind))
             .filter(|entry| query.is_empty() || entry.id.to_ascii_lowercase().contains(&query))
-            .collect()
+            .collect();
+        items.sort_by(|left, right| self.compare_download(left, right));
+        items
+    }
+
+    fn compare_download(&self, left: &CatalogEntry, right: &CatalogEntry) -> std::cmp::Ordering {
+        let by_date = right
+            .released
+            .cmp(&left.released)
+            .then_with(|| version_cmp(&left.id, &right.id));
+        match self.download_sort {
+            DownloadSort::Newest => by_date,
+            DownloadSort::Oldest => left
+                .released
+                .cmp(&right.released)
+                .then_with(|| version_cmp(&left.id, &right.id)),
+            DownloadSort::Name => version_cmp(&left.id, &right.id),
+            DownloadSort::Stored => self
+                .in_store(&right.id)
+                .cmp(&self.in_store(&left.id))
+                .then(by_date),
+        }
+    }
+
+    fn cycle_download_sort(&mut self) {
+        let keep = self
+            .filtered()
+            .get(self.download_selected)
+            .map(|entry| entry.id.clone());
+        self.download_sort = self.download_sort.next();
+        if let Some(id) = keep {
+            if let Some(index) = self.filtered().iter().position(|entry| entry.id == id) {
+                self.download_selected = index;
+            }
+        }
+        self.clamp_download();
     }
 
     pub fn setting_rows(&self) -> Vec<SettingRow> {
@@ -830,11 +910,21 @@ impl App {
             self.begin_edit(Field::Search, self.query.clone());
             return Effect::None;
         }
-        if key == Key::Char('o') && self.page == Page::Launch && self.creator.is_none() {
-            self.sort_mode = self.sort_mode.next();
-            self.reload_local();
-            self.note(format!("Sort by {}", self.sort_mode.label()), false);
-            return Effect::Save;
+        if key == Key::Char('o') && self.creator.is_none() {
+            match self.page {
+                Page::Launch => {
+                    self.sort_mode = self.sort_mode.next();
+                    self.reload_local();
+                    self.note(format!("Sort by {}", self.sort_mode.label()), false);
+                    return Effect::Save;
+                }
+                Page::Download => {
+                    self.cycle_download_sort();
+                    self.note(format!("Sort by {}", self.download_sort.label()), false);
+                    return Effect::Save;
+                }
+                _ => {}
+            }
         }
         if key == Key::Char('n') && self.page == Page::Launch && self.creator.is_none() {
             self.open_creator();
@@ -2098,6 +2188,30 @@ fn reveal(selected: usize, scroll: &mut usize, window: usize) {
     }
 }
 
+fn version_cmp(left: &str, right: &str) -> std::cmp::Ordering {
+    let mut left_parts = left.split(|ch: char| !ch.is_ascii_alphanumeric());
+    let mut right_parts = right.split(|ch: char| !ch.is_ascii_alphanumeric());
+    loop {
+        match (left_parts.next(), right_parts.next()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(left_part), Some(right_part)) => {
+                if left_part.is_empty() && right_part.is_empty() {
+                    continue;
+                }
+                let order = match (left_part.parse::<u64>(), right_part.parse::<u64>()) {
+                    (Ok(left_num), Ok(right_num)) => left_num.cmp(&right_num),
+                    _ => left_part.cmp(right_part),
+                };
+                if order != std::cmp::Ordering::Equal {
+                    return order;
+                }
+            }
+        }
+    }
+}
+
 fn byte_index(text: &str, chars: usize) -> usize {
     text.char_indices()
         .nth(chars)
@@ -2407,11 +2521,12 @@ fn layout_download(app: &App, screen: &mut Screen) {
             action: Click::Search,
         });
     }
-    let list_y = body.y.saturating_add(2).saturating_add(search_h);
+    // Tabs occupy the first row. Search adds a row only while it is open.
+    let below_tabs = 1 + search_h;
+    let list_y = body.y.saturating_add(below_tabs);
     let list_h = body
         .height
-        .saturating_sub(2)
-        .saturating_sub(search_h)
+        .saturating_sub(below_tabs)
         .saturating_sub(progress_h);
     let list = Rect::new(body.x, list_y, body.width, list_h);
     screen.download_list = inner(list);
@@ -2817,6 +2932,44 @@ mod tests {
         app.setting_selected = 8;
         assert_eq!(app.on_key(Key::Enter), Effect::DeleteInstance);
         assert_eq!(app.page, Page::Launch);
+    }
+
+    #[test]
+    fn download_sort_cycles_date_name_and_stored() {
+        let mut app = App::preview();
+        app.page = Page::Download;
+        app.category = Category::Release;
+        let ids: Vec<_> = app
+            .filtered()
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["1.21.1", "1.20.4"]);
+        assert_eq!(app.on_key(Key::Char('o')), Effect::Save);
+        assert_eq!(app.download_sort, DownloadSort::Oldest);
+        let ids: Vec<_> = app
+            .filtered()
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["1.20.4", "1.21.1"]);
+        app.catalog_items[0].game_version = "1.20.4".into();
+        app.download_sort = DownloadSort::Stored;
+        let ids: Vec<_> = app
+            .filtered()
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect();
+        assert_eq!(ids[0], "1.20.4");
+        app.download_sort = DownloadSort::Newest;
+        let ids: Vec<_> = app
+            .filtered()
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect();
+        assert_eq!(ids[0], "1.21.1");
+        assert_eq!(version_cmp("1.20.4", "1.21.1"), std::cmp::Ordering::Less);
+        assert_eq!(version_cmp("26.3", "26.10"), std::cmp::Ordering::Less);
     }
 
     #[test]

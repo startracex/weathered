@@ -68,6 +68,7 @@ pub async fn run(game_dir: Option<PathBuf>) -> Result<i32> {
     app.jvm_args = config.jvm_args.trim().to_string();
     app.default_instance = config.default_instance.trim().to_string();
     app.sort_mode = crate::tui::model::SortMode::parse(&config.instance_sort);
+    app.download_sort = crate::tui::model::DownloadSort::parse(&config.download_sort);
     if !config.offline_username.trim().is_empty() {
         app.username = config.offline_username.trim().to_string();
     }
@@ -361,6 +362,7 @@ fn persist(app: &App, config: &mut Config) -> weathered_core::Result<()> {
     config.jvm_args = app.jvm_args.clone();
     config.default_instance = app.default_instance.clone();
     config.instance_sort = app.sort_mode.label().to_string();
+    config.download_sort = app.download_sort.label().to_string();
     config.java_path = app.java_path.clone();
     config.offline_username = app.username.clone();
     config.ms_client_id = app.client_id_input.clone();

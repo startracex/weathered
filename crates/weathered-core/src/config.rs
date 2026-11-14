@@ -45,6 +45,9 @@ pub struct Config {
     /// `name`, `created`, or `played`.
     #[serde(default)]
     pub instance_sort: String,
+    /// `newest`, `oldest`, `name`, or `stored`.
+    #[serde(default)]
+    pub download_sort: String,
 }
 
 impl Config {
