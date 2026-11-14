@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
-use super::model::{contains, layout, App, Category, Field, Page, SettingKind};
+use super::model::{contains, layout, App, Category, Field, Focus, Page, SettingKind};
 use super::theme::{self, ACCENT, BG, BORDER, LAUNCH, ON_ACCENT, TEXT};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -17,7 +17,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     frame.render_widget(Block::default().style(theme::base()), area);
     if area.width < 40 || area.height < 12 {
-        let message = Paragraph::new("Resize the terminal to at least 40×12.  q quits.")
+        let message = Paragraph::new("Resize the terminal to at least 40×12.  Ctrl+C quits.")
             .style(theme::base())
             .alignment(ratatui::layout::Alignment::Center);
         frame.render_widget(message, area);
@@ -31,6 +31,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Page::Download => draw_download(frame, app),
         Page::Settings => draw_settings(frame, app),
         Page::More => draw_more(frame, app),
+        Page::Edit => draw_edit(frame, app),
     }
     draw_footer(frame, app);
     if app.screen.cancel.width > 0 {
@@ -46,9 +47,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     if app.picker.is_some() {
         draw_picker(frame, app);
-    }
-    if app.confirm_delete {
-        draw_confirm_delete(frame, app);
     }
     if app.login.is_some() {
         draw_login(frame, app);
@@ -103,7 +101,7 @@ fn draw_nav(frame: &mut Frame, app: &App) {
         let Some(rect) = app.screen.tabs.get(index).copied() else {
             continue;
         };
-        let active = app.page == page;
+        let active = app.page == page || (app.page == Page::Edit && page == Page::Launch);
         let hovered = hot(app, rect) && !active;
         let style = if active {
             theme::selected()
@@ -126,7 +124,7 @@ fn draw_footer(frame: &mut Frame, app: &App) {
     let hints = if app.job.is_some() {
         "esc cancel   Ctrl+C quit"
     } else {
-        "[Q]/[E] pages   [A]/[D] tabs   1-4   Ctrl+C quit"
+        "[Q]/[E] pages  [W]/[S] move  [A]/[D] sideways  Ctrl+F search  O sort  Ctrl+C quit"
     };
     let width = app.screen.footer.width as usize;
     let text = if app.status.is_empty() {
@@ -147,17 +145,10 @@ fn draw_footer(frame: &mut Frame, app: &App) {
 
 fn draw_launch(frame: &mut Frame, app: &App) {
     frame.render_widget(panel("Account"), app.screen.left);
-    let panel_title = if app.launch_section == super::model::LaunchSection::Manage {
-        "Manage"
-    } else {
-        "Instances"
-    };
-    frame.render_widget(panel(panel_title), app.screen.right);
+    frame.render_widget(panel("Instances"), app.screen.right);
     draw_account_card(frame, app);
 
-    if app.launch_section == super::model::LaunchSection::Manage {
-        draw_manage(frame, app);
-    } else if app.creator.is_some() {
+    if app.creator.is_some() {
         draw_creator(frame, app);
     } else {
         for (offset, rect) in app.screen.version_rows.iter().copied().enumerate() {
@@ -168,8 +159,13 @@ fn draw_launch(frame: &mut Frame, app: &App) {
             let selected = index == app.version_selected;
             let style = row_style(selected, hot(app, rect));
             let mark = if selected { "▸" } else { " " };
+            let pin = if instance.id == app.default_instance {
+                "*"
+            } else {
+                " "
+            };
             let label = format!(
-                " {mark} {:<16} {:<10} {}",
+                " {mark}{pin} {:<16} {:<10} {}",
                 instance.name, instance.game_version, instance.loader
             );
             frame.render_widget(
@@ -230,7 +226,7 @@ fn draw_launch(frame: &mut Frame, app: &App) {
         ("PREPARING", theme::disabled_button())
     } else if app.selected_instance().is_none() {
         ("NO VERSION", theme::disabled_button())
-    } else if hot(app, app.screen.launch_button) {
+    } else if app.focus == Focus::LaunchButton || hot(app, app.screen.launch_button) {
         (
             "LAUNCH",
             theme::launch_button().add_modifier(Modifier::REVERSED),
@@ -239,6 +235,12 @@ fn draw_launch(frame: &mut Frame, app: &App) {
         ("LAUNCH", theme::launch_button())
     };
     paint_button(frame, app.screen.launch_button, label, style);
+    let edit_style = if app.focus == Focus::EditButton || hot(app, app.screen.edit_button) {
+        theme::selected()
+    } else {
+        theme::hover()
+    };
+    paint_button(frame, app.screen.edit_button, "EDIT", edit_style);
 
     if let Some(job) = &app.job {
         draw_job(
@@ -267,49 +269,77 @@ fn draw_launch(frame: &mut Frame, app: &App) {
     }
 }
 
-fn draw_manage(frame: &mut Frame, app: &App) {
-    let actions = ["Rename", "Description", "Duplicate", "Delete"];
-    let instance = app.selected_instance();
-    let header = match instance {
-        Some(item) => format!(" {}  {}", item.name, item.game_version),
-        None => " Select an instance on Play".into(),
-    };
-    let note = instance.map(|item| item.description.as_str()).unwrap_or("");
-    if app.screen.version_list.height > 0 {
-        frame.render_widget(
-            Paragraph::new(fit(&header, app.screen.version_list.width as usize))
-                .style(theme::muted().bg(theme::SURFACE)),
-            Rect::new(
-                app.screen.version_list.x,
-                app.screen.version_list.y,
-                app.screen.version_list.width,
-                1,
-            ),
-        );
-    }
-    if app.screen.version_list.height > 1 {
-        frame.render_widget(
-            Paragraph::new(fit(note, app.screen.version_list.width as usize))
-                .style(theme::muted().bg(theme::SURFACE)),
-            Rect::new(
-                app.screen.version_list.x,
-                app.screen.version_list.y.saturating_add(1),
-                app.screen.version_list.width,
-                1,
-            ),
-        );
-    }
-    for (index, action) in actions.iter().enumerate() {
-        let Some(rect) = app.screen.version_rows.get(index).copied() else {
+fn draw_edit(frame: &mut Frame, app: &App) {
+    frame.render_widget(panel("Edit instance"), app.screen.body);
+    let draft = app.draft.as_ref();
+    let rows = [
+        ("Name", draft.map(|item| item.name.as_str()).unwrap_or("")),
+        (
+            "Description",
+            draft.map(|item| item.description.as_str()).unwrap_or(""),
+        ),
+        (
+            "Default",
+            if draft.is_some_and(|item| item.id == app.default_instance) {
+                "this instance"
+            } else {
+                "set as default"
+            },
+        ),
+        ("Java", ""),
+        ("Memory min", ""),
+        ("Memory max", ""),
+        ("JVM args", ""),
+        ("Open folder", "file manager"),
+        ("Delete", "remove this instance"),
+    ];
+    for (index, (label, value)) in rows.iter().enumerate() {
+        let Some(rect) = app.screen.setting_rows.get(index).copied() else {
             continue;
         };
-        let selected = index == app.manage_selected;
+        let shown = match index {
+            3 => inherit_label(
+                draft.map(|item| item.java.as_str()).unwrap_or(""),
+                &app.java_path,
+                "auto",
+            ),
+            4 => inherit_label(
+                draft.map(|item| item.memory_min.as_str()).unwrap_or(""),
+                &app.memory_min,
+                "unset",
+            ),
+            5 => inherit_label(
+                draft.map(|item| item.memory_max.as_str()).unwrap_or(""),
+                &app.memory,
+                "2G",
+            ),
+            6 => inherit_label(
+                draft.map(|item| item.jvm_args.as_str()).unwrap_or(""),
+                &app.jvm_args,
+                "none",
+            ),
+            _ => (*value).to_string(),
+        };
+        let selected = index == app.setting_selected;
         let style = row_style(selected, hot(app, rect));
-        let mark = if selected { "▸" } else { " " };
+        let line = format!("  {:<14} {shown}", label);
         frame.render_widget(
-            Paragraph::new(fit(&format!(" {mark} {action}"), rect.width as usize)).style(style),
+            Paragraph::new(fit(&line, rect.width as usize)).style(style),
             rect,
         );
+    }
+}
+
+fn inherit_label(override_value: &str, global: &str, fallback: &str) -> String {
+    if override_value.trim().is_empty() {
+        let shown = if global.trim().is_empty() {
+            fallback
+        } else {
+            global
+        };
+        format!("inherit global ({shown})")
+    } else {
+        override_value.to_string()
     }
 }
 
@@ -368,32 +398,6 @@ fn draw_picker(frame: &mut Frame, app: &App) {
             Rect::new(inner.x, y, inner.width, 1),
         );
     }
-}
-
-fn draw_confirm_delete(frame: &mut Frame, app: &App) {
-    let name = app
-        .selected_instance()
-        .map(|item| item.name.as_str())
-        .unwrap_or("this instance");
-    let area = app.screen.body;
-    let width = area.width.clamp(24, 50);
-    let rect = Rect::new(
-        area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(6) / 2,
-        width,
-        6,
-    );
-    frame.render_widget(panel("Delete instance"), rect);
-    let inner = inner_of(rect);
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(format!(" Delete {name}?")),
-            Line::from(" The shared store is kept."),
-            Line::from(" Enter confirms, Esc cancels."),
-        ])
-        .style(theme::surface()),
-        inner,
-    );
 }
 
 fn draw_creator(frame: &mut Frame, app: &App) {
@@ -538,21 +542,23 @@ fn draw_download(frame: &mut Frame, app: &App) {
     } else {
         app.query.as_str()
     };
-    let search = format!(" search  {query}");
-    let search_style =
-        if matches!(app.focus, super::model::Focus::Search) || hot(app, app.screen.search) {
-            theme::hover()
-        } else {
-            theme::base()
-        };
-    frame.render_widget(
-        Paragraph::new(fit(&search, app.screen.search.width as usize)).style(search_style),
-        app.screen.search,
-    );
+    if app.search_open {
+        let search = format!(" search  {query}");
+        let search_style =
+            if matches!(app.focus, super::model::Focus::Search) || hot(app, app.screen.search) {
+                theme::hover()
+            } else {
+                theme::base()
+            };
+        frame.render_widget(
+            Paragraph::new(fit(&search, app.screen.search.width as usize)).style(search_style),
+            app.screen.search,
+        );
+    }
     let columns = Rect::new(
-        app.screen.search.x,
-        app.screen.search.y.saturating_add(1),
-        app.screen.search.width,
+        app.screen.download_list.x,
+        app.screen.download_list.y.saturating_sub(1),
+        app.screen.download_list.width,
         1,
     );
     frame.render_widget(
@@ -686,7 +692,8 @@ fn draw_more(frame: &mut Frame, app: &App) {
         Line::from("Settings stores the game directory, memory, Java, and username."),
         Line::from(""),
         Line::from("Mouse: click tabs, rows, and buttons. The wheel scrolls lists."),
-        Line::from("Keys: 1–4 switch pages, arrows move, enter activates, esc cancels, q quits."),
+        Line::from("Keys: Q/E pages, W/S move, A/D sideways, Enter activates, Esc goes back."),
+        Line::from("Ctrl+F searches downloads. O cycles instance sort. Ctrl+C quits."),
         Line::from(""),
         Line::from("Microsoft login uses a device code. Set an Azure client id first."),
     ];
@@ -924,6 +931,7 @@ mod tests {
         assert!(text.contains("Settings"), "{text}");
         assert!(text.contains("More"), "{text}");
         assert!(text.contains("LAUNCH"), "{text}");
+        assert!(text.contains("EDIT"), "{text}");
         assert!(text.contains("Steve"), "{text}");
         assert!(text.contains("1.21.1"), "{text}");
         assert!(text.contains("q quit") || text.contains("quit"), "{text}");
@@ -966,5 +974,45 @@ mod tests {
         assert!(text.contains("Username"), "{text}");
         assert!(text.contains("Sign in with Microsoft"), "{text}");
         assert!(text.contains("Save"), "{text}");
+    }
+
+    #[test]
+    fn edit_page_is_full_screen_and_shows_inherited_settings() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::preview();
+        app.page = Page::Edit;
+        app.draft = Some(super::super::model::InstanceDraft {
+            id: "vanilla".into(),
+            name: "Vanilla".into(),
+            description: "world".into(),
+            java: String::new(),
+            memory_min: String::new(),
+            memory_max: String::new(),
+            jvm_args: String::new(),
+        });
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let text = frame_text(terminal.backend().buffer());
+        assert!(text.contains("Edit instance"), "{text}");
+        assert!(text.contains("inherit global"), "{text}");
+        assert!(text.contains("Delete"), "{text}");
+        assert!(text.contains("Open folder"), "{text}");
+        assert!(!text.contains("Account"), "{text}");
+    }
+
+    #[test]
+    fn download_search_stays_hidden_until_ctrl_f() {
+        let backend = TestBackend::new(100, 36);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::preview();
+        app.page = Page::Download;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.screen.search.height, 0);
+        app.search_open = true;
+        app.query = "1.20".into();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let shown = frame_text(terminal.backend().buffer());
+        assert!(app.screen.search.height > 0);
+        assert!(shown.contains(" search  1.20"), "{shown}");
     }
 }

@@ -675,6 +675,9 @@ async fn cmd_launch(args: LaunchCli<'_>) -> Result<i32> {
         return Ok(0);
     }
     let mut child = spawn(&plan)?;
+    if instance::find(args.layout, &args.version)?.is_some() {
+        let _ = instance::touch_played(args.layout, &args.version);
+    }
     let status = child.wait().context("failed while waiting for Minecraft")?;
     Ok(status.code().unwrap_or(1))
 }

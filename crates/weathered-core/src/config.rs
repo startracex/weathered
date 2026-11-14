@@ -33,6 +33,18 @@ pub struct Config {
     /// Concurrent downloads. Zero uses 16.
     #[serde(default)]
     pub download_jobs: u32,
+    /// Minimum heap, such as `512M`. Empty omits `-Xms`.
+    #[serde(default)]
+    pub memory_min: String,
+    /// Extra JVM arguments used when an instance does not set its own.
+    #[serde(default)]
+    pub jvm_args: String,
+    /// Instance id pinned to the top of the list and selected at startup.
+    #[serde(default)]
+    pub default_instance: String,
+    /// `name`, `created`, or `played`.
+    #[serde(default)]
+    pub instance_sort: String,
 }
 
 impl Config {

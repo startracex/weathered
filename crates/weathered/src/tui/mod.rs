@@ -63,6 +63,10 @@ pub async fn run(game_dir: Option<PathBuf>) -> Result<i32> {
     if !config.memory.trim().is_empty() {
         app.memory = config.memory.trim().to_string();
     }
+    app.memory_min = config.memory_min.trim().to_string();
+    app.jvm_args = config.jvm_args.trim().to_string();
+    app.default_instance = config.default_instance.trim().to_string();
+    app.sort_mode = crate::tui::model::SortMode::parse(&config.instance_sort);
     if !config.offline_username.trim().is_empty() {
         app.username = config.offline_username.trim().to_string();
     }
@@ -191,42 +195,93 @@ async fn dispatch(
         Effect::ClosePicker => {
             stop_download(download_task);
         }
-        Effect::UpdateInstance { name, description } => {
-            let layout = DataLayout::new(&app.game_dir);
-            let id = app
-                .selected_instance()
-                .map(|item| item.id.clone())
-                .unwrap_or_default();
-            match instance::set_details(&layout, &id, &name, &description) {
-                Ok(instance) => app.note(format!("Saved {}", instance.name), false),
-                Err(err) => app.note(err.to_string(), true),
-            }
-            app.reload_local();
-        }
-        Effect::DuplicateInstance => {
-            let layout = DataLayout::new(&app.game_dir);
-            let id = app
-                .selected_instance()
-                .map(|item| item.id.clone())
-                .unwrap_or_default();
-            match instance::duplicate(&layout, &id) {
-                Ok(instance) => app.note(format!("Duplicated {}", instance.name), false),
-                Err(err) => app.note(err.to_string(), true),
-            }
-            app.reload_local();
-        }
         Effect::DeleteInstance => {
-            app.confirm_delete = false;
             let layout = DataLayout::new(&app.game_dir);
             let id = app
-                .selected_instance()
-                .map(|item| item.id.clone())
+                .draft
+                .as_ref()
+                .map(|draft| draft.id.clone())
+                .or_else(|| app.selected_instance().map(|item| item.id.clone()))
                 .unwrap_or_default();
             match instance::delete(&layout, &id) {
-                Ok(instance) => app.note(format!("Deleted {}", instance.name), false),
+                Ok(instance) => {
+                    if app.default_instance == instance.id {
+                        app.default_instance.clear();
+                        let _ = persist(app, config);
+                    }
+                    app.draft = None;
+                    app.note(format!("Deleted {}", instance.name), false);
+                }
                 Err(err) => app.note(err.to_string(), true),
             }
             app.reload_local();
+        }
+        Effect::SetDefault => {
+            let id = app
+                .draft
+                .as_ref()
+                .map(|draft| draft.id.clone())
+                .unwrap_or_default();
+            if id.is_empty() {
+                app.note("Select an instance first", true);
+            } else if app.default_instance == id {
+                app.default_instance.clear();
+                app.note("Default instance cleared", false);
+                if let Err(err) = persist(app, config) {
+                    app.note(format!("Could not save settings: {err}"), true);
+                }
+                app.reload_local();
+            } else {
+                app.default_instance = id;
+                app.note("Default instance set", false);
+                if let Err(err) = persist(app, config) {
+                    app.note(format!("Could not save settings: {err}"), true);
+                }
+                app.reload_local();
+            }
+        }
+        Effect::OpenFolder => {
+            let layout = DataLayout::new(&app.game_dir);
+            let id = app
+                .draft
+                .as_ref()
+                .map(|draft| draft.id.clone())
+                .unwrap_or_default();
+            match instance::find(&layout, &id) {
+                Ok(Some(instance)) => {
+                    if let Err(err) =
+                        instance::open_in_file_manager(std::path::Path::new(&instance.game_dir))
+                    {
+                        app.note(err.to_string(), true);
+                    } else {
+                        app.note("Opened the instance folder", false);
+                    }
+                }
+                Ok(None) => app.note("That instance is no longer on disk", true),
+                Err(err) => app.note(err.to_string(), true),
+            }
+        }
+        Effect::PersistDraft => {
+            let layout = DataLayout::new(&app.game_dir);
+            let Some(draft) = app.draft.clone() else {
+                return;
+            };
+            match instance::save_settings(
+                &layout,
+                &draft.id,
+                &draft.name,
+                &draft.description,
+                &draft.java,
+                &draft.memory_min,
+                &draft.memory_max,
+                &draft.jvm_args,
+            ) {
+                Ok(instance) => {
+                    app.note(format!("Saved {}", instance.name), false);
+                    app.reload_local();
+                }
+                Err(err) => app.note(err.to_string(), true),
+            }
         }
         Effect::CreateInstance { catalog_id } => {
             spawn_create(tx.clone(), app.game_dir.clone(), catalog_id);
@@ -301,6 +356,10 @@ async fn dispatch(
 fn persist(app: &App, config: &mut Config) -> weathered_core::Result<()> {
     config.game_dir = app.game_dir.display().to_string();
     config.memory = app.memory.clone();
+    config.memory_min = app.memory_min.clone();
+    config.jvm_args = app.jvm_args.clone();
+    config.default_instance = app.default_instance.clone();
+    config.instance_sort = app.sort_mode.label().to_string();
     config.java_path = app.java_path.clone();
     config.offline_username = app.username.clone();
     config.ms_client_id = app.client_id_input.clone();
@@ -679,6 +738,7 @@ fn spawn_launch(tx: mpsc::Sender<Msg>, params: LaunchParams, control: LaunchCont
                 return Err(weathered_core::Error::message("launch cancelled"));
             }
             let mut child = spawn_captured(&plan)?;
+            let _ = instance::touch_played(&layout, &params.instance_id);
             let stdout = child.stdout.take();
             let stderr = child.stderr.take();
             control.store(child);
@@ -896,6 +956,11 @@ fn map_key(key: crossterm::event::KeyEvent) -> Option<Key> {
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
         return Some(Key::CtrlC);
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('f') | KeyCode::Char('F'))
+    {
+        return Some(Key::CtrlF);
     }
     Some(match key.code {
         KeyCode::Char(ch) => Key::Char(ch),

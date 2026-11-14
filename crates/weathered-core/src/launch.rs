@@ -402,6 +402,35 @@ fn memory_arg(memory: &str) -> Option<String> {
     }
 }
 
+/// Insert a minimum heap and extra arguments ahead of the version's JVM args.
+pub fn apply_jvm_overrides(plan: &mut LaunchPlan, memory_min: &str, extra: &str) {
+    if let Some(min) = memory_flag("-Xms", memory_min) {
+        plan.jvm_args.insert(0, min);
+    }
+    let extra: Vec<String> = extra.split_whitespace().map(str::to_string).collect();
+    if extra.is_empty() {
+        return;
+    }
+    let at = plan
+        .jvm_args
+        .iter()
+        .position(|arg| arg.starts_with("-Xmx"))
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    for (offset, arg) in extra.into_iter().enumerate() {
+        plan.jvm_args.insert(at + offset, arg);
+    }
+}
+
+fn memory_flag(flag: &str, memory: &str) -> Option<String> {
+    let memory = memory.trim();
+    if memory.is_empty() || memory == "0" {
+        None
+    } else {
+        Some(format!("{flag}{memory}"))
+    }
+}
+
 fn join_classpath(libraries: &[PathBuf], client: &Path, separator: &str) -> String {
     let mut parts: Vec<String> = libraries
         .iter()
@@ -907,5 +936,21 @@ mod tests {
         assert!(!shown.contains("secret-token"));
         assert!(shown.contains("***"));
         assert!(plan.game_args.iter().any(|arg| arg == "secret-token"));
+    }
+
+    #[test]
+    fn jvm_overrides_insert_a_minimum_heap_and_extra_arguments() {
+        let spec = spec_for(
+            MODERN,
+            OsInfo::new(OsName::Linux, Arch::X86_64, ""),
+            FeatureSet::default(),
+        );
+        let mut plan = build_launch_plan(spec).unwrap();
+        apply_jvm_overrides(&mut plan, "512M", "-Dexample=1");
+        assert_eq!(plan.jvm_args[0], "-Xms512M");
+        assert!(plan.jvm_args.iter().any(|arg| arg == "-Dexample=1"));
+        let before = plan.jvm_args.len();
+        apply_jvm_overrides(&mut plan, "", "");
+        assert_eq!(plan.jvm_args.len(), before);
     }
 }

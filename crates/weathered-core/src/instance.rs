@@ -54,9 +54,21 @@ pub struct Instance {
     pub legacy: bool,
     /// Absolute game directory.
     pub game_dir: String,
-    /// Optional note shown on the manage page.
+    /// Optional note shown on the edit page.
     #[serde(default)]
     pub description: String,
+    /// Minimum heap, such as `512M`. Empty inherits the global setting.
+    #[serde(default)]
+    pub memory_min: String,
+    /// Extra JVM arguments. Empty inherits the global setting.
+    #[serde(default)]
+    pub jvm_args: String,
+    /// Unix seconds when the instance was created. Zero if unknown.
+    #[serde(default)]
+    pub created_at: i64,
+    /// Unix seconds when the instance was last launched. Zero if never.
+    #[serde(default)]
+    pub last_played: i64,
 }
 
 impl Instance {
@@ -83,7 +95,7 @@ impl Instance {
     }
 }
 
-/// Every instance, sorted by name.
+/// Every instance. Call [`order_instances`] to pin the default and sort the rest.
 pub fn list(layout: &DataLayout) -> Result<Vec<Instance>> {
     let dir = layout.instances_dir();
     let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -106,8 +118,115 @@ pub fn list(layout: &DataLayout) -> Result<Vec<Instance>> {
         }
         items.push(Instance::load_at(layout, &id)?);
     }
-    items.sort_by_key(|item| item.name.to_ascii_lowercase());
     Ok(items)
+}
+
+/// How the instance list is ordered after the default instance is pinned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstanceOrder {
+    /// Alphabetical by name.
+    Name,
+    /// Newest creation time first.
+    Created,
+    /// Most recently launched first.
+    Played,
+}
+
+impl InstanceOrder {
+    /// Next mode in the cycle name, created, played.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Name => Self::Created,
+            Self::Created => Self::Played,
+            Self::Played => Self::Name,
+        }
+    }
+
+    /// Value stored in the config file.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Created => "created",
+            Self::Played => "played",
+        }
+    }
+
+    /// Parse a stored sort mode. Unknown values are name order.
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "created" => Self::Created,
+            "played" => Self::Played,
+            _ => Self::Name,
+        }
+    }
+}
+
+/// Pin `default_id` first, then order the rest.
+pub fn order_instances(items: &mut [Instance], order: InstanceOrder, default_id: &str) {
+    items.sort_by(|left, right| {
+        let left_default = left.id == default_id;
+        let right_default = right.id == default_id;
+        right_default.cmp(&left_default).then_with(|| match order {
+            InstanceOrder::Name => left
+                .name
+                .to_ascii_lowercase()
+                .cmp(&right.name.to_ascii_lowercase()),
+            InstanceOrder::Created => right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| left.name.cmp(&right.name)),
+            InstanceOrder::Played => right
+                .last_played
+                .cmp(&left.last_played)
+                .then_with(|| left.name.cmp(&right.name)),
+        })
+    });
+}
+
+/// Record that an instance was launched.
+pub fn touch_played(layout: &DataLayout, id: &str) -> Result<()> {
+    let Some(mut instance) = find(layout, id)? else {
+        return Ok(());
+    };
+    instance.last_played = unix_now();
+    instance.save(layout)
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Open `path` in the system file manager.
+pub fn open_in_file_manager(path: &Path) -> Result<()> {
+    let mut command = file_manager(path);
+    command
+        .spawn()
+        .map_err(|err| Error::message(format!("could not open {}: {err}", path.display())))?;
+    Ok(())
+}
+
+fn file_manager(path: &Path) -> std::process::Command {
+    #[cfg(windows)]
+    {
+        let mut command = std::process::Command::new("explorer");
+        command.arg(path);
+        command
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut command = std::process::Command::new("open");
+        command.arg(path);
+        command
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let mut command = std::process::Command::new("xdg-open");
+        command.arg(path);
+        command
+    }
 }
 
 /// Find an instance by id or by name.
@@ -154,6 +273,10 @@ pub fn migrate_legacy(layout: &DataLayout) -> Result<Vec<Instance>> {
             legacy: true,
             game_dir: layout.root.display().to_string(),
             description: String::new(),
+            memory_min: String::new(),
+            jvm_args: String::new(),
+            created_at: 0,
+            last_played: 0,
         };
         instance.save(layout)?;
         created.push(instance);
@@ -242,6 +365,10 @@ pub fn create(
         legacy: false,
         game_dir: game_dir.display().to_string(),
         description: String::new(),
+        memory_min: String::new(),
+        jvm_args: String::new(),
+        created_at: unix_now(),
+        last_played: 0,
     };
     instance.save(layout)?;
     Ok(instance)
@@ -263,6 +390,34 @@ pub fn delete(layout: &DataLayout, query: &str) -> Result<Instance> {
     } else {
         std::fs::remove_dir_all(&dir).io_at(&dir)?;
     }
+    Ok(instance)
+}
+
+/// Write the fields edited on the instance page. Empty overrides inherit globals.
+#[allow(clippy::too_many_arguments)]
+pub fn save_settings(
+    layout: &DataLayout,
+    query: &str,
+    name: &str,
+    description: &str,
+    java: &str,
+    memory_min: &str,
+    memory_max: &str,
+    jvm_args: &str,
+) -> Result<Instance> {
+    let mut instance = find(layout, query)?
+        .ok_or_else(|| Error::message(format!("no instance matches '{query}'")))?;
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(Error::message("instance name cannot be empty"));
+    }
+    instance.name = name.to_string();
+    instance.description = description.trim().to_string();
+    instance.java = java.trim().to_string();
+    instance.memory_min = memory_min.trim().to_string();
+    instance.memory = memory_max.trim().to_string();
+    instance.jvm_args = jvm_args.trim().to_string();
+    instance.save(layout)?;
     Ok(instance)
 }
 
@@ -302,6 +457,8 @@ pub fn duplicate(layout: &DataLayout, query: &str) -> Result<Instance> {
     copy.id = id;
     copy.name = format!("{} copy", copy.name);
     copy.game_dir = layout.instance_game(&copy.id).display().to_string();
+    copy.created_at = unix_now();
+    copy.last_played = 0;
     copy.save(layout)?;
     Ok(copy)
 }
@@ -396,10 +553,16 @@ pub async fn prepare_launch(
     if request.java.is_none() && !instance.java.trim().is_empty() {
         request.java = Some(PathBuf::from(instance.java.trim()));
     }
+    let config = crate::config::Config::load().unwrap_or_default();
+    let memory_min = inherited(&instance.memory_min, &config.memory_min);
+    let extra_jvm = inherited(&instance.jvm_args, &config.jvm_args);
     let game_dir = PathBuf::from(&instance.game_dir);
     if instance.legacy {
         request.version_id = instance.version_id;
-        return launch::prepare_launch(client, &GamePaths::new(&game_dir), request, progress).await;
+        let mut plan =
+            launch::prepare_launch(client, &GamePaths::new(&game_dir), request, progress).await?;
+        launch::apply_jvm_overrides(&mut plan, &memory_min, &extra_jvm);
+        return Ok(plan);
     }
     let paths = GamePaths::new(&game_dir);
     let manifest = empty_manifest();
@@ -475,7 +638,7 @@ pub async fn prepare_launch(
     .await?;
     let index_name = version::asset_index_name(&resolved.info).unwrap_or_default();
     let shared = layout.shared_assets();
-    build_launch_plan(LaunchSpec {
+    let mut plan = build_launch_plan(LaunchSpec {
         version: resolved.info.clone(),
         classpath,
         client_jar,
@@ -502,7 +665,17 @@ pub async fn prepare_launch(
         launcher_version: LAUNCHER_VERSION.into(),
         argfile: paths.argfile(),
         java_warning: None,
-    })
+    })?;
+    launch::apply_jvm_overrides(&mut plan, &memory_min, &extra_jvm);
+    Ok(plan)
+}
+
+fn inherited(instance_value: &str, global: &str) -> String {
+    if instance_value.trim().is_empty() {
+        global.trim().to_string()
+    } else {
+        instance_value.trim().to_string()
+    }
 }
 
 fn materialize_version(layout: &DataLayout, item: &CatalogItem, game_dir: &Path) -> Result<()> {
@@ -752,7 +925,45 @@ mod tests {
             .unwrap();
         assert!(again.cached);
         assert_eq!(sha512_hex(client), stored_client.sha512);
+        let mut items = list(&layout).unwrap();
+        order_instances(&mut items, InstanceOrder::Name, &instance.id);
+        assert_eq!(items[0].id, instance.id);
+        set_details(&layout, &instance.id, "Skyblock", "a small world").unwrap();
+        let renamed = find(&layout, "skyblock").unwrap().unwrap();
+        assert_eq!(renamed.description, "a small world");
+        let copy = duplicate(&layout, &renamed.id).unwrap();
+        assert!(PathBuf::from(&copy.game_dir).join("mods").is_dir());
+        assert!(store.object_count() >= 2);
+        let mut older = find(&layout, &copy.id).unwrap().unwrap();
+        older.created_at = 1;
+        older.last_played = 50;
+        older.save(&layout).unwrap();
+        let mut newer = find(&layout, &renamed.id).unwrap().unwrap();
+        newer.created_at = 20;
+        newer.last_played = 1;
+        newer.save(&layout).unwrap();
+        let mut ordered = list(&layout).unwrap();
+        order_instances(&mut ordered, InstanceOrder::Created, "");
+        assert_eq!(ordered[0].id, newer.id);
+        order_instances(&mut ordered, InstanceOrder::Played, "");
+        assert_eq!(ordered[0].id, older.id);
+        order_instances(&mut ordered, InstanceOrder::Name, &older.id);
+        assert_eq!(ordered[0].id, older.id);
+        delete(&layout, &copy.id).unwrap();
+        assert!(store.object_path(&stored_client.sha512).unwrap().is_file());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_manager_uses_the_desktop_opener() {
+        let command = file_manager(Path::new("."));
+        let program = command.get_program().to_string_lossy();
+        #[cfg(windows)]
+        assert_eq!(program, "explorer");
+        #[cfg(target_os = "macos")]
+        assert_eq!(program, "open");
+        #[cfg(all(unix, not(target_os = "macos")))]
+        assert_eq!(program, "xdg-open");
     }
 
     #[test]

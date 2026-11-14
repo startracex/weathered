@@ -95,9 +95,13 @@ If the data directory already contains `versions/<id>/<id>.jar` from an earlier 
 
 `weathered` with no subcommand opens the full-screen UI. `weathered tui` does the same thing.
 
-The layout follows Plain Craft Launcher: a top bar for Launch, Download, Settings, and More; a launch page with the account on the left, the instance list on the right, and a Launch button; a download page split into release, snapshot, old, Fabric, Quilt, Forge, and NeoForge; and a settings page for the data directory, Java, memory, offline username, and Microsoft sign-in. `[Q]` and `[E]` move between those pages. `[A]` and `[D]` move between the sub-tabs on the current page (Play/Manage, or the download categories). The screen is dark, with a weathered-copper teal for the selection and a greener Launch control.
+The layout follows Plain Craft Launcher: a top bar for Launch, Download, Settings, and More; a launch page with the account on the left and the instance list on the right; a download page split into release, snapshot, old, Fabric, Quilt, Forge, and NeoForge; and a settings page for the data directory, Java, memory, JVM arguments, offline username, and Microsoft sign-in. The screen is dark, with a weathered-copper teal for the selection and a greener Launch control.
 
-Click a tab, a version, or a button. The wheel scrolls the version lists. Keys work too: `1`–`4` switch pages, the arrows move, Enter activates, Esc cancels a download or a dialog, and Ctrl+C quits. `Q`, `E`, `A`, and `D` are typed normally while a text field is focused. Manage can rename an instance, edit its description, duplicate it, or delete it. Delete removes only that instance directory. The shared store stays. Fabric, Quilt, Forge, and NeoForge installs open a loader-version list first. The newest stable or recommended build is selected. `B` shows unstable builds.
+`[Q]` and `[E]` switch those pages. `[W]` and `[S]` move up and down. `[A]` and `[D]` move left and right, the same as the arrow keys. On the instance list, right lands on Launch and then Edit. `1`–`4` also switch pages. Enter activates the focused control, so starting the app and pressing Enter launches the pinned default instance. Text fields still accept `q`, `e`, `w`, `s`, `a`, and `d` as letters. Ctrl+C quits.
+
+The search box on Download stays hidden until Ctrl+F. The first Esc clears that search. A later Esc cancels a download, closes the loader picker, or leaves the edit page. `O` cycles the instance list between name, creation time, and last played. The choice is saved. The default instance stays pinned at the top and is selected when the UI opens.
+
+The selected instance shows Launch and Edit on the right. Edit is its own page, without the account panel. It renames the instance, edits the description, sets or clears the default, deletes the instance, and sets Java, minimum memory, maximum memory, and JVM arguments. An empty override shows `inherit global` and uses the settings page value. Clearing the field returns it to that inherited value. Open folder opens the instance game directory in the system file manager. Actions run immediately. Delete removes only that instance directory. The shared store stays. Fabric, Quilt, Forge, and NeoForge installs open a loader-version list first. The newest stable or recommended build is selected. `B` shows unstable builds.
 
 ```sh
 weathered --game-dir ~/.local/share/weathered
@@ -114,15 +118,15 @@ A rendered Launch page:
 │ Profiles                     │ │ + New instance                               │
 │ ▸ Steve          offline     │ │              Vanilla  ·  1.21.1  ·  2G        │
 │                              │ │                   LAUNCH                      │
+│                              │ │                    EDIT                       │
 ╰──────────────────────────────╯ ╰───────────────────────────────────────────────╯
- Ready  ·  1-4 pages   ↑↓ move   enter   click & wheel   q quit
+ Ready  ·  [Q]/[E] pages  [W]/[S] move  [A]/[D] sideways  Ctrl+C quit
 ```
 
 Download progress stays on screen while files are fetched:
 
 ```text
   Release   Snapshot   Old
-  search
 ╭ Versions ──────────────────────────────────────────────────────────────────────╮
 │ ▸ 1.21.1               2024-08-08   in store                        reinstall  │
 │   1.20.4               2023-12-07   not stored                      install    │

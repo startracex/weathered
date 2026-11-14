@@ -16,12 +16,14 @@ pub enum Page {
     Download,
     Settings,
     More,
+    /// Full-screen instance editor. It is not one of the Q/E tabs.
+    Edit,
 }
 
 impl Page {
     pub fn index(self) -> usize {
         match self {
-            Self::Launch => 0,
+            Self::Launch | Self::Edit => 0,
             Self::Download => 1,
             Self::Settings => 2,
             Self::More => 3,
@@ -43,6 +45,7 @@ impl Page {
             Self::Download => "Download",
             Self::Settings => "Settings",
             Self::More => "More",
+            Self::Edit => "Edit",
         }
     }
 }
@@ -98,6 +101,7 @@ pub enum Focus {
     Versions,
     Accounts,
     LaunchButton,
+    EditButton,
     DownloadCats,
     DownloadList,
     Search,
@@ -121,6 +125,7 @@ pub enum Key {
     Home,
     End,
     CtrlC,
+    CtrlF,
 }
 
 /// Pointer input already translated from the terminal.
@@ -147,12 +152,10 @@ pub enum Effect {
         create_instance: bool,
     },
     ClosePicker,
-    UpdateInstance {
-        name: String,
-        description: String,
-    },
-    DuplicateInstance,
     DeleteInstance,
+    SetDefault,
+    OpenFolder,
+    PersistDraft,
     CreateInstance {
         catalog_id: String,
     },
@@ -260,11 +263,50 @@ pub struct LoaderPicker {
     pub create_instance: bool,
 }
 
-/// Secondary page on Launch.
+/// How the instance list is ordered under the pinned default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LaunchSection {
-    Play,
-    Manage,
+pub enum SortMode {
+    Name,
+    Created,
+    Played,
+}
+
+impl SortMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Name => Self::Created,
+            Self::Created => Self::Played,
+            Self::Played => Self::Name,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Created => "created",
+            Self::Played => "played",
+        }
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "created" => Self::Created,
+            "played" => Self::Played,
+            _ => Self::Name,
+        }
+    }
+}
+
+/// Editable copy of one instance. Empty override fields inherit globals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceDraft {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub java: String,
+    pub memory_min: String,
+    pub memory_max: String,
+    pub jvm_args: String,
 }
 
 /// One downloaded profile that can become an instance.
@@ -325,6 +367,12 @@ pub enum Field {
     PackPath,
     Rename,
     Description,
+    JavaOverride,
+    MemoryMin,
+    MemoryMax,
+    JvmArgs,
+    MemoryMinGlobal,
+    JvmGlobal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -376,9 +424,13 @@ pub struct App {
     pub creator: Option<CreatorStep>,
     pub creator_selected: usize,
     pub picker: Option<LoaderPicker>,
-    pub launch_section: LaunchSection,
-    pub manage_selected: usize,
-    pub confirm_delete: bool,
+    pub search_open: bool,
+    pub sort_mode: SortMode,
+    pub default_instance: String,
+    pub memory_min: String,
+    pub jvm_args: String,
+    pub draft: Option<InstanceDraft>,
+    pub startup_select: bool,
     pub pending_create: bool,
     /// Late progress from a cancelled task must not lock the screen again.
     pub ignore_job: bool,
@@ -427,9 +479,13 @@ impl App {
             creator: None,
             creator_selected: 0,
             picker: None,
-            launch_section: LaunchSection::Play,
-            manage_selected: 0,
-            confirm_delete: false,
+            search_open: false,
+            sort_mode: SortMode::Name,
+            default_instance: String::new(),
+            memory_min: String::new(),
+            jvm_args: String::new(),
+            draft: None,
+            startup_select: true,
             pending_create: false,
             ignore_job: false,
             version_selected: 0,
@@ -566,9 +622,29 @@ impl App {
                 selected_mark: false,
             },
             SettingRow {
-                label: "Memory".into(),
+                label: "Memory max".into(),
                 value: self.memory.clone(),
                 kind: SettingKind::Edit(Field::Memory),
+                selected_mark: false,
+            },
+            SettingRow {
+                label: "Memory min".into(),
+                value: if self.memory_min.is_empty() {
+                    "unset".into()
+                } else {
+                    self.memory_min.clone()
+                },
+                kind: SettingKind::Edit(Field::MemoryMinGlobal),
+                selected_mark: false,
+            },
+            SettingRow {
+                label: "JVM args".into(),
+                value: if self.jvm_args.is_empty() {
+                    "unset".into()
+                } else {
+                    self.jvm_args.clone()
+                },
+                kind: SettingKind::Edit(Field::JvmGlobal),
                 selected_mark: false,
             },
             SettingRow {
@@ -642,8 +718,24 @@ impl App {
     pub fn reload_local(&mut self) {
         let layout = weathered_core::paths::DataLayout::new(&self.game_dir);
         let _ = weathered_core::instance::migrate_legacy(&layout);
-        self.instances = weathered_core::instance::list(&layout)
-            .unwrap_or_default()
+        let mut found = weathered_core::instance::list(&layout).unwrap_or_default();
+        let order = match self.sort_mode {
+            SortMode::Name => weathered_core::instance::InstanceOrder::Name,
+            SortMode::Created => weathered_core::instance::InstanceOrder::Created,
+            SortMode::Played => weathered_core::instance::InstanceOrder::Played,
+        };
+        weathered_core::instance::order_instances(&mut found, order, &self.default_instance);
+        let keep = if self.startup_select {
+            self.version_selected = 0;
+            self.version_scroll = 0;
+            self.startup_select = false;
+            None
+        } else {
+            self.instances
+                .get(self.version_selected)
+                .map(|item| item.id.clone())
+        };
+        self.instances = found
             .into_iter()
             .map(|item| InstanceRow {
                 id: item.id,
@@ -654,6 +746,11 @@ impl App {
                 legacy: item.legacy,
             })
             .collect();
+        if let Some(id) = keep {
+            if let Some(index) = self.instances.iter().position(|item| item.id == id) {
+                self.version_selected = index;
+            }
+        }
         self.catalog_items = weathered_core::catalog::list(&layout)
             .unwrap_or_default()
             .into_iter()
@@ -689,15 +786,9 @@ impl App {
         if self.editing.is_some() {
             return self.on_edit_key(key);
         }
-        if self.confirm_delete {
-            return match key {
-                Key::Enter => Effect::DeleteInstance,
-                Key::Esc => {
-                    self.confirm_delete = false;
-                    Effect::None
-                }
-                _ => Effect::None,
-            };
+        if self.search_open && key == Key::Esc {
+            self.clear_search();
+            return Effect::None;
         }
         if self.picker.is_some() {
             return self.on_picker_key(key);
@@ -708,6 +799,22 @@ impl App {
         if key == Key::Esc && self.creator.is_some() {
             self.creator = None;
             return Effect::None;
+        }
+        if key == Key::Esc && self.page == Page::Edit {
+            self.page = Page::Launch;
+            self.focus = Focus::Versions;
+            return Effect::None;
+        }
+        if key == Key::CtrlF && self.page == Page::Download {
+            self.search_open = true;
+            self.begin_edit(Field::Search, self.query.clone());
+            return Effect::None;
+        }
+        if key == Key::Char('o') && self.page == Page::Launch && self.creator.is_none() {
+            self.sort_mode = self.sort_mode.next();
+            self.reload_local();
+            self.note(format!("Sort by {}", self.sort_mode.label()), false);
+            return Effect::Save;
         }
         if key == Key::Char('n') && self.page == Page::Launch && self.creator.is_none() {
             self.open_creator();
@@ -722,12 +829,14 @@ impl App {
                 self.shift_page(1);
                 Effect::None
             }
-            Key::Char('a') => {
-                self.shift_sub(-1);
+            Key::Char('a') => self.nudge_side(-1),
+            Key::Char('d') => self.nudge_side(1),
+            Key::Char('w') => {
+                self.nudge(-1);
                 Effect::None
             }
-            Key::Char('d') => {
-                self.shift_sub(1);
+            Key::Char('s') => {
+                self.nudge(1);
                 Effect::None
             }
             Key::Char('1') => self.goto(Page::Launch),
@@ -735,6 +844,7 @@ impl App {
             Key::Char('3') => self.goto(Page::Settings),
             Key::Char('4') => self.goto(Page::More),
             Key::Char('/') if self.page == Page::Download => {
+                self.search_open = true;
                 self.begin_edit(Field::Search, self.query.clone());
                 Effect::None
             }
@@ -883,20 +993,6 @@ impl App {
         let _ = self.goto(Page::from_index(next));
     }
 
-    fn shift_sub(&mut self, delta: isize) {
-        match self.page {
-            Page::Download => self.shift_category(delta),
-            Page::Launch => {
-                self.launch_section = if delta > 0 {
-                    LaunchSection::Manage
-                } else {
-                    LaunchSection::Play
-                };
-            }
-            Page::Settings | Page::More => {}
-        }
-    }
-
     fn on_picker_key(&mut self, key: Key) -> Effect {
         if self.picker.is_none() {
             return Effect::None;
@@ -999,7 +1095,7 @@ impl App {
         self.focus = match page {
             Page::Launch => Focus::Versions,
             Page::Download => Focus::DownloadList,
-            Page::Settings => Focus::Settings(self.setting_selected),
+            Page::Settings | Page::Edit => Focus::Settings(self.setting_selected),
             Page::More => Focus::More,
         };
         Effect::None
@@ -1009,17 +1105,20 @@ impl App {
         self.focus = match (self.page, self.focus, reverse) {
             (Page::Launch, Focus::Versions, false) => Focus::Accounts,
             (Page::Launch, Focus::Accounts, false) => Focus::LaunchButton,
+            (Page::Launch, Focus::LaunchButton, false) => Focus::EditButton,
             (Page::Launch, _, false) => Focus::Versions,
-            (Page::Launch, Focus::Versions, true) => Focus::LaunchButton,
+            (Page::Launch, Focus::Versions, true) => Focus::EditButton,
+            (Page::Launch, Focus::EditButton, true) => Focus::LaunchButton,
             (Page::Launch, Focus::LaunchButton, true) => Focus::Accounts,
             (Page::Launch, _, true) => Focus::Versions,
             (Page::Download, Focus::DownloadList, false) => Focus::DownloadCats,
-            (Page::Download, Focus::DownloadCats, false) => Focus::Search,
+            (Page::Download, Focus::DownloadCats, false) if self.search_open => Focus::Search,
             (Page::Download, _, false) => Focus::DownloadList,
-            (Page::Download, Focus::DownloadList, true) => Focus::Search,
+            (Page::Download, Focus::DownloadList, true) if self.search_open => Focus::Search,
             (Page::Download, Focus::Search, true) => Focus::DownloadCats,
+            (Page::Download, Focus::DownloadList, true) => Focus::DownloadCats,
             (Page::Download, _, true) => Focus::DownloadList,
-            (Page::Settings, _, _) => Focus::Settings(self.setting_selected),
+            (Page::Settings | Page::Edit, _, _) => Focus::Settings(self.setting_selected),
             (Page::More, _, _) => Focus::More,
         };
     }
@@ -1037,8 +1136,14 @@ impl App {
                 let len = self.creator_len();
                 bump(&mut self.creator_selected, len, delta.signum());
             }
-            Page::Launch if self.launch_section == LaunchSection::Manage => {
-                bump(&mut self.manage_selected, 4, delta.signum());
+            Page::Launch
+                if self.focus == Focus::LaunchButton || self.focus == Focus::EditButton =>
+            {
+                self.focus = if delta < 0 {
+                    Focus::LaunchButton
+                } else {
+                    Focus::EditButton
+                };
             }
             Page::Launch => {
                 self.focus = Focus::Versions;
@@ -1070,10 +1175,38 @@ impl App {
                 self.focus = Focus::Settings(self.setting_selected);
             }
             Page::More => {}
+            Page::Edit => {
+                bump(&mut self.setting_selected, 9, delta.signum());
+                self.focus = Focus::Settings(self.setting_selected);
+            }
         }
     }
 
     fn nudge_side(&mut self, delta: isize) -> Effect {
+        if self.page == Page::Edit {
+            return Effect::None;
+        }
+        if self.page == Page::Launch && self.creator.is_none() {
+            match (self.focus, delta.signum()) {
+                (Focus::Versions | Focus::Accounts, 1) => {
+                    self.focus = Focus::LaunchButton;
+                    return Effect::None;
+                }
+                (Focus::LaunchButton, 1) => {
+                    self.focus = Focus::EditButton;
+                    return Effect::None;
+                }
+                (Focus::EditButton, -1) => {
+                    self.focus = Focus::LaunchButton;
+                    return Effect::None;
+                }
+                (Focus::LaunchButton | Focus::Accounts, -1) => {
+                    self.focus = Focus::Versions;
+                    return Effect::None;
+                }
+                _ => {}
+            }
+        }
         if self.focus == Focus::DownloadCats {
             self.shift_category(delta.signum());
             return Effect::None;
@@ -1109,9 +1242,10 @@ impl App {
             return self.activate_creator();
         }
         match self.page {
-            Page::Launch if self.launch_section == LaunchSection::Manage => self.activate_manage(),
+            Page::Launch if self.focus == Focus::EditButton => self.open_edit(),
             Page::Launch if self.focus == Focus::Accounts => Effect::None,
             Page::Launch => self.request_launch(),
+            Page::Edit => self.activate_edit(),
             Page::Download if self.focus == Focus::Search => {
                 self.begin_edit(Field::Search, self.query.clone());
                 Effect::None
@@ -1156,10 +1290,6 @@ impl App {
                 self.activate_creator()
             }
             Click::Version(index) => {
-                if self.launch_section == LaunchSection::Manage {
-                    self.manage_selected = index;
-                    return self.activate_manage();
-                }
                 self.page = Page::Launch;
                 self.focus = Focus::Versions;
                 let now = Instant::now();
@@ -1174,6 +1304,7 @@ impl App {
                     Effect::None
                 }
             }
+            Click::EditButton => self.open_edit(),
             Click::LaunchButton => {
                 self.focus = Focus::LaunchButton;
                 if self.game_running {
@@ -1203,6 +1334,11 @@ impl App {
                 self.request_install(index)
             }
             Click::Setting(index) => {
+                if self.page == Page::Edit {
+                    self.setting_selected = index;
+                    self.focus = Focus::Settings(index);
+                    return self.activate_edit();
+                }
                 self.page = Page::Settings;
                 self.setting_selected = index;
                 self.focus = Focus::Settings(index);
@@ -1343,26 +1479,77 @@ impl App {
         }
     }
 
-    fn activate_manage(&mut self) -> Effect {
-        let Some(instance) = self.selected_instance() else {
-            self.note("Select an instance on the Play page first", true);
+    fn open_edit(&mut self) -> Effect {
+        let Some(row) = self.selected_instance() else {
+            self.note("Select an instance first", true);
             return Effect::None;
         };
-        match self.manage_selected {
+        let layout = weathered_core::paths::DataLayout::new(&self.game_dir);
+        let Ok(Some(instance)) = weathered_core::instance::find(&layout, &row.id) else {
+            self.note("That instance is no longer on disk", true);
+            return Effect::None;
+        };
+        self.draft = Some(InstanceDraft {
+            id: instance.id,
+            name: instance.name,
+            description: instance.description,
+            java: instance.java,
+            memory_min: instance.memory_min,
+            memory_max: instance.memory,
+            jvm_args: instance.jvm_args,
+        });
+        self.page = Page::Edit;
+        self.setting_selected = 0;
+        self.focus = Focus::Settings(0);
+        Effect::None
+    }
+
+    fn activate_edit(&mut self) -> Effect {
+        let Some(draft) = self.draft.clone() else {
+            self.page = Page::Launch;
+            return Effect::None;
+        };
+        match self.setting_selected {
             0 => {
-                self.begin_edit(Field::Rename, instance.name.clone());
+                self.begin_edit(Field::Rename, draft.name);
                 Effect::None
             }
             1 => {
-                self.begin_edit(Field::Description, instance.description.clone());
+                self.begin_edit(Field::Description, draft.description);
                 Effect::None
             }
-            2 => Effect::DuplicateInstance,
-            _ => {
-                self.confirm_delete = true;
+            2 => Effect::SetDefault,
+            3 => {
+                self.begin_edit(Field::JavaOverride, draft.java);
                 Effect::None
+            }
+            4 => {
+                self.begin_edit(Field::MemoryMin, draft.memory_min);
+                Effect::None
+            }
+            5 => {
+                self.begin_edit(Field::MemoryMax, draft.memory_max);
+                Effect::None
+            }
+            6 => {
+                self.begin_edit(Field::JvmArgs, draft.jvm_args);
+                Effect::None
+            }
+            7 => Effect::OpenFolder,
+            _ => {
+                self.page = Page::Launch;
+                Effect::DeleteInstance
             }
         }
+    }
+
+    fn clear_search(&mut self) {
+        self.query.clear();
+        self.search_open = false;
+        self.editing = None;
+        self.download_selected = 0;
+        self.download_scroll = 0;
+        self.focus = Focus::DownloadList;
     }
 
     fn open_creator(&mut self) {
@@ -1447,6 +1634,28 @@ impl App {
                         .selected_instance()
                         .map(|item| item.description.clone())
                         .unwrap_or_default(),
+                    Field::JavaOverride => self
+                        .draft
+                        .as_ref()
+                        .map(|draft| draft.java.clone())
+                        .unwrap_or_default(),
+                    Field::MemoryMin => self
+                        .draft
+                        .as_ref()
+                        .map(|draft| draft.memory_min.clone())
+                        .unwrap_or_default(),
+                    Field::MemoryMax => self
+                        .draft
+                        .as_ref()
+                        .map(|draft| draft.memory_max.clone())
+                        .unwrap_or_default(),
+                    Field::JvmArgs => self
+                        .draft
+                        .as_ref()
+                        .map(|draft| draft.jvm_args.clone())
+                        .unwrap_or_default(),
+                    Field::MemoryMinGlobal => self.memory_min.clone(),
+                    Field::JvmGlobal => self.jvm_args.clone(),
                 };
                 self.begin_edit(field, current);
                 Effect::None
@@ -1476,11 +1685,13 @@ impl App {
     fn on_edit_key(&mut self, key: Key) -> Effect {
         match key {
             Key::Esc => {
-                if let Some(editor) = self.editing.clone() {
-                    if editor.field == Field::Search {
-                        self.query = editor.origin;
-                        self.clamp_download();
-                    }
+                if self
+                    .editing
+                    .as_ref()
+                    .is_some_and(|editor| editor.field == Field::Search)
+                {
+                    self.clear_search();
+                    return Effect::None;
                 }
                 self.editing = None;
                 Effect::None
@@ -1561,8 +1772,14 @@ impl App {
             return Effect::None;
         };
         match editor.field {
-            Field::Memory if !valid_memory(&editor.buffer) => {
+            Field::Memory | Field::MemoryMax | Field::MemoryMin | Field::MemoryMinGlobal
+                if !editor.buffer.trim().is_empty() && !valid_memory(&editor.buffer) =>
+            {
                 self.note("Memory should look like 2G or 4096M", true);
+                return Effect::None;
+            }
+            Field::Rename if editor.buffer.trim().is_empty() => {
+                self.note("Name cannot be empty", true);
                 return Effect::None;
             }
             Field::Username if editor.buffer.trim().is_empty() => {
@@ -1594,6 +1811,12 @@ impl App {
                 self.reload_local();
             }
             Field::Memory => self.memory = editor.buffer.trim().to_string(),
+            Field::MemoryMinGlobal => self.memory_min = editor.buffer.trim().to_string(),
+            Field::JvmGlobal => self.jvm_args = editor.buffer.trim().to_string(),
+            Field::JavaOverride | Field::MemoryMin | Field::MemoryMax | Field::JvmArgs => {
+                self.write_draft(editor.field, editor.buffer.trim());
+                return Effect::PersistDraft;
+            }
             Field::Username => {
                 self.username = editor.buffer.trim().to_string();
                 self.sync_offline_profile();
@@ -1607,29 +1830,28 @@ impl App {
                 self.clamp_download();
                 return Effect::None;
             }
-            Field::Rename => {
-                let description = self
-                    .selected_instance()
-                    .map(|item| item.description.clone())
-                    .unwrap_or_default();
-                return Effect::UpdateInstance {
-                    name: editor.buffer.trim().to_string(),
-                    description,
-                };
-            }
-            Field::Description => {
-                let name = self
-                    .selected_instance()
-                    .map(|item| item.name.clone())
-                    .unwrap_or_default();
-                return Effect::UpdateInstance {
-                    name,
-                    description: editor.buffer.trim().to_string(),
-                };
+            Field::Rename | Field::Description => {
+                self.write_draft(editor.field, editor.buffer.trim());
+                return Effect::PersistDraft;
             }
         }
         self.note("Settings updated", false);
         Effect::Save
+    }
+
+    fn write_draft(&mut self, field: Field, value: &str) {
+        let Some(draft) = self.draft.as_mut() else {
+            return;
+        };
+        match field {
+            Field::Rename => draft.name = value.to_string(),
+            Field::Description => draft.description = value.to_string(),
+            Field::JavaOverride => draft.java = value.to_string(),
+            Field::MemoryMin => draft.memory_min = value.to_string(),
+            Field::MemoryMax => draft.memory_max = value.to_string(),
+            Field::JvmArgs => draft.jvm_args = value.to_string(),
+            _ => {}
+        }
     }
 
     fn commit_edit_if_any(&mut self) {
@@ -1733,6 +1955,7 @@ pub enum Click {
     Refresh,
     CancelLogin,
     CancelJob,
+    EditButton,
     Stop,
 }
 
@@ -1832,6 +2055,7 @@ pub struct Screen {
     pub version_list: Rect,
     pub version_rows: Vec<Rect>,
     pub launch_button: Rect,
+    pub edit_button: Rect,
     pub new_instance: Rect,
     pub progress: Rect,
     pub cancel: Rect,
@@ -1902,6 +2126,7 @@ pub fn layout(app: &App, area: Rect) -> Screen {
         Page::Download => layout_download(app, &mut screen),
         Page::Settings => layout_settings(app, &mut screen),
         Page::More => layout_more(&mut screen),
+        Page::Edit => layout_edit(app, &mut screen),
     }
 
     if app.login.is_some() {
@@ -2012,11 +2237,22 @@ fn layout_launch(app: &App, screen: &mut Screen) {
                 action: Click::LaunchButton,
             });
         }
+        screen.edit_button = Rect::new(
+            screen.launch_button.x,
+            screen
+                .launch_button
+                .y
+                .saturating_add(screen.launch_button.height),
+            screen.launch_button.width,
+            1,
+        );
+        screen.zones.push(Zone {
+            rect: screen.edit_button,
+            action: Click::EditButton,
+        });
     }
     let list_len = if app.creator.is_some() {
         app.creator_len()
-    } else if app.launch_section == LaunchSection::Manage {
-        4
     } else {
         app.instances.len()
     };
@@ -2073,18 +2309,25 @@ fn layout_download(app: &App, screen: &mut Screen) {
         screen.download_tabs.push(rect);
         x = x.saturating_add(width).saturating_add(1);
     }
-    screen.search = Rect::new(
-        body.x.saturating_add(1),
-        body.y.saturating_add(1),
-        body.width.saturating_sub(2),
-        1,
-    );
-    screen.zones.push(Zone {
-        rect: screen.search,
-        action: Click::Search,
-    });
-    let list_y = body.y.saturating_add(3);
-    let list_h = body.height.saturating_sub(3).saturating_sub(progress_h);
+    let search_h = if app.search_open { 1 } else { 0 };
+    if search_h > 0 {
+        screen.search = Rect::new(
+            body.x.saturating_add(1),
+            body.y.saturating_add(1),
+            body.width.saturating_sub(2),
+            1,
+        );
+        screen.zones.push(Zone {
+            rect: screen.search,
+            action: Click::Search,
+        });
+    }
+    let list_y = body.y.saturating_add(2).saturating_add(search_h);
+    let list_h = body
+        .height
+        .saturating_sub(2)
+        .saturating_sub(search_h)
+        .saturating_sub(progress_h);
     let list = Rect::new(body.x, list_y, body.width, list_h);
     screen.download_list = inner(list);
     let count = app.filtered().len();
@@ -2146,6 +2389,17 @@ fn place_cancel(screen: &mut Screen, area: Rect) {
         });
     } else {
         screen.progress = area;
+    }
+}
+
+fn layout_edit(_app: &App, screen: &mut Screen) {
+    screen.settings_list = inner(screen.body);
+    screen.setting_rows = rows(screen.settings_list, 9, 0);
+    for (index, rect) in screen.setting_rows.iter().copied().enumerate() {
+        screen.zones.push(Zone {
+            rect,
+            action: Click::Setting(index),
+        });
     }
 }
 
@@ -2250,20 +2504,105 @@ mod tests {
         let mut app = App::preview();
         app.on_key(Key::Char('e'));
         assert_eq!(app.page, Page::Download);
+        app.on_key(Key::Char('s'));
+        assert_eq!(app.page, Page::Download);
+        assert_eq!(app.download_selected, 1);
+        app.on_key(Key::Char('w'));
+        assert_eq!(app.download_selected, 0);
         app.on_key(Key::Char('d'));
-        assert_eq!(app.category, Category::Snapshot);
+        assert_eq!(app.page, Page::Settings);
         app.on_key(Key::Char('a'));
+        assert_eq!(app.page, Page::Download);
         assert_eq!(app.category, Category::Release);
         app.on_key(Key::Char('q'));
         assert_eq!(app.page, Page::Launch);
+        app.on_key(Key::Char('d'));
+        assert_eq!(app.focus, Focus::LaunchButton);
+        app.on_key(Key::Char('d'));
+        assert_eq!(app.focus, Focus::EditButton);
+        app.on_key(Key::Char('a'));
+        assert_eq!(app.focus, Focus::LaunchButton);
         app.begin_edit(Field::Rename, String::new());
         app.on_key(Key::Char('q'));
         app.on_key(Key::Char('e'));
         app.on_key(Key::Char('a'));
         app.on_key(Key::Char('d'));
+        app.on_key(Key::Char('w'));
+        app.on_key(Key::Char('s'));
         let editor = app.editing.clone().unwrap();
-        assert_eq!(editor.buffer, "qead");
+        assert_eq!(editor.buffer, "qeadws");
         assert_eq!(app.page, Page::Launch);
+    }
+
+    #[test]
+    fn ctrl_f_opens_search_and_the_first_escape_clears_it() {
+        let mut app = App::preview();
+        app.page = Page::Download;
+        app.job = Some(Job {
+            version: "1.21.1".into(),
+            stage: "assets".into(),
+            completed: 1,
+            total: 4,
+            detail: "working".into(),
+            launching: false,
+        });
+        assert!(!app.search_open);
+        app.on_key(Key::CtrlF);
+        assert!(app.search_open);
+        app.on_key(Key::Char('1'));
+        assert_eq!(app.on_key(Key::Esc), Effect::None);
+        assert!(!app.search_open);
+        assert!(app.query.is_empty());
+        assert!(app.job.is_some());
+        assert_eq!(app.on_key(Key::Esc), Effect::CancelJob);
+    }
+
+    #[test]
+    fn edit_page_default_and_open_folder_are_direct_actions() {
+        let mut app = App::preview();
+        app.draft = Some(InstanceDraft {
+            id: "vanilla".into(),
+            name: "Vanilla".into(),
+            description: String::new(),
+            java: String::new(),
+            memory_min: String::new(),
+            memory_max: String::new(),
+            jvm_args: String::new(),
+        });
+        app.page = Page::Edit;
+        app.setting_selected = 2;
+        assert_eq!(app.on_key(Key::Enter), Effect::SetDefault);
+        assert_eq!(app.page, Page::Edit);
+        app.setting_selected = 7;
+        assert_eq!(app.on_key(Key::Enter), Effect::OpenFolder);
+        assert_eq!(app.page, Page::Edit);
+    }
+
+    #[test]
+    fn edit_page_delete_has_no_confirmation() {
+        let mut app = App::preview();
+        app.draft = Some(InstanceDraft {
+            id: "vanilla".into(),
+            name: "Vanilla".into(),
+            description: String::new(),
+            java: String::new(),
+            memory_min: String::new(),
+            memory_max: String::new(),
+            jvm_args: String::new(),
+        });
+        app.page = Page::Edit;
+        app.setting_selected = 8;
+        assert_eq!(app.on_key(Key::Enter), Effect::DeleteInstance);
+        assert_eq!(app.page, Page::Launch);
+    }
+
+    #[test]
+    fn sort_key_cycles_and_asks_to_save() {
+        let mut app = App::preview();
+        assert_eq!(app.on_key(Key::Char('o')), Effect::Save);
+        assert_eq!(app.sort_mode, SortMode::Created);
+        assert_eq!(app.on_key(Key::Char('o')), Effect::Save);
+        assert_eq!(app.sort_mode, SortMode::Played);
     }
 
     #[test]
