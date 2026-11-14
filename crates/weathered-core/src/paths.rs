@@ -52,6 +52,11 @@ impl DataLayout {
         GamePaths::new(self.root.join("meta"))
     }
 
+    /// Maven library tree used by Forge and NeoForge processors.
+    pub fn libraries(&self) -> PathBuf {
+        self.root.join("libraries")
+    }
+
     /// Shared asset tree Minecraft reads (`assets/objects/<sha1>`).
     ///
     /// The bytes live once in the content store. This directory hard-links

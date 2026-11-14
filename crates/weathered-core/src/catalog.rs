@@ -149,6 +149,148 @@ fn loader_nodes(value: &serde_json::Value) -> Vec<&serde_json::Value> {
     }
 }
 
+/// One loader build the user can pick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoaderBuild {
+    /// Version passed to the downloader. Forge uses `1.21.1-52.0.28`.
+    pub version: String,
+    /// Stable or otherwise suitable to show before the beta toggle.
+    pub stable: bool,
+    /// Preferred build for this game version.
+    pub recommended: bool,
+}
+
+/// Fabric or Quilt loader list. Newest stable entry is marked recommended.
+pub fn parse_loader_builds(document: &serde_json::Value) -> Vec<LoaderBuild> {
+    let mut builds = Vec::new();
+    for node in loader_nodes(document) {
+        let Some(version) = node.get("version").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if version.is_empty() {
+            continue;
+        }
+        let stable = node
+            .get("stable")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true);
+        builds.push(LoaderBuild {
+            version: version.to_string(),
+            stable,
+            recommended: false,
+        });
+    }
+    if let Some(index) = builds.iter().position(|build| build.stable) {
+        builds[index].recommended = true;
+    } else if let Some(first) = builds.first_mut() {
+        first.recommended = true;
+    }
+    builds
+}
+
+/// Forge builds for one Minecraft version.
+///
+/// `promos` is `promotions_slim.json`. Recommended, then latest, are stable.
+/// Older builds stay hidden until the beta toggle is on.
+pub fn forge_builds_for_game(
+    game: &str,
+    versions: &[String],
+    promos: &serde_json::Value,
+) -> Vec<LoaderBuild> {
+    let promo_map = promos.get("promos").unwrap_or(promos);
+    let recommended = promo_map
+        .get(format!("{game}-recommended"))
+        .and_then(|value| value.as_str())
+        .map(|build| format!("{game}-{build}"));
+    let latest = promo_map
+        .get(format!("{game}-latest"))
+        .and_then(|value| value.as_str())
+        .map(|build| format!("{game}-{build}"));
+    let mut builds = Vec::new();
+    for version in versions {
+        let Some(rest) = version.strip_prefix(game) else {
+            continue;
+        };
+        if !rest.starts_with('-') {
+            continue;
+        }
+        let is_recommended = recommended.as_deref() == Some(version.as_str());
+        let is_latest = latest.as_deref() == Some(version.as_str());
+        builds.push(LoaderBuild {
+            version: version.clone(),
+            stable: is_recommended || is_latest,
+            recommended: is_recommended || (recommended.is_none() && is_latest),
+        });
+    }
+    if !builds.iter().any(|build| build.recommended) {
+        if let Some(first) = builds.first_mut() {
+            first.recommended = true;
+            first.stable = true;
+        }
+    }
+    builds
+}
+
+/// NeoForge builds whose version number matches a Minecraft release.
+///
+/// `1.21.1` matches `21.1.*`. `1.20.1` also matches the older `47.1.*` line.
+/// The newest match is recommended. Names containing `beta` or `alpha` are unstable.
+pub fn neoforge_builds_for_game(game: &str, versions: &[String]) -> Vec<LoaderBuild> {
+    let prefixes = neoforge_prefixes(game);
+    let mut builds: Vec<LoaderBuild> = versions
+        .iter()
+        .filter(|version| prefixes.iter().any(|prefix| version.starts_with(prefix)))
+        .map(|version| {
+            let lower = version.to_ascii_lowercase();
+            let unstable = lower.contains("beta") || lower.contains("alpha");
+            LoaderBuild {
+                version: version.clone(),
+                stable: !unstable,
+                recommended: false,
+            }
+        })
+        .collect();
+    builds.reverse();
+    if let Some(best) = builds.iter().position(|build| build.stable) {
+        builds[best].recommended = true;
+    } else if let Some(first) = builds.first_mut() {
+        first.recommended = true;
+    }
+    builds
+}
+
+/// Maven prefixes NeoForge uses for a Minecraft version.
+pub fn neoforge_prefixes(game: &str) -> Vec<String> {
+    let parts: Vec<&str> = game.split('.').collect();
+    let mut prefixes = Vec::new();
+    if parts.len() >= 3 {
+        prefixes.push(format!("{}.{}.", parts[1], parts[2]));
+    } else if parts.len() == 2 {
+        prefixes.push(format!("{}.0.", parts[1]));
+    }
+    if game == "1.20.1" {
+        prefixes.push("47.1.".into());
+    }
+    prefixes
+}
+
+/// Builds shown before or after the beta toggle.
+pub fn visible_builds(builds: &[LoaderBuild], show_unstable: bool) -> Vec<LoaderBuild> {
+    builds
+        .iter()
+        .filter(|build| show_unstable || build.stable)
+        .cloned()
+        .collect()
+}
+
+/// Index of the recommended build, or the first row.
+pub fn preferred_index(builds: &[LoaderBuild]) -> usize {
+    builds
+        .iter()
+        .position(|build| build.recommended)
+        .unwrap_or(0)
+}
+
 /// Version strings from a Maven `maven-metadata.xml` document.
 pub fn maven_versions(xml: &str) -> Vec<String> {
     let mut versions = Vec::new();
@@ -201,5 +343,51 @@ mod tests {
             maven_versions(xml),
             vec!["1.20.1-47.3.0".to_string(), "1.21.1-52.0.1".to_string()]
         );
+    }
+
+    #[test]
+    fn loader_list_marks_the_newest_stable_build() {
+        let builds = parse_loader_builds(&serde_json::json!([
+            { "loader": { "version": "0.20.1", "stable": false } },
+            { "loader": { "version": "0.19.0", "stable": true } },
+            { "loader": { "version": "0.18.0", "stable": true } }
+        ]));
+        assert_eq!(builds[1].version, "0.19.0");
+        assert!(builds[1].recommended);
+        let shown = visible_builds(&builds, false);
+        assert_eq!(shown.len(), 2);
+        assert_eq!(preferred_index(&shown), 0);
+    }
+
+    #[test]
+    fn forge_and_neoforge_lists_follow_the_game_version() {
+        let promos = serde_json::json!({
+            "promos": { "1.21.1-recommended": "52.0.1", "1.21.1-latest": "52.0.9" }
+        });
+        let versions = vec![
+            "1.20.1-47.3.0".into(),
+            "1.21.1-52.0.1".into(),
+            "1.21.1-52.0.9".into(),
+            "1.21.1-51.0.0".into(),
+        ];
+        let builds = forge_builds_for_game("1.21.1", &versions, &promos);
+        assert_eq!(builds.len(), 3);
+        assert!(builds
+            .iter()
+            .any(|build| build.version == "1.21.1-52.0.1" && build.recommended));
+        assert_eq!(visible_builds(&builds, false).len(), 2);
+        let neo = neoforge_builds_for_game(
+            "1.21.1",
+            &[
+                "21.1.80".into(),
+                "21.1.81-beta".into(),
+                "21.0.1".into(),
+                "47.1.100".into(),
+            ],
+        );
+        assert_eq!(neo[0].version, "21.1.81-beta");
+        assert!(!neo[0].stable);
+        assert!(neo[1].recommended);
+        assert!(neoforge_builds_for_game("1.20.1", &["47.1.100".into()])[0].recommended);
     }
 }

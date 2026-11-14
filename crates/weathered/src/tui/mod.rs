@@ -160,6 +160,7 @@ async fn dispatch(
         Effect::Install {
             version,
             loader,
+            loader_version,
             create_instance,
         } => {
             stop_download(download_task);
@@ -169,11 +170,63 @@ async fn dispatch(
                 app.game_dir.clone(),
                 version,
                 loader,
+                loader_version,
                 create_instance,
                 config.jobs(),
                 cancel.clone(),
             );
             *download_task = Some(DownloadTask { cancel, handle });
+        }
+        Effect::OpenPicker {
+            version,
+            loader,
+            create_instance,
+        } => {
+            stop_download(download_task);
+            let cancel = CancelFlag::new();
+            let handle =
+                spawn_loader_list(tx.clone(), version, loader, create_instance, cancel.clone());
+            *download_task = Some(DownloadTask { cancel, handle });
+        }
+        Effect::ClosePicker => {
+            stop_download(download_task);
+        }
+        Effect::UpdateInstance { name, description } => {
+            let layout = DataLayout::new(&app.game_dir);
+            let id = app
+                .selected_instance()
+                .map(|item| item.id.clone())
+                .unwrap_or_default();
+            match instance::set_details(&layout, &id, &name, &description) {
+                Ok(instance) => app.note(format!("Saved {}", instance.name), false),
+                Err(err) => app.note(err.to_string(), true),
+            }
+            app.reload_local();
+        }
+        Effect::DuplicateInstance => {
+            let layout = DataLayout::new(&app.game_dir);
+            let id = app
+                .selected_instance()
+                .map(|item| item.id.clone())
+                .unwrap_or_default();
+            match instance::duplicate(&layout, &id) {
+                Ok(instance) => app.note(format!("Duplicated {}", instance.name), false),
+                Err(err) => app.note(err.to_string(), true),
+            }
+            app.reload_local();
+        }
+        Effect::DeleteInstance => {
+            app.confirm_delete = false;
+            let layout = DataLayout::new(&app.game_dir);
+            let id = app
+                .selected_instance()
+                .map(|item| item.id.clone())
+                .unwrap_or_default();
+            match instance::delete(&layout, &id) {
+                Ok(instance) => app.note(format!("Deleted {}", instance.name), false),
+                Err(err) => app.note(err.to_string(), true),
+            }
+            app.reload_local();
         }
         Effect::CreateInstance { catalog_id } => {
             spawn_create(tx.clone(), app.game_dir.clone(), catalog_id);
@@ -348,11 +401,48 @@ fn stop_download(task: &mut Option<DownloadTask>) {
     }
 }
 
+fn spawn_loader_list(
+    tx: mpsc::Sender<Msg>,
+    version: String,
+    loader: String,
+    _create_instance: bool,
+    cancel: CancelFlag,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let sink = ProgressSink::noop();
+        let outcome = async {
+            cancel.check()?;
+            let client = build_http_client()?;
+            let parsed = Loader::parse(&loader)?;
+            content::list_loader_builds(&client, parsed, &version, &cancel, &sink).await
+        }
+        .await;
+        let (builds, error) = match outcome {
+            Ok(builds) => (
+                builds
+                    .into_iter()
+                    .map(|build| model::LoaderBuildRow {
+                        version: build.version,
+                        stable: build.stable,
+                        recommended: build.recommended,
+                    })
+                    .collect(),
+                String::new(),
+            ),
+            Err(err) if err.is_cancelled() => return,
+            Err(err) => (Vec::new(), err.to_string()),
+        };
+        let _ = tx.send(Msg::LoaderBuilds { builds, error }).await;
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_install(
     tx: mpsc::Sender<Msg>,
     game_dir: PathBuf,
     version: String,
     loader: String,
+    loader_version: Option<String>,
     create_instance: bool,
     jobs: usize,
     cancel: CancelFlag,
@@ -381,7 +471,7 @@ fn spawn_install(
                 content::DownloadRequest {
                     version: &version,
                     loader: parsed,
-                    loader_version: None,
+                    loader_version: loader_version.as_deref(),
                     os: &os,
                     concurrency: jobs,
                     java_mode: JavaMode::Auto,

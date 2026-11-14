@@ -54,6 +54,9 @@ pub struct Instance {
     pub legacy: bool,
     /// Absolute game directory.
     pub game_dir: String,
+    /// Optional note shown on the manage page.
+    #[serde(default)]
+    pub description: String,
 }
 
 impl Instance {
@@ -150,6 +153,7 @@ pub fn migrate_legacy(layout: &DataLayout) -> Result<Vec<Instance>> {
             java: String::new(),
             legacy: true,
             game_dir: layout.root.display().to_string(),
+            description: String::new(),
         };
         instance.save(layout)?;
         created.push(instance);
@@ -237,6 +241,7 @@ pub fn create(
         java: java.trim().to_string(),
         legacy: false,
         game_dir: game_dir.display().to_string(),
+        description: String::new(),
     };
     instance.save(layout)?;
     Ok(instance)
@@ -259,6 +264,61 @@ pub fn delete(layout: &DataLayout, query: &str) -> Result<Instance> {
         std::fs::remove_dir_all(&dir).io_at(&dir)?;
     }
     Ok(instance)
+}
+
+/// Change the name and description stored in `instance.toml`.
+pub fn set_details(
+    layout: &DataLayout,
+    query: &str,
+    name: &str,
+    description: &str,
+) -> Result<Instance> {
+    let mut instance = find(layout, query)?
+        .ok_or_else(|| Error::message(format!("no instance matches '{query}'")))?;
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(Error::message("instance name cannot be empty"));
+    }
+    instance.name = name.to_string();
+    instance.description = description.trim().to_string();
+    instance.save(layout)?;
+    Ok(instance)
+}
+
+/// Copy an instance directory to a new id. The shared store is not copied.
+pub fn duplicate(layout: &DataLayout, query: &str) -> Result<Instance> {
+    let instance = find(layout, query)?
+        .ok_or_else(|| Error::message(format!("no instance matches '{query}'")))?;
+    if instance.legacy {
+        return Err(Error::message(
+            "a legacy instance uses the old shared game directory and cannot be duplicated",
+        ));
+    }
+    let id = unique_id(layout, &slug(&format!("{}-copy", instance.name)))?;
+    let src = layout.instance_dir(&instance.id);
+    let dest = layout.instance_dir(&id);
+    copy_tree(&src, &dest)?;
+    let mut copy = instance;
+    copy.id = id;
+    copy.name = format!("{} copy", copy.name);
+    copy.game_dir = layout.instance_game(&copy.id).display().to_string();
+    copy.save(layout)?;
+    Ok(copy)
+}
+
+fn copy_tree(src: &Path, dest: &Path) -> Result<()> {
+    std::fs::create_dir_all(dest).io_at(dest)?;
+    for entry in std::fs::read_dir(src).map_err(|err| Error::io(src, err))? {
+        let entry = entry.map_err(|err| Error::io(src, err))?;
+        let from = entry.path();
+        let to = dest.join(entry.file_name());
+        if from.is_dir() {
+            copy_tree(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to).map_err(|err| Error::io(&to, err))?;
+        }
+    }
+    Ok(())
 }
 
 /// Download anything the pack needs, then copy mods and overrides into a new instance.
@@ -346,8 +406,13 @@ pub async fn prepare_launch(
     let resolved =
         version::load_resolved(client, &paths, &manifest, &instance.version_id, false).await?;
     let store = Store::open(layout.store_root())?;
-    let (classpath, natives) =
-        classpath_from_store(&store, &resolved.info, &request.os, &request.features)?;
+    let (classpath, natives) = classpath_from_store(
+        &store,
+        &resolved.info,
+        &request.os,
+        &request.features,
+        &layout.libraries(),
+    )?;
     let client_jar = paths.version_jar(&resolved.jar_id);
     if !client_jar.is_file() {
         return Err(Error::message(format!(
@@ -535,6 +600,7 @@ fn classpath_from_store(
     version: &VersionInfo,
     os: &OsInfo,
     features: &FeatureSet,
+    libraries_root: &Path,
 ) -> Result<(Vec<PathBuf>, Vec<NativeJar>)> {
     let libraries = version.libraries.clone().unwrap_or_default();
     let plan = plan_libraries(&libraries, Path::new("libraries"), os, features)?;
@@ -556,6 +622,11 @@ fn classpath_from_store(
         }
         if let Some(record) = store.lookup_url(&file.url)? {
             return store.object_path(&record.sha512);
+        }
+        let relative = path.strip_prefix("libraries").unwrap_or(path);
+        let on_disk = libraries_root.join(relative);
+        if on_disk.is_file() {
+            return Ok(on_disk);
         }
         Err(Error::message(format!(
             "library {} is not in the store. Download the profile first.",

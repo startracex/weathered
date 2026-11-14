@@ -24,6 +24,7 @@ pub mod manifest;
 pub mod modpack;
 pub mod paths;
 pub mod platform;
+pub mod processors;
 pub mod progress;
 pub mod rules;
 pub mod store;

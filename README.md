@@ -95,9 +95,9 @@ If the data directory already contains `versions/<id>/<id>.jar` from an earlier 
 
 `weathered` with no subcommand opens the full-screen UI. `weathered tui` does the same thing.
 
-The layout follows Plain Craft Launcher: a top bar for Launch, Download, Settings, and More; a launch page with the account on the left, the instance list on the right, and a Launch button; a download page split into release, snapshot, old, Fabric, and Quilt; and a settings page for the data directory, Java, memory, offline username, and Microsoft sign-in. The screen is dark, with a weathered-copper teal for the selection and a greener Launch control.
+The layout follows Plain Craft Launcher: a top bar for Launch, Download, Settings, and More; a launch page with the account on the left, the instance list on the right, and a Launch button; a download page split into release, snapshot, old, Fabric, Quilt, Forge, and NeoForge; and a settings page for the data directory, Java, memory, offline username, and Microsoft sign-in. `[Q]` and `[E]` move between those pages. `[A]` and `[D]` move between the sub-tabs on the current page (Play/Manage, or the download categories). The screen is dark, with a weathered-copper teal for the selection and a greener Launch control.
 
-Click a tab, a version, or a button. The wheel scrolls the version lists. Keys work too: `1`–`4` switch pages, the arrows move, Enter activates, `q` quits.
+Click a tab, a version, or a button. The wheel scrolls the version lists. Keys work too: `1`–`4` switch pages, the arrows move, Enter activates, Esc cancels a download or a dialog, and Ctrl+C quits. `Q`, `E`, `A`, and `D` are typed normally while a text field is focused. Manage can rename an instance, edit its description, duplicate it, or delete it. Delete removes only that instance directory. The shared store stays. Fabric, Quilt, Forge, and NeoForge installs open a loader-version list first. The newest stable or recommended build is selected. `B` shows unstable builds.
 
 ```sh
 weathered --game-dir ~/.local/share/weathered
@@ -266,9 +266,9 @@ GitHub Actions runs the same three commands on Linux, macOS, and Windows.
 ## Known gaps
 
 - There is a terminal UI, not a desktop window. The game itself still opens in its own window.
-- Fabric and Quilt profiles are downloaded and can be launched. Forge and NeoForge installers and their libraries can be stored with `--loader forge` or `--loader neoforge`, but the processor step that patches the client is not run, so those profiles cannot be launched or imported from a modpack yet.
-- CurseForge modpacks are not imported. A CurseForge zip names project and file ids, and downloading them needs an API key this launcher does not ship. Modrinth `.mrpack` files are supported.
-- Forge, Fabric, and Quilt installers that are not the metadata profiles above are not run by hand. `inheritsFrom` is implemented, so a version JSON that is already on disk can still be launched.
+- Fabric, Quilt, Forge 1.13+, and NeoForge can be downloaded and launched. The terminal asks which loader build to use and can show unstable builds. Forge builds from before 1.13 use a different installer and are refused with an explanation. LiteLoader and OptiFine are not installed.
+- CurseForge modpacks are not imported. A CurseForge zip names project and file ids, and downloading them needs an API key this launcher does not ship. Modrinth `.mrpack` files are supported for vanilla, Fabric, and Quilt. Forge and NeoForge packs are still refused because those installers need the processor step, which the pack import does not run on its own.
+- LiteLoader and OptiFine are not installed. `inheritsFrom` is implemented, so a version JSON that is already on disk can still be launched.
 - Microsoft login requires your own Azure client id, and Xbox Live may reject it.
 - Mojang does not publish a Java runtime for Linux on ARM64. Install a JDK and pass `--java`.
 - Older native classifiers that use `${arch}` expand to `32` or `64`. That does not select an ARM build.

@@ -55,6 +55,8 @@ pub enum Category {
     Old,
     Fabric,
     Quilt,
+    Forge,
+    NeoForge,
 }
 
 impl Category {
@@ -65,6 +67,8 @@ impl Category {
             Self::Old => "Old",
             Self::Fabric => "Fabric",
             Self::Quilt => "Quilt",
+            Self::Forge => "Forge",
+            Self::NeoForge => "NeoForge",
         }
     }
 
@@ -72,6 +76,8 @@ impl Category {
         match self {
             Self::Fabric => "fabric",
             Self::Quilt => "quilt",
+            Self::Forge => "forge",
+            Self::NeoForge => "neoforge",
             _ => "vanilla",
         }
     }
@@ -81,7 +87,7 @@ impl Category {
             Self::Release => kind == "release",
             Self::Snapshot => kind == "snapshot",
             Self::Old => kind == "old_beta" || kind == "old_alpha",
-            Self::Fabric | Self::Quilt => kind == "release",
+            Self::Fabric | Self::Quilt | Self::Forge | Self::NeoForge => kind == "release",
         }
     }
 }
@@ -132,8 +138,21 @@ pub enum Effect {
     Install {
         version: String,
         loader: String,
+        loader_version: Option<String>,
         create_instance: bool,
     },
+    OpenPicker {
+        version: String,
+        loader: String,
+        create_instance: bool,
+    },
+    ClosePicker,
+    UpdateInstance {
+        name: String,
+        description: String,
+    },
+    DuplicateInstance,
+    DeleteInstance,
     CreateInstance {
         catalog_id: String,
     },
@@ -184,6 +203,10 @@ pub enum Msg {
         detail: String,
         name: String,
     },
+    LoaderBuilds {
+        builds: Vec<LoaderBuildRow>,
+        error: String,
+    },
     /// The game process is on screen and the Launch button should become Stop.
     GameStarted,
     /// Preparing the launch command failed before the process existed.
@@ -210,9 +233,38 @@ pub struct Installed {
 pub struct InstanceRow {
     pub id: String,
     pub name: String,
+    pub description: String,
     pub game_version: String,
     pub loader: String,
     pub legacy: bool,
+}
+
+/// Loader build shown in the version picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoaderBuildRow {
+    pub version: String,
+    pub stable: bool,
+    pub recommended: bool,
+}
+
+/// Fabric, Quilt, Forge, or NeoForge version list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoaderPicker {
+    pub game_version: String,
+    pub loader: String,
+    pub builds: Vec<LoaderBuildRow>,
+    pub show_unstable: bool,
+    pub selected: usize,
+    pub loading: bool,
+    pub error: String,
+    pub create_instance: bool,
+}
+
+/// Secondary page on Launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchSection {
+    Play,
+    Manage,
 }
 
 /// One downloaded profile that can become an instance.
@@ -271,6 +323,8 @@ pub enum Field {
     ClientId,
     Search,
     PackPath,
+    Rename,
+    Description,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -321,6 +375,10 @@ pub struct App {
     pub catalog_items: Vec<CatalogRow>,
     pub creator: Option<CreatorStep>,
     pub creator_selected: usize,
+    pub picker: Option<LoaderPicker>,
+    pub launch_section: LaunchSection,
+    pub manage_selected: usize,
+    pub confirm_delete: bool,
     pub pending_create: bool,
     /// Late progress from a cancelled task must not lock the screen again.
     pub ignore_job: bool,
@@ -368,6 +426,10 @@ impl App {
             catalog_items: Vec::new(),
             creator: None,
             creator_selected: 0,
+            picker: None,
+            launch_section: LaunchSection::Play,
+            manage_selected: 0,
+            confirm_delete: false,
             pending_create: false,
             ignore_job: false,
             version_selected: 0,
@@ -418,6 +480,7 @@ impl App {
             InstanceRow {
                 id: "vanilla".into(),
                 name: "Vanilla".into(),
+                description: String::new(),
                 game_version: "1.21.1".into(),
                 loader: "vanilla".into(),
                 legacy: false,
@@ -425,6 +488,7 @@ impl App {
             InstanceRow {
                 id: "beta".into(),
                 name: "Beta".into(),
+                description: "old world".into(),
                 game_version: "b1.7.3".into(),
                 loader: "vanilla".into(),
                 legacy: false,
@@ -584,6 +648,7 @@ impl App {
             .map(|item| InstanceRow {
                 id: item.id,
                 name: item.name,
+                description: item.description,
                 game_version: item.game_version,
                 loader: item.loader,
                 legacy: item.legacy,
@@ -624,6 +689,19 @@ impl App {
         if self.editing.is_some() {
             return self.on_edit_key(key);
         }
+        if self.confirm_delete {
+            return match key {
+                Key::Enter => Effect::DeleteInstance,
+                Key::Esc => {
+                    self.confirm_delete = false;
+                    Effect::None
+                }
+                _ => Effect::None,
+            };
+        }
+        if self.picker.is_some() {
+            return self.on_picker_key(key);
+        }
         if key == Key::Esc && self.job.is_some() {
             return self.cancel_job();
         }
@@ -637,8 +715,20 @@ impl App {
         }
         match key {
             Key::Char('q') => {
-                self.quit = true;
-                Effect::Quit
+                self.shift_page(-1);
+                Effect::None
+            }
+            Key::Char('e') => {
+                self.shift_page(1);
+                Effect::None
+            }
+            Key::Char('a') => {
+                self.shift_sub(-1);
+                Effect::None
+            }
+            Key::Char('d') => {
+                self.shift_sub(1);
+                Effect::None
             }
             Key::Char('1') => self.goto(Page::Launch),
             Key::Char('2') => self.goto(Page::Download),
@@ -687,6 +777,16 @@ impl App {
 
     pub fn on_msg(&mut self, msg: Msg) {
         match msg {
+            Msg::LoaderBuilds { builds, error } => {
+                let Some(picker) = self.picker.as_mut() else {
+                    return;
+                };
+                picker.loading = false;
+                picker.error = error;
+                picker.builds = builds;
+                picker.selected = 0;
+                self.align_picker_selection();
+            }
             Msg::Catalog(entries) => {
                 self.catalog = entries;
                 self.catalog_ready = true;
@@ -778,6 +878,122 @@ impl App {
         }
     }
 
+    fn shift_page(&mut self, delta: isize) {
+        let next = (self.page.index() as isize + delta).rem_euclid(4) as usize;
+        let _ = self.goto(Page::from_index(next));
+    }
+
+    fn shift_sub(&mut self, delta: isize) {
+        match self.page {
+            Page::Download => self.shift_category(delta),
+            Page::Launch => {
+                self.launch_section = if delta > 0 {
+                    LaunchSection::Manage
+                } else {
+                    LaunchSection::Play
+                };
+            }
+            Page::Settings | Page::More => {}
+        }
+    }
+
+    fn on_picker_key(&mut self, key: Key) -> Effect {
+        if self.picker.is_none() {
+            return Effect::None;
+        }
+        match key {
+            Key::Esc => {
+                self.picker = None;
+                Effect::ClosePicker
+            }
+            Key::Up => {
+                if let Some(picker) = self.picker.as_mut() {
+                    picker.selected = picker.selected.saturating_sub(1);
+                }
+                Effect::None
+            }
+            Key::Down => {
+                let len = self.picker_visible().len();
+                if let Some(picker) = self.picker.as_mut() {
+                    if picker.selected + 1 < len {
+                        picker.selected += 1;
+                    }
+                }
+                Effect::None
+            }
+            Key::Char('b') | Key::Char(' ') => {
+                if let Some(picker) = self.picker.as_mut() {
+                    picker.show_unstable = !picker.show_unstable;
+                }
+                self.align_picker_selection();
+                Effect::None
+            }
+            Key::Enter => self.confirm_picker(),
+            _ => Effect::None,
+        }
+    }
+
+    fn picker_visible(&self) -> Vec<LoaderBuildRow> {
+        let Some(picker) = &self.picker else {
+            return Vec::new();
+        };
+        picker
+            .builds
+            .iter()
+            .filter(|build| picker.show_unstable || build.stable)
+            .cloned()
+            .collect()
+    }
+
+    fn align_picker_selection(&mut self) {
+        let visible = self.picker_visible();
+        let builds: Vec<weathered_core::catalog::LoaderBuild> = visible
+            .iter()
+            .map(|build| weathered_core::catalog::LoaderBuild {
+                version: build.version.clone(),
+                stable: build.stable,
+                recommended: build.recommended,
+            })
+            .collect();
+        if let Some(picker) = self.picker.as_mut() {
+            picker.selected = weathered_core::catalog::preferred_index(&builds)
+                .min(visible.len().saturating_sub(1));
+        }
+    }
+
+    fn confirm_picker(&mut self) -> Effect {
+        let Some(picker) = self.picker.clone() else {
+            return Effect::None;
+        };
+        if picker.loading || !picker.error.is_empty() {
+            return Effect::None;
+        }
+        let visible = self.picker_visible();
+        let Some(build) = visible.get(picker.selected) else {
+            return Effect::None;
+        };
+        let version = picker.game_version;
+        let loader = picker.loader;
+        let loader_version = Some(build.version.clone());
+        let create_instance = picker.create_instance;
+        self.picker = None;
+        self.ignore_job = false;
+        self.job = Some(Job {
+            version: version.clone(),
+            stage: "starting".into(),
+            completed: 0,
+            total: 1,
+            detail: "Queued".into(),
+            launching: false,
+        });
+        Effect::Install {
+            version,
+            loader,
+            loader_version,
+            create_instance,
+        }
+    }
+
     fn goto(&mut self, page: Page) -> Effect {
         self.page = page;
         self.focus = match page {
@@ -820,6 +1036,9 @@ impl App {
             Page::Launch if self.creator.is_some() => {
                 let len = self.creator_len();
                 bump(&mut self.creator_selected, len, delta.signum());
+            }
+            Page::Launch if self.launch_section == LaunchSection::Manage => {
+                bump(&mut self.manage_selected, 4, delta.signum());
             }
             Page::Launch => {
                 self.focus = Focus::Versions;
@@ -871,6 +1090,8 @@ impl App {
             Category::Old,
             Category::Fabric,
             Category::Quilt,
+            Category::Forge,
+            Category::NeoForge,
         ];
         let index = order
             .iter()
@@ -888,6 +1109,7 @@ impl App {
             return self.activate_creator();
         }
         match self.page {
+            Page::Launch if self.launch_section == LaunchSection::Manage => self.activate_manage(),
             Page::Launch if self.focus == Focus::Accounts => Effect::None,
             Page::Launch => self.request_launch(),
             Page::Download if self.focus == Focus::Search => {
@@ -934,6 +1156,10 @@ impl App {
                 self.activate_creator()
             }
             Click::Version(index) => {
+                if self.launch_section == LaunchSection::Manage {
+                    self.manage_selected = index;
+                    return self.activate_manage();
+                }
                 self.page = Page::Launch;
                 self.focus = Focus::Versions;
                 let now = Instant::now();
@@ -1089,11 +1315,53 @@ impl App {
         let loader = self.category.loader().to_string();
         let create_instance = self.pending_create;
         self.pending_create = false;
-        self.note(format!("Downloading {id}"), false);
-        Effect::Install {
-            version: id,
-            loader,
-            create_instance,
+        if loader == "vanilla" {
+            self.note(format!("Downloading {id}"), false);
+            Effect::Install {
+                version: id,
+                loader,
+                loader_version: None,
+                create_instance,
+            }
+        } else {
+            self.picker = Some(LoaderPicker {
+                game_version: id.clone(),
+                loader: loader.clone(),
+                builds: Vec::new(),
+                show_unstable: false,
+                selected: 0,
+                loading: true,
+                error: String::new(),
+                create_instance,
+            });
+            self.note(format!("Loading {loader} versions for {id}"), false);
+            Effect::OpenPicker {
+                version: id,
+                loader,
+                create_instance,
+            }
+        }
+    }
+
+    fn activate_manage(&mut self) -> Effect {
+        let Some(instance) = self.selected_instance() else {
+            self.note("Select an instance on the Play page first", true);
+            return Effect::None;
+        };
+        match self.manage_selected {
+            0 => {
+                self.begin_edit(Field::Rename, instance.name.clone());
+                Effect::None
+            }
+            1 => {
+                self.begin_edit(Field::Description, instance.description.clone());
+                Effect::None
+            }
+            2 => Effect::DuplicateInstance,
+            _ => {
+                self.confirm_delete = true;
+                Effect::None
+            }
         }
     }
 
@@ -1171,6 +1439,14 @@ impl App {
                     Field::JavaPath => self.java_path.clone(),
                     Field::ClientId => self.client_id_input.clone(),
                     Field::Search | Field::PackPath => self.query.clone(),
+                    Field::Rename => self
+                        .selected_instance()
+                        .map(|item| item.name.clone())
+                        .unwrap_or_default(),
+                    Field::Description => self
+                        .selected_instance()
+                        .map(|item| item.description.clone())
+                        .unwrap_or_default(),
                 };
                 self.begin_edit(field, current);
                 Effect::None
@@ -1330,6 +1606,26 @@ impl App {
                 self.query = editor.buffer;
                 self.clamp_download();
                 return Effect::None;
+            }
+            Field::Rename => {
+                let description = self
+                    .selected_instance()
+                    .map(|item| item.description.clone())
+                    .unwrap_or_default();
+                return Effect::UpdateInstance {
+                    name: editor.buffer.trim().to_string(),
+                    description,
+                };
+            }
+            Field::Description => {
+                let name = self
+                    .selected_instance()
+                    .map(|item| item.name.clone())
+                    .unwrap_or_default();
+                return Effect::UpdateInstance {
+                    name,
+                    description: editor.buffer.trim().to_string(),
+                };
             }
         }
         self.note("Settings updated", false);
@@ -1586,7 +1882,7 @@ pub fn layout(app: &App, area: Rect) -> Screen {
     screen.body = chunks[2];
     screen.footer = chunks[3];
 
-    let mut x = screen.nav.x.saturating_add(1);
+    let mut x = screen.nav.x.saturating_add(5);
     for page in [Page::Launch, Page::Download, Page::Settings, Page::More] {
         let width = (page.label().len() as u16).saturating_add(2);
         if x.saturating_add(width) > screen.nav.x.saturating_add(screen.nav.width) {
@@ -1719,6 +2015,8 @@ fn layout_launch(app: &App, screen: &mut Screen) {
     }
     let list_len = if app.creator.is_some() {
         app.creator_len()
+    } else if app.launch_section == LaunchSection::Manage {
+        4
     } else {
         app.instances.len()
     };
@@ -1763,6 +2061,8 @@ fn layout_download(app: &App, screen: &mut Screen) {
         Category::Old,
         Category::Fabric,
         Category::Quilt,
+        Category::Forge,
+        Category::NeoForge,
     ] {
         let width = (category.label().len() as u16).saturating_add(2);
         let rect = Rect::new(x, body.y, width, 1);
@@ -1946,11 +2246,34 @@ mod tests {
     }
 
     #[test]
+    fn q_and_e_move_pages_while_text_fields_keep_the_letters() {
+        let mut app = App::preview();
+        app.on_key(Key::Char('e'));
+        assert_eq!(app.page, Page::Download);
+        app.on_key(Key::Char('d'));
+        assert_eq!(app.category, Category::Snapshot);
+        app.on_key(Key::Char('a'));
+        assert_eq!(app.category, Category::Release);
+        app.on_key(Key::Char('q'));
+        assert_eq!(app.page, Page::Launch);
+        app.begin_edit(Field::Rename, String::new());
+        app.on_key(Key::Char('q'));
+        app.on_key(Key::Char('e'));
+        app.on_key(Key::Char('a'));
+        app.on_key(Key::Char('d'));
+        let editor = app.editing.clone().unwrap();
+        assert_eq!(editor.buffer, "qead");
+        assert_eq!(app.page, Page::Launch);
+    }
+
+    #[test]
     fn number_keys_switch_pages_and_q_quits() {
         let mut app = App::preview();
         assert_eq!(app.on_key(Key::Char('2')), Effect::None);
         assert_eq!(app.page, Page::Download);
-        assert_eq!(app.on_key(Key::Char('q')), Effect::Quit);
+        assert_eq!(app.on_key(Key::Char('q')), Effect::None);
+        assert_eq!(app.page, Page::Launch);
+        assert_eq!(app.on_key(Key::CtrlC), Effect::Quit);
         assert!(app.quit);
     }
 
@@ -2061,6 +2384,7 @@ mod tests {
             Effect::Install {
                 version: "1.20.4".into(),
                 loader: "vanilla".into(),
+                loader_version: None,
                 create_instance: false,
             }
         );
@@ -2078,7 +2402,7 @@ mod tests {
             detail: "already stored".into(),
             launching: false,
         });
-        assert_eq!(app.on_key(Key::Char('q')), Effect::Quit);
+        assert_eq!(app.on_key(Key::CtrlC), Effect::Quit);
         app.quit = false;
         assert!(app.job.is_some());
         assert_eq!(app.on_key(Key::Esc), Effect::CancelJob);

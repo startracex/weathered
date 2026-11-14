@@ -44,6 +44,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             app.screen.cancel,
         );
     }
+    if app.picker.is_some() {
+        draw_picker(frame, app);
+    }
+    if app.confirm_delete {
+        draw_confirm_delete(frame, app);
+    }
     if app.login.is_some() {
         draw_login(frame, app);
     }
@@ -72,6 +78,24 @@ fn draw_header(frame: &mut Frame, app: &App) {
 
 fn draw_nav(frame: &mut Frame, app: &App) {
     frame.render_widget(Block::default().style(theme::base()), app.screen.nav);
+    frame.render_widget(
+        Paragraph::new("[Q]").style(theme::muted()),
+        Rect::new(app.screen.nav.x, app.screen.nav.y, 3, 1),
+    );
+    if app.screen.nav.width > 4 {
+        frame.render_widget(
+            Paragraph::new("[E]").style(theme::muted()),
+            Rect::new(
+                app.screen
+                    .nav
+                    .x
+                    .saturating_add(app.screen.nav.width.saturating_sub(4)),
+                app.screen.nav.y,
+                3,
+                1,
+            ),
+        );
+    }
     for (index, page) in [Page::Launch, Page::Download, Page::Settings, Page::More]
         .into_iter()
         .enumerate()
@@ -100,9 +124,9 @@ fn draw_footer(frame: &mut Frame, app: &App) {
         theme::muted()
     };
     let hints = if app.job.is_some() {
-        "esc cancel   q quit"
+        "esc cancel   Ctrl+C quit"
     } else {
-        "1-4 pages   ↑↓ move   enter   click & wheel   q quit"
+        "[Q]/[E] pages   [A]/[D] tabs   1-4   Ctrl+C quit"
     };
     let width = app.screen.footer.width as usize;
     let text = if app.status.is_empty() {
@@ -123,10 +147,17 @@ fn draw_footer(frame: &mut Frame, app: &App) {
 
 fn draw_launch(frame: &mut Frame, app: &App) {
     frame.render_widget(panel("Account"), app.screen.left);
-    frame.render_widget(panel("Instances"), app.screen.right);
+    let panel_title = if app.launch_section == super::model::LaunchSection::Manage {
+        "Manage"
+    } else {
+        "Instances"
+    };
+    frame.render_widget(panel(panel_title), app.screen.right);
     draw_account_card(frame, app);
 
-    if app.creator.is_some() {
+    if app.launch_section == super::model::LaunchSection::Manage {
+        draw_manage(frame, app);
+    } else if app.creator.is_some() {
         draw_creator(frame, app);
     } else {
         for (offset, rect) in app.screen.version_rows.iter().copied().enumerate() {
@@ -234,6 +265,135 @@ fn draw_launch(frame: &mut Frame, app: &App) {
             app.screen.log,
         );
     }
+}
+
+fn draw_manage(frame: &mut Frame, app: &App) {
+    let actions = ["Rename", "Description", "Duplicate", "Delete"];
+    let instance = app.selected_instance();
+    let header = match instance {
+        Some(item) => format!(" {}  {}", item.name, item.game_version),
+        None => " Select an instance on Play".into(),
+    };
+    let note = instance.map(|item| item.description.as_str()).unwrap_or("");
+    if app.screen.version_list.height > 0 {
+        frame.render_widget(
+            Paragraph::new(fit(&header, app.screen.version_list.width as usize))
+                .style(theme::muted().bg(theme::SURFACE)),
+            Rect::new(
+                app.screen.version_list.x,
+                app.screen.version_list.y,
+                app.screen.version_list.width,
+                1,
+            ),
+        );
+    }
+    if app.screen.version_list.height > 1 {
+        frame.render_widget(
+            Paragraph::new(fit(note, app.screen.version_list.width as usize))
+                .style(theme::muted().bg(theme::SURFACE)),
+            Rect::new(
+                app.screen.version_list.x,
+                app.screen.version_list.y.saturating_add(1),
+                app.screen.version_list.width,
+                1,
+            ),
+        );
+    }
+    for (index, action) in actions.iter().enumerate() {
+        let Some(rect) = app.screen.version_rows.get(index).copied() else {
+            continue;
+        };
+        let selected = index == app.manage_selected;
+        let style = row_style(selected, hot(app, rect));
+        let mark = if selected { "▸" } else { " " };
+        frame.render_widget(
+            Paragraph::new(fit(&format!(" {mark} {action}"), rect.width as usize)).style(style),
+            rect,
+        );
+    }
+}
+
+fn draw_picker(frame: &mut Frame, app: &App) {
+    let Some(picker) = &app.picker else {
+        return;
+    };
+    let area = app.screen.body;
+    let width = area.width.clamp(24, 56);
+    let height = area.height.clamp(8, 16);
+    let rect = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(panel(&format!(" {} ", picker.loader)), rect);
+    let inner = inner_of(rect);
+    let toggle = if picker.show_unstable {
+        "[x] unstable"
+    } else {
+        "[ ] unstable"
+    };
+    let heading = if picker.loading {
+        "Loading versions..."
+    } else if !picker.error.is_empty() {
+        picker.error.as_str()
+    } else {
+        toggle
+    };
+    frame.render_widget(
+        Paragraph::new(fit(heading, inner.width as usize)).style(theme::muted().bg(theme::SURFACE)),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+    let visible: Vec<_> = picker
+        .builds
+        .iter()
+        .filter(|build| picker.show_unstable || build.stable)
+        .collect();
+    for (index, build) in visible
+        .iter()
+        .enumerate()
+        .take(inner.height.saturating_sub(1) as usize)
+    {
+        let y = inner.y.saturating_add(1 + index as u16);
+        let selected = index == picker.selected;
+        let mark = if build.recommended { "*" } else { " " };
+        let label = format!(" {mark} {}", build.version);
+        let style = if selected {
+            theme::selected()
+        } else {
+            theme::surface()
+        };
+        frame.render_widget(
+            Paragraph::new(fit(&label, inner.width as usize)).style(style),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
+    }
+}
+
+fn draw_confirm_delete(frame: &mut Frame, app: &App) {
+    let name = app
+        .selected_instance()
+        .map(|item| item.name.as_str())
+        .unwrap_or("this instance");
+    let area = app.screen.body;
+    let width = area.width.clamp(24, 50);
+    let rect = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(6) / 2,
+        width,
+        6,
+    );
+    frame.render_widget(panel("Delete instance"), rect);
+    let inner = inner_of(rect);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(format!(" Delete {name}?")),
+            Line::from(" The shared store is kept."),
+            Line::from(" Enter confirms, Esc cancels."),
+        ])
+        .style(theme::surface()),
+        inner,
+    );
 }
 
 fn draw_creator(frame: &mut Frame, app: &App) {
@@ -347,6 +507,8 @@ fn draw_download(frame: &mut Frame, app: &App) {
         Category::Old,
         Category::Fabric,
         Category::Quilt,
+        Category::Forge,
+        Category::NeoForge,
     ]
     .into_iter()
     .enumerate()

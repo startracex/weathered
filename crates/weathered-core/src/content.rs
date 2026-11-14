@@ -15,9 +15,10 @@ use crate::library::plan_libraries;
 use crate::manifest;
 use crate::paths::DataLayout;
 use crate::platform::OsInfo;
+use crate::processors::{self, Subst};
 use crate::progress::ProgressSink;
 use crate::rules::FeatureSet;
-use crate::store::{BlobRequest, FetchStats, Store};
+use crate::store::{BlobRequest, Store};
 use crate::version::{self, VersionInfo};
 
 const FABRIC_META: &str = "https://meta.fabricmc.net/v2/versions/loader";
@@ -292,6 +293,64 @@ async fn download_meta_loader(
     Ok(item)
 }
 
+/// Loader builds for the version picker.
+pub async fn list_loader_builds(
+    client: &reqwest::Client,
+    loader: Loader,
+    game: &str,
+    cancel: &CancelFlag,
+    progress: &ProgressSink,
+) -> Result<Vec<catalog::LoaderBuild>> {
+    cancel.check()?;
+    emit_stage(progress, "loader", "loader versions");
+    match loader {
+        Loader::Fabric => {
+            let url = format!("{FABRIC_META}/{game}");
+            let bytes = get_bytes_cancellable(client, &url, cancel).await?;
+            let value =
+                serde_json::from_slice(&bytes).map_err(|err| Error::json("fabric loaders", err))?;
+            Ok(catalog::parse_loader_builds(&value))
+        }
+        Loader::Quilt => {
+            let url = format!("{QUILT_META}/{game}");
+            let bytes = get_bytes_cancellable(client, &url, cancel).await?;
+            let value =
+                serde_json::from_slice(&bytes).map_err(|err| Error::json("quilt loaders", err))?;
+            Ok(catalog::parse_loader_builds(&value))
+        }
+        Loader::Forge => {
+            let promos = get_bytes_cancellable(
+                client,
+                "https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json",
+                cancel,
+            )
+            .await?;
+            let meta =
+                get_bytes_cancellable(client, &format!("{FORGE_MAVEN}/maven-metadata.xml"), cancel)
+                    .await?;
+            let promo_value = serde_json::from_slice(&promos)
+                .map_err(|err| Error::json("forge promotions", err))?;
+            let versions = catalog::maven_versions(&String::from_utf8_lossy(&meta));
+            Ok(catalog::forge_builds_for_game(
+                game,
+                &versions,
+                &promo_value,
+            ))
+        }
+        Loader::NeoForge => {
+            let meta = get_bytes_cancellable(
+                client,
+                &format!("{NEOFORGE_MAVEN}/maven-metadata.xml"),
+                cancel,
+            )
+            .await?;
+            let versions = catalog::maven_versions(&String::from_utf8_lossy(&meta));
+            Ok(catalog::neoforge_builds_for_game(game, &versions))
+        }
+        Loader::Vanilla => Ok(Vec::new()),
+    }
+}
+
 async fn download_installer(
     client: &reqwest::Client,
     layout: &DataLayout,
@@ -301,15 +360,21 @@ async fn download_installer(
     kind: &str,
     progress: &ProgressSink,
 ) -> Result<CatalogItem> {
-    let version = request.version.trim();
-    if version.is_empty() {
+    let coordinate = request
+        .loader_version
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+        .unwrap_or(request.version.trim());
+    if coordinate.is_empty() {
         return Err(Error::message(format!(
-            "pass the full {kind} version, such as the one published on its Maven feed"
+            "pass a {kind} version, or a Minecraft version and a loader version"
         )));
     }
-    let url = format!("{maven}/{version}/{artifact}-{version}-installer.jar");
+    request.cancel.check()?;
+    emit_stage(progress, "loader", "installer");
+    let url = format!("{maven}/{coordinate}/{artifact}-{coordinate}-installer.jar");
     let store = Store::open(layout.store_root())?;
-    let stats: FetchStats = store
+    store
         .fetch_all(
             client,
             vec![BlobRequest {
@@ -323,47 +388,217 @@ async fn download_installer(
             &request.cancel,
         )
         .await?;
-    let _ = stats;
     let record = store
         .lookup_url(&url)?
         .ok_or_else(|| Error::message(format!("{kind} installer was not stored")))?;
     let installer_path = store.object_path(&record.sha512)?;
     let version_json = read_zip_file(&installer_path, "version.json")?;
-    let profile = version::parse_version(&version_json)?;
-    let stored_json = store.ingest(&version_json, None, None, None)?;
-    let game_version = version
-        .split_once('-')
-        .map(|(game, _)| game)
-        .unwrap_or(version)
-        .to_string();
-    let requests = version_blobs(&profile, &OsInfo::current())?;
+    let profile_bytes = read_zip_file(&installer_path, "install_profile.json")?;
+    let install = processors::parse_install_profile(&profile_bytes)?;
+    if !install.supported {
+        return Err(Error::message(processors::unsupported_message(kind)));
+    }
+    let version_info = version::parse_version(&version_json)?;
+    let game_version = install
+        .minecraft
+        .clone()
+        .or_else(|| version_info.inherits_from.clone())
+        .or_else(|| forge_game_version(coordinate).map(str::to_string))
+        .unwrap_or_else(|| request.version.to_string());
+    let mut vanilla_request = request.clone();
+    vanilla_request.loader = Loader::Vanilla;
+    vanilla_request.version = &game_version;
+    vanilla_request.loader_version = None;
+    let vanilla = download_vanilla(client, layout, &vanilla_request, progress).await?;
+    request.cancel.check()?;
+    emit_stage(progress, "loader", "libraries");
+    let mut requests = version_blobs(&version_info, request.os)?;
+    let profile_version = version::VersionInfo {
+        id: coordinate.to_string(),
+        libraries: Some(install.libraries.clone()),
+        ..empty_version()
+    };
+    requests.extend(version_blobs(&profile_version, request.os)?);
     store
-        .fetch_all(client, requests, 16, progress, &request.cancel)
+        .fetch_all(
+            client,
+            requests,
+            request.concurrency,
+            progress,
+            &request.cancel,
+        )
         .await?;
-    let client_sha1 = profile
-        .downloads
-        .as_ref()
-        .and_then(|downloads| downloads.client.as_ref())
-        .and_then(|artifact| artifact.sha1.clone())
-        .unwrap_or_default();
+    let libraries = layout.libraries();
+    materialize_libraries(
+        &store,
+        &version_info,
+        &install.libraries,
+        request.os,
+        &libraries,
+    )?;
+    let work = layout.root.join("store").join("work").join(kind);
+    extract_embedded(&installer_path, &work)?;
+    let client_jar = vanilla_client_path(layout, &vanilla)?;
+    emit_stage(progress, "loader", "processors");
+    let java = java::resolve_java(
+        client,
+        &layout.shared_assets(),
+        java::JavaRequest {
+            spec: version_info.java_version.as_ref(),
+            explicit: None,
+            mode: request.java_mode,
+            os: request.os,
+            concurrency: request.concurrency,
+        },
+        progress,
+    )
+    .await?;
+    let libraries_owned = libraries.clone();
+    let client_owned = client_jar.clone();
+    let installer_owned = installer_path.clone();
+    let work_owned = work.clone();
+    let version_owned = game_version.clone();
+    let data_owned = install.data.clone();
+    let processors_owned = install.processors.clone();
+    let java_path = java.0.path.clone();
+    let cancel = request.cancel.clone();
+    tokio::task::spawn_blocking(move || {
+        let subst = Subst {
+            libraries: &libraries_owned,
+            minecraft_jar: &client_owned,
+            installer: &installer_owned,
+            extracted: &work_owned,
+            minecraft_version: &version_owned,
+            data: &data_owned,
+        };
+        let profile = processors::InstallProfile {
+            minecraft: None,
+            data: std::collections::BTreeMap::new(),
+            processors: processors_owned,
+            libraries: Vec::new(),
+            supported: true,
+        };
+        processors::run_processors(&java_path, &profile, &subst, &cancel)
+    })
+    .await
+    .map_err(|err| Error::message(format!("processor task failed: {err}")))??;
+    ingest_library_tree(&store, &libraries)?;
+    let stored_json = store.ingest(&version_json, None, None, None)?;
     let item = CatalogItem {
-        id: format!("{kind}-{version}"),
+        id: format!("{kind}-{coordinate}"),
         kind: kind.into(),
-        name: format!("{kind} {version}"),
-        game_version,
-        loader_version: version.to_string(),
-        version_id: profile.id,
+        name: format!("{kind} {coordinate}"),
+        game_version: game_version.clone(),
+        loader_version: coordinate.to_string(),
+        version_id: version_info.id,
         version_json_sha512: stored_json.sha512,
-        parent_json_sha512: String::new(),
-        parent_id: String::new(),
-        client_sha1,
-        launchable: false,
-        note: format!(
-            "{kind} installer and libraries are in the store. The processor step that patches the client is not run, so this profile cannot be launched yet."
-        ),
+        parent_json_sha512: vanilla.version_json_sha512,
+        parent_id: vanilla.version_id,
+        client_sha1: vanilla.client_sha1,
+        launchable: true,
+        note: String::new(),
     };
     item.save(layout)?;
     Ok(item)
+}
+
+fn empty_version() -> VersionInfo {
+    serde_json::from_str(r#"{"id":"profile"}"#).expect("empty version")
+}
+
+fn forge_game_version(coordinate: &str) -> Option<&str> {
+    let (game, build) = coordinate.rsplit_once('-')?;
+    if build.is_empty() || !game.starts_with('1') {
+        return None;
+    }
+    Some(game)
+}
+
+fn materialize_libraries(
+    store: &Store,
+    version: &VersionInfo,
+    extra: &[crate::version::Library],
+    os: &OsInfo,
+    libraries: &std::path::Path,
+) -> Result<()> {
+    let mut libraries_list = version.libraries.clone().unwrap_or_default();
+    libraries_list.extend(extra.iter().cloned());
+    let plan = plan_libraries(&libraries_list, libraries, os, &FeatureSet::default())?;
+    for file in plan.downloads {
+        if file.dest.is_file() {
+            continue;
+        }
+        let sha512 = if let Some(sha1) = &file.sha1 {
+            store.lookup_sha1(sha1)?
+        } else {
+            None
+        };
+        let sha512 = match sha512 {
+            Some(hash) => Some(hash),
+            None if !file.url.is_empty() => {
+                store.lookup_url(&file.url)?.map(|record| record.sha512)
+            }
+            None => None,
+        };
+        if let Some(hash) = sha512 {
+            store.link_to(&hash, &file.dest)?;
+        }
+    }
+    Ok(())
+}
+
+fn vanilla_client_path(layout: &DataLayout, vanilla: &CatalogItem) -> Result<std::path::PathBuf> {
+    let store = Store::open(layout.store_root())?;
+    let sha512 = store
+        .lookup_sha1(&vanilla.client_sha1)?
+        .ok_or_else(|| Error::message("the vanilla client jar is not in the store"))?;
+    store.object_path(&sha512)
+}
+
+fn extract_embedded(installer: &std::path::Path, work: &std::path::Path) -> Result<()> {
+    let file = std::fs::File::open(installer).map_err(|err| Error::io(installer, err))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|err| Error::message(format!("could not read installer: {err}")))?;
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|err| Error::message(format!("could not read installer entry: {err}")))?;
+        let name = entry
+            .name()
+            .map_err(|err| Error::message(format!("installer entry name: {err}")))?;
+        if !name.starts_with("data/") || entry.is_dir() {
+            continue;
+        }
+        let dest = work.join(name.as_ref());
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| Error::io(parent, err))?;
+        }
+        let mut output = std::fs::File::create(&dest).map_err(|err| Error::io(&dest, err))?;
+        std::io::copy(&mut entry, &mut output).map_err(|err| Error::io(&dest, err))?;
+    }
+    Ok(())
+}
+
+fn ingest_library_tree(store: &Store, root: &std::path::Path) -> Result<()> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !path.is_file() {
+                continue;
+            }
+            let bytes = std::fs::read(&path).map_err(|err| Error::io(&path, err))?;
+            store.ingest(&bytes, None, None, None)?;
+        }
+    }
+    Ok(())
 }
 
 fn version_blobs(version: &VersionInfo, os: &OsInfo) -> Result<Vec<BlobRequest>> {
