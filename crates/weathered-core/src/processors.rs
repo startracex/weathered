@@ -365,11 +365,11 @@ mod tests {
             data: &profile.data,
         };
         assert_eq!(
-            substitute("{BINPATCH}", &subst).unwrap(),
+            substitute("{BINPATCH}", &subst).unwrap().replace('\\', "/"),
             "work/data/client.lzma"
         );
         assert_eq!(
-            substitute("{MAPPINGS}", &subst).unwrap(),
+            substitute("{MAPPINGS}", &subst).unwrap().replace('\\', "/"),
             "libraries/net/minecraft/client/1.21.1/client-1.21.1-mappings.txt"
         );
         assert_eq!(
