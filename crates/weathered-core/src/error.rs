@@ -81,6 +81,15 @@ pub enum Error {
         name: String,
     },
 
+    /// The loader does not publish builds for this Minecraft version.
+    #[error("{loader} does not support Minecraft {game}")]
+    Unsupported {
+        /// Display name, such as Fabric.
+        loader: String,
+        /// Minecraft version id.
+        game: String,
+    },
+
     /// No local or downloaded runtime satisfies the version's Java major.
     #[error(
         "no Java {major} runtime found. Install a matching JDK, pass --java, or allow Weathered to download Mojang's runtime"
@@ -129,6 +138,54 @@ impl Error {
         Self::Json {
             context: context.into(),
             source,
+        }
+    }
+
+    /// This loader has no builds for the requested game version.
+    pub fn unsupported(loader: &str, game: &str) -> Self {
+        let mut name = loader.to_string();
+        if let Some(first) = name.get_mut(..1) {
+            first.make_ascii_uppercase();
+        }
+        Self::Unsupported {
+            loader: name,
+            game: game.to_string(),
+        }
+    }
+
+    /// The caller asked the operation to stop.
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Message(text) if text == "cancelled")
+    }
+
+    /// A 400 or 404 from loader metadata, or [`Self::Unsupported`].
+    pub fn is_unsupported(&self) -> bool {
+        match self {
+            Self::Unsupported { .. } => true,
+            Self::HttpStatus { status, .. } => *status == 400 || *status == 404,
+            _ => false,
+        }
+    }
+
+    /// One short reason, without URLs or response bodies.
+    pub fn brief(&self) -> String {
+        match self {
+            Self::Http { source, .. } if source.is_timeout() => "connection timed out".into(),
+            Self::Http { source, .. } if source.is_connect() => "could not connect".into(),
+            Self::Http { .. } => "network error".into(),
+            Self::HttpStatus { status, .. } => format!("the server returned HTTP {status}"),
+            Self::Unsupported { .. } => self.to_string(),
+            Self::Message(text) if text == "cancelled" => "cancelled".into(),
+            other => {
+                let text = other.to_string();
+                let text = text.split("http").next().unwrap_or(&text).trim();
+                let text = text.trim_end_matches([':', ' ']);
+                if text.is_empty() {
+                    "something went wrong".into()
+                } else {
+                    text.chars().take(80).collect()
+                }
+            }
         }
     }
 

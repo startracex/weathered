@@ -30,6 +30,24 @@ pub struct Config {
     /// Offline player name used by the terminal UI.
     #[serde(default)]
     pub offline_username: String,
+    /// Concurrent downloads. Zero uses 16.
+    #[serde(default)]
+    pub download_jobs: u32,
+    /// Minimum heap, such as `512M`. Empty omits `-Xms`.
+    #[serde(default)]
+    pub memory_min: String,
+    /// Extra JVM arguments used when an instance does not set its own.
+    #[serde(default)]
+    pub jvm_args: String,
+    /// Instance id pinned to the top of the list and selected at startup.
+    #[serde(default)]
+    pub default_instance: String,
+    /// `name`, `created`, or `played`.
+    #[serde(default)]
+    pub instance_sort: String,
+    /// `newest`, `oldest`, `name`, or `stored`.
+    #[serde(default)]
+    pub download_sort: String,
 }
 
 impl Config {
@@ -78,6 +96,15 @@ impl Config {
         }
         std::fs::rename(&tmp, &path).io_at(&path)?;
         Ok(())
+    }
+
+    /// Download concurrency. Zero or missing means 16.
+    pub fn jobs(&self) -> usize {
+        if self.download_jobs == 0 {
+            16
+        } else {
+            self.download_jobs as usize
+        }
     }
 
     /// Return the game client id, creating and saving one on first use.

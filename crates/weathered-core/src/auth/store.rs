@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::offline::normalize_uuid;
-use super::{unix_now, Session};
+use super::{Session, unix_now};
 use crate::config::{self, Config};
 use crate::error::{Error, IoResultExt, Result};
 

@@ -5,8 +5,8 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -18,7 +18,7 @@ use crate::progress::{ProgressEvent, ProgressSink};
 
 /// Largest single file Weathered will accept. Larger than any current client
 /// jar or Java runtime file, and small enough to reject a runaway response.
-const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
+pub(crate) const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Largest JSON document Weathered will buffer.
 const MAX_JSON_BYTES: usize = 20 * 1024 * 1024;
@@ -30,8 +30,10 @@ pub struct RemoteFile {
     pub url: String,
     /// Final path.
     pub dest: PathBuf,
-    /// Expected SHA-1, if Mojang published one.
+    /// Expected SHA-1, if the source published one.
     pub sha1: Option<String>,
+    /// Expected SHA-512, when a loader profile published one.
+    pub sha512: Option<String>,
     /// Expected size in bytes, if known.
     pub size: Option<u64>,
     /// Set the executable bit after a successful download (Unix runtimes).
@@ -74,13 +76,35 @@ pub fn sha1_hex(data: impl AsRef<[u8]>) -> String {
 
 /// Download `url` into memory. Intended for manifests and other JSON documents.
 pub async fn get_bytes(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
+    get_bytes_cancellable(client, url, &crate::cancel::CancelFlag::new()).await
+}
+
+/// [`get_bytes`] that returns as soon as `cancel` is raised.
+pub async fn get_bytes_cancellable(
+    client: &reqwest::Client,
+    url: &str,
+    cancel: &crate::cancel::CancelFlag,
+) -> Result<Vec<u8>> {
     let mut last = None;
     for attempt in 1u32..=3 {
-        match get_bytes_once(client, url).await {
+        cancel.check()?;
+        let once = async {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => Err(Error::message("cancelled")),
+                result = get_bytes_once(client, url) => result,
+            }
+        };
+        match once.await {
             Ok(bytes) => return Ok(bytes),
+            Err(err) if err.is_cancelled() => return Err(err),
             Err(err) if attempt < 3 && err.is_retryable() => {
                 last = Some(err);
-                tokio::time::sleep(Duration::from_millis(200 * u64::from(attempt))).await;
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => return Err(Error::message("cancelled")),
+                    () = tokio::time::sleep(Duration::from_millis(200 * u64::from(attempt))) => {}
+                }
             }
             Err(err) => return Err(err),
         }
@@ -216,10 +240,10 @@ async fn file_is_valid(file: &RemoteFile) -> Result<bool> {
         if !meta.is_file() {
             return Ok(false);
         }
-        if let Some(size) = size {
-            if meta.len() != size {
-                return Ok(false);
-            }
+        if let Some(size) = size
+            && meta.len() != size
+        {
+            return Ok(false);
         }
         if let Some(expected) = expected {
             let actual = hash_file(&dest)?;
@@ -251,10 +275,10 @@ async fn download_once(client: &reqwest::Client, file: &RemoteFile) -> Result<()
     }
 
     let tmp = part_path(&file.dest);
-    if let Some(parent) = tmp.parent() {
-        if !parent.as_os_str().is_empty() {
-            tokio::fs::create_dir_all(parent).await.io_at(parent)?;
-        }
+    if let Some(parent) = tmp.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        tokio::fs::create_dir_all(parent).await.io_at(parent)?;
     }
     let mut output = tokio::fs::File::create(&tmp).await.io_at(&tmp)?;
     let mut hasher = Sha1::new();
@@ -290,14 +314,14 @@ async fn download_once(client: &reqwest::Client, file: &RemoteFile) -> Result<()
                 actual,
             });
         }
-    } else if let Some(size) = file.size {
-        if downloaded != size {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            return Err(Error::message(format!(
-                "size mismatch for {}: expected {size} bytes, got {downloaded}",
-                file.dest.display()
-            )));
-        }
+    } else if let Some(size) = file.size
+        && downloaded != size
+    {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(Error::message(format!(
+            "size mismatch for {}: expected {size} bytes, got {downloaded}",
+            file.dest.display()
+        )));
     }
 
     if file.executable {
@@ -308,10 +332,10 @@ async fn download_once(client: &reqwest::Client, file: &RemoteFile) -> Result<()
 
 /// Write `bytes` to `path` via a temporary file.
 pub async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            tokio::fs::create_dir_all(parent).await.io_at(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        tokio::fs::create_dir_all(parent).await.io_at(parent)?;
     }
     let tmp = part_path(path);
     tokio::fs::write(&tmp, bytes).await.io_at(&tmp)?;
@@ -339,10 +363,10 @@ fn part_path(path: &Path) -> PathBuf {
 }
 
 async fn replace_file(tmp: &Path, dest: &Path) -> Result<()> {
-    if let Some(parent) = dest.parent() {
-        if !parent.as_os_str().is_empty() {
-            tokio::fs::create_dir_all(parent).await.io_at(parent)?;
-        }
+    if let Some(parent) = dest.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        tokio::fs::create_dir_all(parent).await.io_at(parent)?;
     }
     #[cfg(windows)]
     if tokio::fs::try_exists(dest).await.unwrap_or(false) {

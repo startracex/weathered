@@ -60,6 +60,7 @@ pub fn plan_asset_downloads(index: &AssetIndex, objects_root: &Path) -> Result<V
             url: format!("{OBJECT_BASE}/{rel}"),
             dest,
             sha1: Some(object.hash.clone()),
+            sha512: None,
             size: Some(object.size),
             executable: false,
         });
@@ -148,9 +149,10 @@ mod tests {
         );
         let files = plan_asset_downloads(&index, Path::new("objects")).unwrap();
         assert_eq!(files.len(), 2);
-        assert!(files.iter().any(|file| file
-            .url
-            .ends_with("bd/bdf48ef6b5d0d23bbb02e17d04865216179f510a")));
+        assert!(files.iter().any(|file| {
+            file.url
+                .ends_with("bd/bdf48ef6b5d0d23bbb02e17d04865216179f510a")
+        }));
         assert!(object_rel_path("a").is_err());
     }
 }

@@ -4,6 +4,73 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 
+/// Launcher data directory: shared store, instance folders, and legacy files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataLayout {
+    /// Root previously used as the single game directory.
+    pub root: PathBuf,
+}
+
+impl DataLayout {
+    /// Use `root` as the launcher data directory.
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    /// `$WEATHERED_GAME_DIR`, or the platform data directory plus `weathered`.
+    pub fn from_environment() -> Self {
+        Self::new(GamePaths::default_root())
+    }
+
+    /// Content-addressed file store.
+    pub fn store_root(&self) -> PathBuf {
+        self.root.join("store")
+    }
+
+    /// One JSON file per downloaded profile.
+    pub fn catalog_dir(&self) -> PathBuf {
+        self.root.join("catalog")
+    }
+
+    /// Instance metadata and isolated game directories.
+    pub fn instances_dir(&self) -> PathBuf {
+        self.root.join("instances")
+    }
+
+    /// `instances/<id>/`.
+    pub fn instance_dir(&self, id: &str) -> PathBuf {
+        self.instances_dir().join(id)
+    }
+
+    /// Isolated game directory for a new instance.
+    pub fn instance_game(&self, id: &str) -> PathBuf {
+        self.instance_dir(id).join("game")
+    }
+
+    /// Downloaded manifests and loader lists, with timestamp sidecars.
+    pub fn cache_dir(&self) -> PathBuf {
+        self.root.join("cache")
+    }
+
+    /// Version JSON cache used while resolving Mojang documents.
+    pub fn meta(&self) -> GamePaths {
+        GamePaths::new(self.root.join("meta"))
+    }
+
+    /// Maven library tree used by Forge and NeoForge processors.
+    pub fn libraries(&self) -> PathBuf {
+        self.root.join("libraries")
+    }
+
+    /// Shared asset tree Minecraft reads (`assets/objects/<sha1>`).
+    ///
+    /// The bytes live once in the content store. This directory hard-links
+    /// them under the SHA-1 names the game expects.
+    pub fn shared_assets(&self) -> GamePaths {
+        GamePaths::new(self.root.clone())
+    }
+}
+
 /// Paths inside one game directory.
 ///
 /// The layout matches the official client: `versions/`, `libraries/`, and

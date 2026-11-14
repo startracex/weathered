@@ -5,7 +5,6 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use ratatui::layout::Rect;
 
@@ -16,13 +15,17 @@ pub enum Page {
     Download,
     Settings,
     More,
+    /// Full-screen instance editor. It is not one of the Q/E tabs.
+    Edit,
+    /// Loader builds for one Minecraft version. It is not one of the Q/E tabs.
+    Loaders,
 }
 
 impl Page {
     pub fn index(self) -> usize {
         match self {
-            Self::Launch => 0,
-            Self::Download => 1,
+            Self::Launch | Self::Edit => 0,
+            Self::Download | Self::Loaders => 1,
             Self::Settings => 2,
             Self::More => 3,
         }
@@ -43,6 +46,8 @@ impl Page {
             Self::Download => "Download",
             Self::Settings => "Settings",
             Self::More => "More",
+            Self::Edit => "Edit",
+            Self::Loaders => "Loaders",
         }
     }
 }
@@ -64,6 +69,10 @@ impl Category {
         }
     }
 
+    pub fn loader(self) -> &'static str {
+        "vanilla"
+    }
+
     pub fn matches(self, kind: &str) -> bool {
         match self {
             Self::Release => kind == "release",
@@ -78,9 +87,20 @@ impl Category {
 pub enum Focus {
     Versions,
     Accounts,
-    LaunchButton,
+    /// Path in the top bar. Enter opens it in the file manager.
+    DataDir,
+    /// Launch control on the selected instance row.
+    RowLaunch,
+    /// Edit control on the selected instance row.
+    RowEdit,
     DownloadCats,
     DownloadList,
+    /// Install or Create instance on the selected version row.
+    DownloadAction,
+    /// Loaders button on the selected version row.
+    DownloadLoaders,
+    /// Download or Create instance on the selected loader build.
+    LoaderButton,
     Search,
     Settings(usize),
     More,
@@ -90,6 +110,7 @@ pub enum Focus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
     Char(char),
+    CtrlR,
     Enter,
     Esc,
     Up,
@@ -102,6 +123,7 @@ pub enum Key {
     Home,
     End,
     CtrlC,
+    CtrlF,
 }
 
 /// Pointer input already translated from the terminal.
@@ -116,26 +138,63 @@ pub enum Mouse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     None,
-    Install { version: String },
+    Install {
+        id: u64,
+        version: String,
+        loader: String,
+        loader_version: Option<String>,
+        create_instance: bool,
+    },
+    /// Fetch these loader lists for one Minecraft version. Already-running
+    /// requests for the same key are left alone unless `force` is set.
+    LoadLoaders {
+        version: String,
+        loaders: Vec<String>,
+        force: bool,
+    },
+    DeleteInstance,
+    SetDefault,
+    OpenFolder,
+    OpenDataDir,
+    PersistDraft,
+    CreateNamed {
+        catalog_id: String,
+        name: String,
+    },
+    ImportPack {
+        id: u64,
+        path: String,
+    },
+    CancelJob {
+        id: u64,
+    },
     Launch,
     StopGame,
     Save,
     Login,
     CancelLogin,
     RefreshManifest,
+    /// Reload the version manifest and, on the loaders page, the open loader list.
+    RefreshCache {
+        force: bool,
+    },
     Quit,
 }
 
 /// Messages from background tasks.
 #[derive(Debug, Clone)]
 pub enum Msg {
-    Catalog(Vec<CatalogEntry>),
+    Catalog {
+        entries: Vec<CatalogEntry>,
+        saved_at: i64,
+    },
     Notice {
         text: String,
         error: bool,
     },
     Javas(Vec<DetectedJava>),
     Progress {
+        id: u64,
         version: String,
         stage: String,
         completed: u64,
@@ -144,12 +203,16 @@ pub enum Msg {
         launching: bool,
     },
     InstallFinished {
+        id: u64,
         version: String,
         ok: bool,
         detail: String,
     },
-    GameLog(String),
-    GameExit(i32),
+    GameExit {
+        code: i32,
+        log_path: String,
+        crash_report: String,
+    },
     LoginPrompt {
         url: String,
         code: String,
@@ -160,10 +223,25 @@ pub enum Msg {
         detail: String,
         name: String,
     },
+    LoaderBuilds {
+        game: String,
+        loader: String,
+        builds: Vec<LoaderBuildRow>,
+        /// Unix time of the list that was just applied. Zero means "do not cache".
+        saved_at: i64,
+        error: String,
+        /// The loader publishes nothing for this Minecraft version.
+        unsupported: bool,
+    },
+    /// A catalog refresh finished, including one that failed after showing a cache.
+    CatalogSettled,
     /// The game process is on screen and the Launch button should become Stop.
-    GameStarted,
+    GameStarted {
+        id: u64,
+    },
     /// Preparing the launch command failed before the process existed.
     LaunchFailed {
+        id: u64,
         detail: String,
     },
 }
@@ -179,6 +257,156 @@ pub struct CatalogEntry {
 pub struct Installed {
     pub id: String,
     pub kind: String,
+}
+
+/// One row on the Launch page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceRow {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub game_version: String,
+    pub loader: String,
+    pub legacy: bool,
+}
+
+/// Loader build shown in the version picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoaderBuildRow {
+    pub version: String,
+    pub stable: bool,
+    pub recommended: bool,
+}
+
+/// One loader's builds for one Minecraft version, including a failed fetch.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LoaderList {
+    pub builds: Vec<LoaderBuildRow>,
+    pub saved_at: i64,
+    pub loading: bool,
+    pub error: String,
+    /// The metadata says this loader has no builds for the game version.
+    pub unsupported: bool,
+}
+
+/// Fabric, Quilt, Forge, or NeoForge version list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoaderPicker {
+    pub game_version: String,
+    pub loader: String,
+    pub builds: Vec<LoaderBuildRow>,
+    pub show_unstable: bool,
+    pub selected: usize,
+    pub loading: bool,
+    pub error: String,
+    /// Grey tab: this loader does not support the Minecraft version.
+    pub unsupported: bool,
+    pub create_instance: bool,
+}
+
+/// How the instance list is ordered under the pinned default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortMode {
+    Name,
+    Created,
+    Played,
+}
+
+impl SortMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Name => Self::Created,
+            Self::Created => Self::Played,
+            Self::Played => Self::Name,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Created => "created",
+            Self::Played => "played",
+        }
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "created" => Self::Created,
+            "played" => Self::Played,
+            _ => Self::Name,
+        }
+    }
+}
+
+/// How the download version list is ordered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadSort {
+    /// Release date, newest first.
+    Newest,
+    /// Release date, oldest first.
+    Oldest,
+    /// Version name, low to high.
+    Name,
+    /// Versions already in the store, then newest.
+    Stored,
+}
+
+impl DownloadSort {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Newest => Self::Oldest,
+            Self::Oldest => Self::Name,
+            Self::Name => Self::Stored,
+            Self::Stored => Self::Newest,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Newest => "newest",
+            Self::Oldest => "oldest",
+            Self::Name => "name",
+            Self::Stored => "stored",
+        }
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "oldest" => Self::Oldest,
+            "name" => Self::Name,
+            "stored" => Self::Stored,
+            _ => Self::Newest,
+        }
+    }
+}
+
+/// Editable copy of one instance. Empty override fields inherit globals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceDraft {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub java: String,
+    pub memory_min: String,
+    pub memory_max: String,
+    pub jvm_args: String,
+}
+
+/// One downloaded profile that can become an instance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogRow {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub game_version: String,
+    pub launchable: bool,
+    pub loader_version: String,
+}
+
+/// New-instance wizard step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreatorStep {
+    Source,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -197,12 +425,14 @@ pub struct DetectedJava {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Job {
+    pub id: u64,
     pub version: String,
     pub stage: String,
     pub completed: u64,
     pub total: u64,
     pub detail: String,
     pub launching: bool,
+    pub create_instance: bool,
 }
 
 impl Job {
@@ -219,6 +449,16 @@ pub enum Field {
     JavaPath,
     ClientId,
     Search,
+    PackPath,
+    Rename,
+    Description,
+    JavaOverride,
+    MemoryMin,
+    MemoryMax,
+    JvmArgs,
+    MemoryMinGlobal,
+    JvmGlobal,
+    InstanceName,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -265,6 +505,32 @@ pub struct App {
     pub detected: Vec<DetectedJava>,
     pub installed: Vec<Installed>,
     pub installed_ids: HashSet<String>,
+    pub instances: Vec<InstanceRow>,
+    pub catalog_items: Vec<CatalogRow>,
+    pub creator: Option<CreatorStep>,
+    pub creator_selected: usize,
+    pub picker: Option<LoaderPicker>,
+    /// Catalog id waiting for the instance-name prompt.
+    pub pending_catalog: Option<String>,
+    /// Loader lists remembered for this session, keyed by `loader\ngame`.
+    pub loader_cache: std::collections::HashMap<String, LoaderList>,
+    /// Keys with a fetch that has not finished. A second request is not started.
+    pub loader_inflight: HashSet<String>,
+    pub search_open: bool,
+    pub sort_mode: SortMode,
+    pub download_sort: DownloadSort,
+    pub default_instance: String,
+    pub memory_min: String,
+    pub jvm_args: String,
+    pub draft: Option<InstanceDraft>,
+    pub startup_select: bool,
+    /// Unix time of the version list currently on screen.
+    pub catalog_saved_at: i64,
+    /// A manifest refresh is already running.
+    pub catalog_refreshing: bool,
+    /// Ids whose late progress must be ignored.
+    pub cancelled_jobs: HashSet<u64>,
+    next_job_id: u64,
     pub version_selected: usize,
     pub version_scroll: usize,
     pub version_window: usize,
@@ -278,17 +544,17 @@ pub struct App {
     pub download_scroll: usize,
     pub download_window: usize,
     pub setting_selected: usize,
-    pub job: Option<Job>,
-    pub log: Vec<String>,
+    pub jobs: Vec<Job>,
     pub status: String,
     pub status_error: bool,
     pub editing: Option<Editor>,
     pub login: Option<LoginPrompt>,
     pub game_running: bool,
+    /// The user asked to stop the process, so a later non-zero exit is not a crash.
+    pub stop_requested: bool,
     pub screen: Screen,
     pub hover: Option<(u16, u16)>,
     pub quit: bool,
-    last_version_click: Option<(usize, Instant)>,
 }
 
 impl App {
@@ -296,7 +562,7 @@ impl App {
     pub fn empty(game_dir: PathBuf) -> Self {
         let mut app = Self {
             page: Page::Launch,
-            focus: Focus::Versions,
+            focus: Focus::RowLaunch,
             game_dir,
             memory: "2G".into(),
             username: "Steve".into(),
@@ -305,6 +571,26 @@ impl App {
             detected: Vec::new(),
             installed: Vec::new(),
             installed_ids: HashSet::new(),
+            instances: Vec::new(),
+            catalog_items: Vec::new(),
+            creator: None,
+            creator_selected: 0,
+            picker: None,
+            pending_catalog: None,
+            loader_cache: std::collections::HashMap::new(),
+            loader_inflight: HashSet::new(),
+            search_open: false,
+            sort_mode: SortMode::Name,
+            download_sort: DownloadSort::Newest,
+            default_instance: String::new(),
+            memory_min: String::new(),
+            jvm_args: String::new(),
+            draft: None,
+            startup_select: true,
+            catalog_saved_at: 0,
+            catalog_refreshing: false,
+            cancelled_jobs: HashSet::new(),
+            next_job_id: 1,
             version_selected: 0,
             version_scroll: 0,
             version_window: 8,
@@ -318,17 +604,16 @@ impl App {
             download_scroll: 0,
             download_window: 12,
             setting_selected: 0,
-            job: None,
-            log: Vec::new(),
+            jobs: Vec::new(),
             status: "Ready".into(),
             status_error: false,
             editing: None,
             login: None,
             game_running: false,
+            stop_requested: false,
             screen: Screen::default(),
             hover: None,
             quit: false,
-            last_version_click: None,
         };
         app.sync_offline_profile();
         app
@@ -349,6 +634,32 @@ impl App {
             },
         ];
         app.rebuild_installed_ids();
+        app.instances = vec![
+            InstanceRow {
+                id: "vanilla".into(),
+                name: "Vanilla".into(),
+                description: String::new(),
+                game_version: "1.21.1".into(),
+                loader: "vanilla".into(),
+                legacy: false,
+            },
+            InstanceRow {
+                id: "beta".into(),
+                name: "Beta".into(),
+                description: "old world".into(),
+                game_version: "b1.7.3".into(),
+                loader: "vanilla".into(),
+                legacy: false,
+            },
+        ];
+        app.catalog_items = vec![CatalogRow {
+            id: "vanilla-1.21.1".into(),
+            name: "1.21.1".into(),
+            kind: "vanilla".into(),
+            game_version: "1.21.1".into(),
+            launchable: true,
+            loader_version: String::new(),
+        }];
         app.catalog_ready = true;
         app.catalog = vec![
             CatalogEntry {
@@ -376,6 +687,7 @@ impl App {
             label: "21.0.13   /usr/bin/java".into(),
             path: "/usr/bin/java".into(),
         }];
+        app.default_instance = "vanilla".into();
         app.note("Ready", false);
         app
     }
@@ -385,24 +697,49 @@ impl App {
         self.status_error = error;
     }
 
-    pub fn push_log(&mut self, line: String) {
-        if line.is_empty() {
-            return;
-        }
-        self.log.push(line);
-        if self.log.len() > 200 {
-            let drop_count = self.log.len() - 200;
-            self.log.drain(0..drop_count);
-        }
-    }
-
     pub fn filtered(&self) -> Vec<&CatalogEntry> {
         let query = self.query.to_ascii_lowercase();
-        self.catalog
+        let mut items: Vec<&CatalogEntry> = self
+            .catalog
             .iter()
             .filter(|entry| self.category.matches(&entry.kind))
             .filter(|entry| query.is_empty() || entry.id.to_ascii_lowercase().contains(&query))
-            .collect()
+            .collect();
+        items.sort_by(|left, right| self.compare_download(left, right));
+        items
+    }
+
+    fn compare_download(&self, left: &CatalogEntry, right: &CatalogEntry) -> std::cmp::Ordering {
+        let by_date = right
+            .released
+            .cmp(&left.released)
+            .then_with(|| version_cmp(&left.id, &right.id));
+        match self.download_sort {
+            DownloadSort::Newest => by_date,
+            DownloadSort::Oldest => left
+                .released
+                .cmp(&right.released)
+                .then_with(|| version_cmp(&left.id, &right.id)),
+            DownloadSort::Name => version_cmp(&left.id, &right.id),
+            DownloadSort::Stored => self
+                .in_store(&right.id)
+                .cmp(&self.in_store(&left.id))
+                .then(by_date),
+        }
+    }
+
+    fn cycle_download_sort(&mut self) {
+        let keep = self
+            .filtered()
+            .get(self.download_selected)
+            .map(|entry| entry.id.clone());
+        self.download_sort = self.download_sort.next();
+        if let Some(id) = keep
+            && let Some(index) = self.filtered().iter().position(|entry| entry.id == id)
+        {
+            self.download_selected = index;
+        }
+        self.clamp_download();
     }
 
     pub fn setting_rows(&self) -> Vec<SettingRow> {
@@ -414,9 +751,29 @@ impl App {
                 selected_mark: false,
             },
             SettingRow {
-                label: "Memory".into(),
+                label: "Memory max".into(),
                 value: self.memory.clone(),
                 kind: SettingKind::Edit(Field::Memory),
+                selected_mark: false,
+            },
+            SettingRow {
+                label: "Memory min".into(),
+                value: if self.memory_min.is_empty() {
+                    "unset".into()
+                } else {
+                    self.memory_min.clone()
+                },
+                kind: SettingKind::Edit(Field::MemoryMinGlobal),
+                selected_mark: false,
+            },
+            SettingRow {
+                label: "JVM args".into(),
+                value: if self.jvm_args.is_empty() {
+                    "unset".into()
+                } else {
+                    self.jvm_args.clone()
+                },
+                kind: SettingKind::Edit(Field::JvmGlobal),
                 selected_mark: false,
             },
             SettingRow {
@@ -473,13 +830,93 @@ impl App {
         self.installed = scan_installed(&self.game_dir);
         self.rebuild_installed_ids();
         self.sort_installed();
-        if !self.installed.is_empty() && self.version_selected >= self.installed.len() {
+    }
+
+    pub fn selected_instance(&self) -> Option<&InstanceRow> {
+        self.instances.get(self.version_selected)
+    }
+
+    pub fn in_store(&self, version_id: &str) -> bool {
+        let kind = self.category.loader();
+        self.catalog_items
+            .iter()
+            .any(|item| item.kind == kind && item.game_version == version_id)
+    }
+
+    /// Reload instances and the download catalog from the data directory.
+    pub fn reload_local(&mut self) {
+        let layout = weathered_core::paths::DataLayout::new(&self.game_dir);
+        let _ = weathered_core::instance::migrate_legacy(&layout);
+        let mut found = weathered_core::instance::list(&layout).unwrap_or_default();
+        let order = match self.sort_mode {
+            SortMode::Name => weathered_core::instance::InstanceOrder::Name,
+            SortMode::Created => weathered_core::instance::InstanceOrder::Created,
+            SortMode::Played => weathered_core::instance::InstanceOrder::Played,
+        };
+        weathered_core::instance::order_instances(&mut found, order, &self.default_instance);
+        let startup = self.startup_select;
+        let keep = if self.startup_select {
             self.version_selected = 0;
+            self.version_scroll = 0;
+            self.startup_select = false;
+            None
+        } else {
+            self.instances
+                .get(self.version_selected)
+                .map(|item| item.id.clone())
+        };
+        self.instances = found
+            .into_iter()
+            .map(|item| InstanceRow {
+                id: item.id,
+                name: item.name,
+                description: item.description,
+                game_version: item.game_version,
+                loader: item.loader,
+                legacy: item.legacy,
+            })
+            .collect();
+        if let Some(id) = keep
+            && let Some(index) = self.instances.iter().position(|item| item.id == id)
+        {
+            self.version_selected = index;
+        }
+        self.catalog_items = weathered_core::catalog::list(&layout)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| CatalogRow {
+                id: item.id,
+                name: item.name,
+                kind: item.kind,
+                game_version: item.game_version,
+                launchable: item.launchable,
+                loader_version: item.loader_version,
+            })
+            .collect();
+        if !self.instances.is_empty() && self.version_selected >= self.instances.len() {
+            self.version_selected = 0;
+        }
+        if startup {
+            self.apply_startup_focus();
         }
     }
 
-    pub fn selected_version(&self) -> Option<&Installed> {
-        self.installed.get(self.version_selected)
+    /// The pinned default instance is the current selection.
+    #[cfg(test)]
+    pub fn selected_is_default(&self) -> bool {
+        self.selected_instance().is_some_and(|item| {
+            !self.default_instance.is_empty() && item.id == self.default_instance
+        })
+    }
+
+    fn apply_startup_focus(&mut self) {
+        self.version_selected = 0;
+        self.version_scroll = 0;
+        self.focus = if self.instances.is_empty() {
+            Focus::Accounts
+        } else {
+            Focus::RowLaunch
+        };
     }
 
     pub fn selected_profile(&self) -> Option<&Profile> {
@@ -501,16 +938,93 @@ impl App {
         if self.editing.is_some() {
             return self.on_edit_key(key);
         }
+        let key = match key {
+            Key::Char(ch) => Key::Char(ch.to_ascii_lowercase()),
+            other => other,
+        };
+        if self.search_open && key == Key::Esc {
+            self.clear_search();
+            return Effect::None;
+        }
+        if key == Key::Esc && self.page == Page::Loaders {
+            self.page = Page::Download;
+            self.focus = Focus::DownloadAction;
+            return Effect::None;
+        }
+        if key == Key::Esc && !self.jobs.is_empty() {
+            return self.cancel_job();
+        }
+        if key == Key::Esc && self.creator.is_some() {
+            self.creator = None;
+            return Effect::None;
+        }
+        if key == Key::Esc && self.page == Page::Edit {
+            self.page = Page::Launch;
+            self.focus = Focus::RowLaunch;
+            return Effect::None;
+        }
+        if key == Key::CtrlF && self.page == Page::Download {
+            self.search_open = true;
+            self.begin_edit(Field::Search, self.query.clone());
+            return Effect::None;
+        }
+        if key == Key::Char('o') && self.creator.is_none() {
+            match self.page {
+                Page::Launch => {
+                    self.sort_mode = self.sort_mode.next();
+                    self.reload_local();
+                    self.note(format!("Sort by {}", self.sort_mode.label()), false);
+                    return Effect::Save;
+                }
+                Page::Download => {
+                    self.cycle_download_sort();
+                    self.note(format!("Sort by {}", self.download_sort.label()), false);
+                    return Effect::Save;
+                }
+                _ => {}
+            }
+        }
+        if matches!(key, Key::Char('r') | Key::CtrlR)
+            && matches!(self.page, Page::Download | Page::Loaders)
+        {
+            return Effect::RefreshCache { force: true };
+        }
+        if key == Key::Char('b') && self.page == Page::Loaders {
+            if let Some(picker) = self.picker.as_mut() {
+                picker.show_unstable = !picker.show_unstable;
+            }
+            self.align_picker_selection();
+            return Effect::None;
+        }
+        if key == Key::Char('n') && self.page == Page::Launch && self.creator.is_none() {
+            self.open_creator();
+            return Effect::None;
+        }
         match key {
             Key::Char('q') => {
-                self.quit = true;
-                Effect::Quit
+                self.shift_page(-1);
+                Effect::None
+            }
+            Key::Char('e') => {
+                self.shift_page(1);
+                Effect::None
+            }
+            Key::Char('a') => self.nudge_side(-1),
+            Key::Char('d') => self.nudge_side(1),
+            Key::Char('w') => {
+                self.nudge(-1);
+                Effect::None
+            }
+            Key::Char('s') => {
+                self.nudge(1);
+                Effect::None
             }
             Key::Char('1') => self.goto(Page::Launch),
             Key::Char('2') => self.goto(Page::Download),
             Key::Char('3') => self.goto(Page::Settings),
             Key::Char('4') => self.goto(Page::More),
             Key::Char('/') if self.page == Page::Download => {
+                self.search_open = true;
                 self.begin_edit(Field::Search, self.query.clone());
                 Effect::None
             }
@@ -553,14 +1067,31 @@ impl App {
 
     pub fn on_msg(&mut self, msg: Msg) {
         match msg {
-            Msg::Catalog(entries) => {
+            Msg::LoaderBuilds {
+                game,
+                loader,
+                builds,
+                saved_at,
+                error,
+                unsupported,
+            } => {
+                self.store_loader_result(&game, &loader, builds, saved_at, error, unsupported);
+            }
+            Msg::Catalog { entries, saved_at } => {
                 self.catalog = entries;
                 self.catalog_ready = true;
+                self.catalog_saved_at = saved_at;
                 self.clamp_download();
                 self.sort_installed();
-                if self.status == "Loading version list..." || self.status == "Ready" {
+                if self.status == "Loading version list..."
+                    || self.status == "Refreshing version list..."
+                    || self.status == "Ready"
+                {
                     self.note(format!("{} versions", self.catalog.len()), false);
                 }
+            }
+            Msg::CatalogSettled => {
+                self.catalog_refreshing = false;
             }
             Msg::Notice { text, error } => self.note(text, error),
             Msg::Javas(found) => {
@@ -570,6 +1101,7 @@ impl App {
                 }
             }
             Msg::Progress {
+                id,
                 version,
                 stage,
                 completed,
@@ -577,41 +1109,53 @@ impl App {
                 detail,
                 launching,
             } => {
-                self.job = Some(Job {
-                    version,
-                    stage,
-                    completed,
-                    total,
-                    detail,
-                    launching,
-                });
+                if self.cancelled_jobs.contains(&id) {
+                    return;
+                }
+                if let Some(job) = self.jobs.iter_mut().find(|job| job.id == id) {
+                    job.version = version;
+                    job.stage = stage;
+                    job.completed = completed;
+                    job.total = total;
+                    job.detail = detail;
+                    job.launching = launching;
+                }
             }
             Msg::InstallFinished {
+                id,
                 version,
                 ok,
                 detail,
             } => {
-                if self.job.as_ref().is_some_and(|job| job.version == version) {
-                    self.job = None;
+                self.jobs.retain(|job| job.id != id);
+                if self.cancelled_jobs.contains(&id) {
+                    return;
                 }
                 if ok {
                     self.reload_installed();
-                    if let Some(index) = self.installed.iter().position(|item| item.id == version) {
-                        self.version_selected = index;
+                    self.reload_local();
+                    self.note(format!("Stored {version}. {detail}"), false);
+                    if self.jobs.iter().all(|job| job.launching) && detail.contains("instance") {
+                        self.page = Page::Launch;
+                        self.focus = Focus::RowLaunch;
                     }
-                    self.note(format!("Installed {version}. {detail}"), false);
                 } else {
                     self.note(format!("Install {version} failed: {detail}"), true);
                 }
             }
-            Msg::GameLog(line) => self.push_log(line),
-            Msg::GameExit(code) => {
+            Msg::GameExit {
+                code,
+                log_path,
+                crash_report,
+            } => {
                 self.game_running = false;
-                self.job = None;
-                if code == 0 {
-                    self.note("Game exited", false);
+                self.jobs.retain(|job| !job.launching);
+                if self.stop_requested {
+                    self.stop_requested = false;
+                    self.note("Stopped", false);
                 } else {
-                    self.note(format!("Game exited with status {code}"), true);
+                    let (text, error) = exit_notice(code, &log_path, &crash_report);
+                    self.note(text, error);
                 }
             }
             Msg::LoginPrompt { url, code, message } => {
@@ -625,47 +1169,138 @@ impl App {
                     self.note(detail, true);
                 }
             }
-            Msg::GameStarted => {
+            Msg::GameStarted { id } => {
+                if self.cancelled_jobs.contains(&id) {
+                    return;
+                }
+                self.jobs.retain(|job| job.id != id);
                 self.game_running = true;
                 self.note("Game is running", false);
             }
-            Msg::LaunchFailed { detail } => {
-                self.game_running = false;
-                if self.job.as_ref().is_some_and(|job| job.launching) {
-                    self.job = None;
+            Msg::LaunchFailed { id, detail } => {
+                self.jobs.retain(|job| job.id != id);
+                if self.cancelled_jobs.contains(&id) {
+                    return;
                 }
+                self.game_running = false;
                 self.note(detail, true);
             }
+        }
+    }
+
+    fn shift_page(&mut self, delta: isize) {
+        let next = (self.page.index() as isize + delta).rem_euclid(4) as usize;
+        let _ = self.goto(Page::from_index(next));
+    }
+
+    pub fn loader_scroll(&self, window: usize) -> usize {
+        let selected = self
+            .picker
+            .as_ref()
+            .map(|picker| picker.selected)
+            .unwrap_or(0);
+        if window == 0 || selected < window {
+            0
+        } else {
+            selected + 1 - window
+        }
+    }
+
+    pub fn picker_visible(&self) -> Vec<LoaderBuildRow> {
+        let Some(picker) = &self.picker else {
+            return Vec::new();
+        };
+        picker
+            .builds
+            .iter()
+            .filter(|build| picker.show_unstable || build.stable)
+            .cloned()
+            .collect()
+    }
+
+    fn align_picker_selection(&mut self) {
+        let visible = self.picker_visible();
+        let builds: Vec<weathered_core::catalog::LoaderBuild> = visible
+            .iter()
+            .map(|build| weathered_core::catalog::LoaderBuild {
+                version: build.version.clone(),
+                stable: build.stable,
+                recommended: build.recommended,
+            })
+            .collect();
+        if let Some(picker) = self.picker.as_mut() {
+            picker.selected = weathered_core::catalog::preferred_index(&builds)
+                .min(visible.len().saturating_sub(1));
         }
     }
 
     fn goto(&mut self, page: Page) -> Effect {
         self.page = page;
         self.focus = match page {
-            Page::Launch => Focus::Versions,
-            Page::Download => Focus::DownloadList,
-            Page::Settings => Focus::Settings(self.setting_selected),
+            Page::Launch => {
+                if self.instances.is_empty() {
+                    Focus::Accounts
+                } else {
+                    Focus::RowLaunch
+                }
+            }
+            Page::Download => Focus::DownloadAction,
+            Page::Loaders => Focus::LoaderButton,
+            Page::Settings | Page::Edit => Focus::Settings(self.setting_selected),
             Page::More => Focus::More,
         };
-        Effect::None
+        if page == Page::Download && self.needs_catalog_refresh() {
+            Effect::RefreshCache { force: false }
+        } else {
+            Effect::None
+        }
+    }
+
+    fn needs_catalog_refresh(&self) -> bool {
+        !self.catalog_refreshing
+            && !weathered_core::cache::is_fresh(
+                self.catalog_saved_at,
+                weathered_core::cache::FRESH_SECS,
+            )
+    }
+
+    /// Show a cached Mojang manifest immediately. A stale file stays on screen
+    /// until the background refresh replaces it.
+    pub fn load_cached_catalog(&mut self) {
+        let path = weathered_core::paths::DataLayout::new(&self.game_dir)
+            .cache_dir()
+            .join("version_manifest_v2.json");
+        let Some((saved, bytes)) = weathered_core::cache::read(&path) else {
+            return;
+        };
+        let Ok(manifest) = weathered_core::manifest::parse_manifest(&bytes) else {
+            return;
+        };
+        self.catalog = entries_from_manifest(&manifest);
+        self.catalog_ready = !self.catalog.is_empty();
+        self.catalog_saved_at = saved;
     }
 
     fn cycle_focus(&mut self, reverse: bool) {
         self.focus = match (self.page, self.focus, reverse) {
-            (Page::Launch, Focus::Versions, false) => Focus::Accounts,
-            (Page::Launch, Focus::Accounts, false) => Focus::LaunchButton,
-            (Page::Launch, _, false) => Focus::Versions,
-            (Page::Launch, Focus::Versions, true) => Focus::LaunchButton,
-            (Page::Launch, Focus::LaunchButton, true) => Focus::Accounts,
-            (Page::Launch, _, true) => Focus::Versions,
+            (Page::Launch, Focus::RowLaunch, false) => Focus::RowEdit,
+            (Page::Launch, Focus::RowEdit, false) => Focus::Accounts,
+            (Page::Launch, Focus::Accounts, false) => Focus::DataDir,
+            (Page::Launch, _, false) => Focus::RowLaunch,
+            (Page::Launch, Focus::RowLaunch, true) => Focus::DataDir,
+            (Page::Launch, Focus::DataDir, true) => Focus::Accounts,
+            (Page::Launch, Focus::Accounts, true) => Focus::RowEdit,
+            (Page::Launch, _, true) => Focus::RowLaunch,
             (Page::Download, Focus::DownloadList, false) => Focus::DownloadCats,
-            (Page::Download, Focus::DownloadCats, false) => Focus::Search,
+            (Page::Download, Focus::DownloadCats, false) if self.search_open => Focus::Search,
             (Page::Download, _, false) => Focus::DownloadList,
-            (Page::Download, Focus::DownloadList, true) => Focus::Search,
+            (Page::Download, Focus::DownloadList, true) if self.search_open => Focus::Search,
             (Page::Download, Focus::Search, true) => Focus::DownloadCats,
+            (Page::Download, Focus::DownloadList, true) => Focus::DownloadCats,
             (Page::Download, _, true) => Focus::DownloadList,
-            (Page::Settings, _, _) => Focus::Settings(self.setting_selected),
+            (Page::Settings | Page::Edit, _, _) => Focus::Settings(self.setting_selected),
             (Page::More, _, _) => Focus::More,
+            (Page::Loaders, _, _) => Focus::LoaderButton,
         };
     }
 
@@ -678,21 +1313,36 @@ impl App {
                     delta.signum(),
                 );
             }
+            Page::Launch if self.focus == Focus::DataDir => {}
+            Page::Launch if self.creator.is_some() => {
+                let len = self.creator_len();
+                bump(&mut self.creator_selected, len, delta.signum());
+            }
             Page::Launch => {
-                self.focus = Focus::Versions;
+                let column = if self.focus == Focus::RowEdit {
+                    Focus::RowEdit
+                } else {
+                    Focus::RowLaunch
+                };
                 slide(
                     &mut self.version_selected,
                     &mut self.version_scroll,
-                    self.installed.len(),
+                    self.instances.len(),
                     self.version_window,
                     delta,
                 );
+                self.focus = column;
             }
             Page::Download if self.focus == Focus::DownloadCats => {
                 self.shift_category(delta.signum());
             }
             Page::Download => {
-                self.focus = Focus::DownloadList;
+                let column = if self.focus == Focus::DownloadLoaders {
+                    Focus::DownloadLoaders
+                } else {
+                    Focus::DownloadAction
+                };
+                self.focus = column;
                 let len = self.filtered().len();
                 slide(
                     &mut self.download_selected,
@@ -708,10 +1358,48 @@ impl App {
                 self.focus = Focus::Settings(self.setting_selected);
             }
             Page::More => {}
+            Page::Edit => {
+                bump(&mut self.setting_selected, 9, delta.signum());
+                self.focus = Focus::Settings(self.setting_selected);
+            }
+            Page::Loaders => {
+                let len = self.picker_visible().len();
+                if let Some(picker) = self.picker.as_mut() {
+                    bump(&mut picker.selected, len, delta.signum());
+                }
+                self.focus = Focus::LoaderButton;
+            }
         }
     }
 
     fn nudge_side(&mut self, delta: isize) -> Effect {
+        if self.page == Page::Edit {
+            return Effect::None;
+        }
+        if self.page == Page::Launch && self.creator.is_none() {
+            self.focus = if delta > 0 {
+                Focus::RowEdit
+            } else {
+                Focus::RowLaunch
+            };
+            return Effect::None;
+        }
+        if self.page == Page::Download
+            && matches!(
+                self.focus,
+                Focus::DownloadAction | Focus::DownloadLoaders | Focus::DownloadList
+            )
+        {
+            self.focus = if delta > 0 {
+                Focus::DownloadLoaders
+            } else {
+                Focus::DownloadAction
+            };
+            return Effect::None;
+        }
+        if self.page == Page::Loaders {
+            return self.shift_loader(delta);
+        }
         if self.focus == Focus::DownloadCats {
             self.shift_category(delta.signum());
             return Effect::None;
@@ -735,21 +1423,49 @@ impl App {
     }
 
     fn activate(&mut self) -> Effect {
+        if self.creator.is_some() && self.page == Page::Launch {
+            return self.activate_creator();
+        }
+        if self.focus == Focus::DataDir {
+            return Effect::OpenDataDir;
+        }
         match self.page {
+            Page::Launch if self.focus == Focus::RowEdit => self.open_edit(),
             Page::Launch if self.focus == Focus::Accounts => Effect::None,
             Page::Launch => self.request_launch(),
+            Page::Edit => self.activate_edit(),
+            Page::Loaders => self.activate_loader(),
+            Page::Download if self.focus == Focus::DownloadLoaders => self.open_loaders(),
             Page::Download if self.focus == Focus::Search => {
                 self.begin_edit(Field::Search, self.query.clone());
                 Effect::None
             }
             Page::Download if self.focus == Focus::DownloadCats => Effect::None,
-            Page::Download => self.request_install(self.download_selected),
+            Page::Download => self.activate_download_action(),
             Page::Settings => self.activate_setting(self.setting_selected),
             Page::More => Effect::RefreshManifest,
         }
     }
 
     fn click_at(&mut self, x: u16, y: u16) -> Effect {
+        if self.login.is_some() {
+            if contains(self.screen.modal, x, y) {
+                if contains(self.screen.modal_cancel, x, y) {
+                    self.login = None;
+                    return Effect::CancelLogin;
+                }
+                return Effect::None;
+            }
+            self.login = None;
+            return Effect::CancelLogin;
+        }
+        if self.prompt_open() {
+            if contains(self.screen.modal, x, y) {
+                return Effect::None;
+            }
+            self.cancel_prompt();
+            return Effect::None;
+        }
         let Some(action) = self
             .screen
             .zones
@@ -760,10 +1476,12 @@ impl App {
         else {
             return Effect::None;
         };
-        if self.login.is_some() && !matches!(action, Click::CancelLogin) {
-            return Effect::None;
+        if self.editing.is_some() {
+            let effect = self.commit_edit();
+            if self.editing.is_some() || effect != Effect::None {
+                return effect;
+            }
         }
-        self.commit_edit_if_any();
         match action {
             Click::Page(page) => self.goto(page),
             Click::Account(index) => {
@@ -772,28 +1490,36 @@ impl App {
                 self.profile_selected = index;
                 Effect::None
             }
+            Click::CancelJob => self.cancel_job(),
+            Click::NewInstance => {
+                self.open_creator();
+                Effect::None
+            }
+            Click::Creator(index) => {
+                self.creator_selected = index;
+                self.activate_creator()
+            }
             Click::Version(index) => {
                 self.page = Page::Launch;
-                self.focus = Focus::Versions;
-                let now = Instant::now();
-                let double = self.last_version_click.is_some_and(|(previous, when)| {
-                    previous == index && now.duration_since(when) < Duration::from_millis(400)
-                });
                 self.version_selected = index;
-                self.last_version_click = Some((index, now));
-                if double {
-                    self.request_launch()
-                } else {
-                    Effect::None
-                }
+                self.focus = Focus::RowLaunch;
+                Effect::None
             }
-            Click::LaunchButton => {
-                self.focus = Focus::LaunchButton;
-                if self.game_running {
-                    Effect::StopGame
-                } else {
-                    self.request_launch()
-                }
+            Click::RowEdit(index) => {
+                self.page = Page::Launch;
+                self.version_selected = index;
+                self.focus = Focus::RowEdit;
+                self.open_edit()
+            }
+            Click::RowLaunch(index) => {
+                self.page = Page::Launch;
+                self.version_selected = index;
+                self.focus = Focus::RowLaunch;
+                self.request_launch()
+            }
+            Click::OpenDataDir => {
+                self.focus = Focus::DataDir;
+                Effect::OpenDataDir
             }
             Click::Category(category) => {
                 self.page = Page::Download;
@@ -805,17 +1531,43 @@ impl App {
             }
             Click::DownloadRow(index) => {
                 self.page = Page::Download;
-                self.focus = Focus::DownloadList;
+                self.focus = Focus::DownloadAction;
                 self.download_selected = index;
                 Effect::None
             }
             Click::InstallRow(index) => {
                 self.page = Page::Download;
-                self.focus = Focus::DownloadList;
+                self.focus = Focus::DownloadAction;
                 self.download_selected = index;
-                self.request_install(index)
+                self.activate_download_action()
+            }
+            Click::LoadersRow(index) => {
+                self.page = Page::Download;
+                self.focus = Focus::DownloadLoaders;
+                self.download_selected = index;
+                self.open_loaders()
+            }
+            Click::LoaderKind(index) => self.shift_loader_to(index),
+            Click::LoaderSelect(index) => {
+                if let Some(picker) = self.picker.as_mut() {
+                    picker.selected = index;
+                }
+                self.focus = Focus::LoaderButton;
+                Effect::None
+            }
+            Click::LoaderAction(index) => {
+                if let Some(picker) = self.picker.as_mut() {
+                    picker.selected = index;
+                }
+                self.focus = Focus::LoaderButton;
+                self.activate_loader()
             }
             Click::Setting(index) => {
+                if self.page == Page::Edit {
+                    self.setting_selected = index;
+                    self.focus = Focus::Settings(index);
+                    return self.activate_edit();
+                }
                 self.page = Page::Settings;
                 self.setting_selected = index;
                 self.focus = Focus::Settings(index);
@@ -837,22 +1589,25 @@ impl App {
                 self.login = None;
                 Effect::CancelLogin
             }
-            Click::Stop => Effect::StopGame,
         }
     }
 
     fn scroll_at(&mut self, x: u16, y: u16, delta: isize) {
         if contains(self.screen.version_list, x, y) {
-            self.focus = Focus::Versions;
+            if self.focus != Focus::RowEdit {
+                self.focus = Focus::RowLaunch;
+            }
             slide(
                 &mut self.version_selected,
                 &mut self.version_scroll,
-                self.installed.len(),
+                self.instances.len(),
                 self.version_window,
                 delta,
             );
         } else if contains(self.screen.download_list, x, y) {
-            self.focus = Focus::DownloadList;
+            if self.focus != Focus::DownloadLoaders {
+                self.focus = Focus::DownloadAction;
+            }
             let len = self.filtered().len();
             slide(
                 &mut self.download_selected,
@@ -875,49 +1630,570 @@ impl App {
         }
     }
 
+    fn start_job(&mut self, version: String, launching: bool, create_instance: bool) -> u64 {
+        let id = self.next_job_id;
+        self.next_job_id = self.next_job_id.saturating_add(1);
+        self.jobs.push(Job {
+            id,
+            version,
+            stage: if launching {
+                "preparing".into()
+            } else {
+                "starting".into()
+            },
+            completed: 0,
+            total: if launching { 0 } else { 1 },
+            detail: if launching {
+                "Resolving files".into()
+            } else {
+                "Queued".into()
+            },
+            launching,
+            create_instance,
+        });
+        id
+    }
+
+    pub fn download_action_label(&self, version_id: &str) -> &'static str {
+        let busy = self
+            .jobs
+            .iter()
+            .any(|job| !job.launching && job.version == version_id);
+        if busy {
+            "[wait]"
+        } else if self.vanilla_item(version_id).is_some() {
+            "[Create instance]"
+        } else {
+            "[Install]"
+        }
+    }
+
+    pub fn loader_action_label(&self, build_version: &str) -> &'static str {
+        let Some(picker) = &self.picker else {
+            return "[Download]";
+        };
+        if self
+            .loader_item(&picker.loader, &picker.game_version, build_version)
+            .is_some()
+        {
+            "[Create instance]"
+        } else {
+            "[Download]"
+        }
+    }
+
+    pub fn vanilla_item(&self, version_id: &str) -> Option<&CatalogRow> {
+        self.catalog_items.iter().find(|item| {
+            item.kind == "vanilla" && item.game_version == version_id && item.launchable
+        })
+    }
+
+    pub fn loader_item(&self, kind: &str, game: &str, loader_version: &str) -> Option<&CatalogRow> {
+        self.catalog_items.iter().find(|item| {
+            item.kind == kind
+                && item.game_version == game
+                && item.loader_version == loader_version
+                && item.launchable
+        })
+    }
+
+    fn prompt_instance_name(&mut self, catalog_id: String, default_name: String) {
+        self.pending_catalog = Some(catalog_id);
+        self.begin_edit(Field::InstanceName, default_name);
+    }
+
+    fn activate_download_action(&mut self) -> Effect {
+        let Some(version) = self
+            .filtered()
+            .get(self.download_selected)
+            .map(|entry| entry.id.clone())
+        else {
+            return Effect::None;
+        };
+        if let Some(item) = self.vanilla_item(&version) {
+            let catalog_id = item.id.clone();
+            self.prompt_instance_name(catalog_id, version);
+            Effect::None
+        } else {
+            self.request_install(self.download_selected)
+        }
+    }
+
+    fn prompt_open(&self) -> bool {
+        self.editing
+            .as_ref()
+            .is_some_and(|editor| matches!(editor.field, Field::InstanceName | Field::PackPath))
+    }
+
+    fn cancel_prompt(&mut self) {
+        self.pending_catalog = None;
+        self.editing = None;
+    }
+
+    fn open_loaders(&mut self) -> Effect {
+        let Some(version) = self
+            .filtered()
+            .get(self.download_selected)
+            .map(|entry| entry.id.clone())
+        else {
+            return Effect::None;
+        };
+        self.page = Page::Loaders;
+        self.focus = Focus::LoaderButton;
+        self.picker = Some(LoaderPicker {
+            game_version: version.clone(),
+            loader: "fabric".into(),
+            builds: Vec::new(),
+            show_unstable: false,
+            selected: 0,
+            loading: true,
+            error: String::new(),
+            unsupported: false,
+            create_instance: false,
+        });
+        let loaders = self.request_loader_lists(&version, &Self::loader_kinds(), false);
+        self.show_loader_tab();
+        if loaders.is_empty() {
+            Effect::None
+        } else {
+            Effect::LoadLoaders {
+                version,
+                loaders,
+                force: false,
+            }
+        }
+    }
+
+    fn loader_kinds() -> [&'static str; 4] {
+        ["fabric", "quilt", "forge", "neoforge"]
+    }
+
+    fn loader_cache_key(loader: &str, game: &str) -> String {
+        format!("{loader}\n{game}")
+    }
+
+    /// `loading`, `unsupported`, `error`, or `ready` for one loader tab.
+    pub fn loader_tab_state(&self, kind: &str) -> &'static str {
+        let game = self
+            .picker
+            .as_ref()
+            .map(|picker| picker.game_version.as_str())
+            .unwrap_or("");
+        let key = Self::loader_cache_key(kind, game);
+        match self.loader_cache.get(&key) {
+            Some(list) if list.loading || self.loader_inflight.contains(&key) => "loading",
+            Some(list) if list.unsupported => "unsupported",
+            Some(list) if !list.error.is_empty() && list.builds.is_empty() => "error",
+            _ if self.loader_inflight.contains(&key) => "loading",
+            _ => "ready",
+        }
+    }
+
+    /// Tab text. A loading tab ends with `...`. Other states keep the plain name.
+    pub fn loader_tab_label(&self, kind: &str, name: &str) -> String {
+        if self.loader_tab_state(kind) == "loading" {
+            format!("{name}...")
+        } else {
+            name.to_string()
+        }
+    }
+
+    fn remember_loader(&mut self, game: &str, loader: &str) {
+        let key = Self::loader_cache_key(loader, game);
+        if self.loader_cache.contains_key(&key) {
+            return;
+        }
+        let path = weathered_core::content::loader_cache_path(
+            &weathered_core::paths::DataLayout::new(&self.game_dir),
+            loader,
+            game,
+        );
+        if let Some((saved, builds)) = weathered_core::content::read_loader_cache(&path) {
+            self.loader_cache.insert(
+                key,
+                LoaderList {
+                    builds: builds
+                        .into_iter()
+                        .map(|build| LoaderBuildRow {
+                            version: build.version,
+                            stable: build.stable,
+                            recommended: build.recommended,
+                        })
+                        .collect(),
+                    saved_at: saved,
+                    loading: false,
+                    error: String::new(),
+                    unsupported: false,
+                },
+            );
+        }
+    }
+
+    /// Queue one fetch per loader that has no fresh list.
+    ///
+    /// An in-flight key is left alone. A finished error is left alone too:
+    /// tab switches do not retry it. `force` is the explicit refresh.
+    fn request_loader_lists(&mut self, game: &str, loaders: &[&str], force: bool) -> Vec<String> {
+        let mut need = Vec::new();
+        for loader in loaders {
+            self.remember_loader(game, loader);
+            let key = Self::loader_cache_key(loader, game);
+            if self.loader_inflight.contains(&key) && !force {
+                continue;
+            }
+            if !force && self.loader_fetch_settled(&key) {
+                continue;
+            }
+            self.loader_inflight.insert(key.clone());
+            let entry = self.loader_cache.entry(key).or_default();
+            entry.loading = true;
+            if force {
+                entry.error.clear();
+                entry.unsupported = false;
+            }
+            need.push((*loader).to_string());
+        }
+        need
+    }
+
+    fn loader_fetch_settled(&self, key: &str) -> bool {
+        let Some(list) = self.loader_cache.get(key) else {
+            return false;
+        };
+        if list.unsupported || (list.builds.is_empty() && !list.error.is_empty()) {
+            return true;
+        }
+        if list.builds.is_empty() && list.error.is_empty() && list.saved_at > 0 {
+            return true;
+        }
+        !list.builds.is_empty()
+            && list.error.is_empty()
+            && weathered_core::cache::is_fresh(list.saved_at, weathered_core::cache::FRESH_SECS)
+    }
+
+    fn show_loader_tab(&mut self) {
+        let Some(picker) = self.picker.clone() else {
+            return;
+        };
+        let key = Self::loader_cache_key(&picker.loader, &picker.game_version);
+        let Some(list) = self.loader_cache.get(&key).cloned() else {
+            if let Some(picker) = self.picker.as_mut() {
+                picker.builds.clear();
+                picker.loading = self.loader_inflight.contains(&key);
+                picker.error.clear();
+                picker.unsupported = false;
+                picker.selected = 0;
+            }
+            return;
+        };
+        let replaced = self
+            .picker
+            .as_ref()
+            .is_some_and(|picker| picker.builds != list.builds);
+        if let Some(picker) = self.picker.as_mut() {
+            picker.builds = list.builds;
+            picker.loading = list.loading;
+            picker.error = list.error;
+            picker.unsupported = list.unsupported;
+            if replaced {
+                picker.selected = 0;
+            }
+        }
+        if replaced {
+            self.align_picker_selection();
+        }
+    }
+
+    fn store_loader_result(
+        &mut self,
+        game: &str,
+        loader: &str,
+        builds: Vec<LoaderBuildRow>,
+        saved_at: i64,
+        error: String,
+        unsupported: bool,
+    ) {
+        let key = Self::loader_cache_key(loader, game);
+        self.loader_inflight.remove(&key);
+        let entry = self.loader_cache.entry(key).or_default();
+        let had_builds = !entry.builds.is_empty();
+        if unsupported {
+            entry.builds.clear();
+            entry.error.clear();
+            entry.unsupported = true;
+            entry.saved_at = weathered_core::cache::unix_now();
+        } else if !builds.is_empty() {
+            entry.builds = builds;
+            entry.saved_at = if saved_at > 0 {
+                saved_at
+            } else {
+                weathered_core::cache::unix_now()
+            };
+            entry.error.clear();
+            entry.unsupported = false;
+        } else if !had_builds {
+            entry.error = error.clone();
+            entry.unsupported = false;
+            if error.is_empty() {
+                entry.saved_at = weathered_core::cache::unix_now();
+            }
+        }
+        entry.loading = false;
+        let failed_refresh = had_builds && !error.is_empty();
+        let active = self
+            .picker
+            .as_ref()
+            .is_some_and(|picker| picker.game_version == game && picker.loader == loader);
+        if !active {
+            return;
+        }
+        self.show_loader_tab();
+        if failed_refresh {
+            self.note(error, true);
+        }
+    }
+
+    fn loader_index(&self) -> usize {
+        let kinds = ["fabric", "quilt", "forge", "neoforge"];
+        self.picker
+            .as_ref()
+            .and_then(|picker| kinds.iter().position(|kind| *kind == picker.loader))
+            .unwrap_or(0)
+    }
+
+    fn shift_loader(&mut self, delta: isize) -> Effect {
+        let next = (self.loader_index() as isize + delta.signum()).clamp(0, 3) as usize;
+        self.shift_loader_to(next)
+    }
+
+    fn shift_loader_to(&mut self, next: usize) -> Effect {
+        let kinds = ["fabric", "quilt", "forge", "neoforge"];
+        let Some(picker) = self.picker.as_ref() else {
+            return Effect::None;
+        };
+        let next = next.min(kinds.len() - 1);
+        if picker.loader == kinds[next] {
+            return Effect::None;
+        }
+        let loader = kinds[next].to_string();
+        if let Some(picker) = self.picker.as_mut() {
+            picker.loader = loader;
+            picker.selected = 0;
+        }
+        self.focus = Focus::LoaderButton;
+        self.show_loader_tab();
+        Effect::None
+    }
+
+    fn activate_loader(&mut self) -> Effect {
+        let Some(picker) = self.picker.clone() else {
+            return Effect::None;
+        };
+        if picker.unsupported {
+            self.note(
+                format!(
+                    "{} does not support Minecraft {}",
+                    picker.loader, picker.game_version
+                ),
+                true,
+            );
+            return Effect::None;
+        }
+        let visible = self.picker_visible();
+        let Some(build) = visible.get(picker.selected) else {
+            return Effect::None;
+        };
+        if let Some(item) = self.loader_item(&picker.loader, &picker.game_version, &build.version) {
+            let catalog_id = item.id.clone();
+            let name = format!("{}-{}", picker.game_version, picker.loader);
+            self.prompt_instance_name(catalog_id, name);
+            return Effect::None;
+        }
+        let label = format!(
+            "{} {} {}",
+            picker.game_version, picker.loader, build.version
+        );
+        if self
+            .jobs
+            .iter()
+            .any(|job| !job.launching && job.version == label)
+        {
+            self.note(format!("{label} is already downloading"), false);
+            return Effect::None;
+        }
+        let id = self.start_job(label.clone(), false, false);
+        self.note(format!("Downloading {label}"), false);
+        Effect::Install {
+            id,
+            version: picker.game_version,
+            loader: picker.loader,
+            loader_version: Some(build.version.clone()),
+            create_instance: false,
+        }
+    }
+
     fn request_launch(&mut self) -> Effect {
         if self.game_running {
             return Effect::StopGame;
         }
-        if self.job.is_some() {
-            self.note("Wait for the current task to finish", true);
+        if self.jobs.iter().any(|job| job.launching) {
+            self.note("A launch is already being prepared", true);
             return Effect::None;
         }
-        let Some(version) = self.selected_version().map(|item| item.id.clone()) else {
-            self.note("Install a version on the Download page first", true);
+        let Some(instance) = self.selected_instance() else {
+            self.note("Create an instance first", true);
             return Effect::None;
         };
-        self.job = Some(Job {
-            version: version.clone(),
-            stage: "preparing".to_string(),
-            completed: 0,
-            total: 0,
-            detail: "Resolving files".into(),
-            launching: true,
-        });
-        self.note(format!("Preparing {version}"), false);
+        if self.jobs.iter().any(|job| {
+            job.create_instance
+                && !job.launching
+                && (job.version == instance.game_version || job.version == instance.id)
+        }) {
+            self.note("That instance is still being installed", true);
+            return Effect::None;
+        }
+        let name = instance.name.clone();
+        let _id = self.start_job(name.clone(), true, false);
+        self.note(format!("Preparing {name}"), false);
         Effect::Launch
     }
 
     fn request_install(&mut self, index: usize) -> Effect {
-        if self.job.is_some() {
-            self.note("A download or launch is already running", true);
-            return Effect::None;
-        }
-        let Some(id) = self.filtered().get(index).map(|entry| entry.id.clone()) else {
+        let Some(version) = self.filtered().get(index).map(|entry| entry.id.clone()) else {
             return Effect::None;
         };
+        if self
+            .jobs
+            .iter()
+            .any(|job| !job.launching && job.version == version)
+        {
+            self.note(format!("{version} is already downloading"), false);
+            return Effect::None;
+        }
         self.download_selected = index;
-        self.job = Some(Job {
-            version: id.clone(),
-            stage: "starting".to_string(),
-            completed: 0,
-            total: 1,
-            detail: "Queued".into(),
-            launching: false,
+        let id = self.start_job(version.clone(), false, false);
+        self.note(format!("Downloading {version}"), false);
+        Effect::Install {
+            id,
+            version,
+            loader: "vanilla".into(),
+            loader_version: None,
+            create_instance: false,
+        }
+    }
+
+    fn open_edit(&mut self) -> Effect {
+        let Some(row) = self.selected_instance() else {
+            self.note("Select an instance first", true);
+            return Effect::None;
+        };
+        let layout = weathered_core::paths::DataLayout::new(&self.game_dir);
+        let Ok(Some(instance)) = weathered_core::instance::find(&layout, &row.id) else {
+            self.note("That instance is no longer on disk", true);
+            return Effect::None;
+        };
+        self.draft = Some(InstanceDraft {
+            id: instance.id,
+            name: instance.name,
+            description: instance.description,
+            java: instance.java,
+            memory_min: instance.memory_min,
+            memory_max: instance.memory,
+            jvm_args: instance.jvm_args,
         });
-        self.note(format!("Installing {id}"), false);
-        Effect::Install { version: id }
+        self.page = Page::Edit;
+        self.setting_selected = 0;
+        self.focus = Focus::Settings(0);
+        Effect::None
+    }
+
+    fn activate_edit(&mut self) -> Effect {
+        let Some(draft) = self.draft.clone() else {
+            self.page = Page::Launch;
+            return Effect::None;
+        };
+        match self.setting_selected {
+            0 => {
+                self.begin_edit(Field::Rename, draft.name);
+                Effect::None
+            }
+            1 => {
+                self.begin_edit(Field::Description, draft.description);
+                Effect::None
+            }
+            2 => Effect::SetDefault,
+            3 => {
+                self.begin_edit(Field::JavaOverride, draft.java);
+                Effect::None
+            }
+            4 => {
+                self.begin_edit(Field::MemoryMin, draft.memory_min);
+                Effect::None
+            }
+            5 => {
+                self.begin_edit(Field::MemoryMax, draft.memory_max);
+                Effect::None
+            }
+            6 => {
+                self.begin_edit(Field::JvmArgs, draft.jvm_args);
+                Effect::None
+            }
+            7 => Effect::OpenFolder,
+            _ => {
+                self.page = Page::Launch;
+                Effect::DeleteInstance
+            }
+        }
+    }
+
+    fn clear_search(&mut self) {
+        self.query.clear();
+        self.search_open = false;
+        self.editing = None;
+        self.download_selected = 0;
+        self.download_scroll = 0;
+        self.focus = Focus::DownloadAction;
+    }
+
+    fn open_creator(&mut self) {
+        self.creator = Some(CreatorStep::Source);
+        self.creator_selected = 0;
+        self.page = Page::Launch;
+        self.focus = Focus::Versions;
+        self.note("New instance", false);
+    }
+
+    fn creator_len(&self) -> usize {
+        match self.creator {
+            Some(CreatorStep::Source) => 2,
+            None => 0,
+        }
+    }
+
+    fn activate_creator(&mut self) -> Effect {
+        match self.creator {
+            Some(CreatorStep::Source) => match self.creator_selected {
+                0 => {
+                    self.creator = None;
+                    self.page = Page::Download;
+                    self.focus = Focus::DownloadAction;
+                    self.note(
+                        "Choose a version to install or turn into an instance.",
+                        false,
+                    );
+                    if self.needs_catalog_refresh() {
+                        Effect::RefreshCache { force: false }
+                    } else {
+                        Effect::None
+                    }
+                }
+                _ => {
+                    self.begin_edit(Field::PackPath, String::new());
+                    Effect::None
+                }
+            },
+            None => Effect::None,
+        }
     }
 
     fn activate_setting(&mut self, index: usize) -> Effect {
@@ -932,7 +2208,38 @@ impl App {
                     Field::Username => self.username.clone(),
                     Field::JavaPath => self.java_path.clone(),
                     Field::ClientId => self.client_id_input.clone(),
-                    Field::Search => self.query.clone(),
+                    Field::Search | Field::PackPath => self.query.clone(),
+                    Field::Rename => self
+                        .selected_instance()
+                        .map(|item| item.name.clone())
+                        .unwrap_or_default(),
+                    Field::Description => self
+                        .selected_instance()
+                        .map(|item| item.description.clone())
+                        .unwrap_or_default(),
+                    Field::JavaOverride => self
+                        .draft
+                        .as_ref()
+                        .map(|draft| draft.java.clone())
+                        .unwrap_or_default(),
+                    Field::MemoryMin => self
+                        .draft
+                        .as_ref()
+                        .map(|draft| draft.memory_min.clone())
+                        .unwrap_or_default(),
+                    Field::MemoryMax => self
+                        .draft
+                        .as_ref()
+                        .map(|draft| draft.memory_max.clone())
+                        .unwrap_or_default(),
+                    Field::JvmArgs => self
+                        .draft
+                        .as_ref()
+                        .map(|draft| draft.jvm_args.clone())
+                        .unwrap_or_default(),
+                    Field::MemoryMinGlobal => self.memory_min.clone(),
+                    Field::JvmGlobal => self.jvm_args.clone(),
+                    Field::InstanceName => String::new(),
                 };
                 self.begin_edit(field, current);
                 Effect::None
@@ -962,11 +2269,17 @@ impl App {
     fn on_edit_key(&mut self, key: Key) -> Effect {
         match key {
             Key::Esc => {
-                if let Some(editor) = self.editing.clone() {
-                    if editor.field == Field::Search {
-                        self.query = editor.origin;
-                        self.clamp_download();
-                    }
+                if self
+                    .editing
+                    .as_ref()
+                    .is_some_and(|editor| editor.field == Field::Search)
+                {
+                    self.clear_search();
+                    return Effect::None;
+                }
+                if self.prompt_open() {
+                    self.cancel_prompt();
+                    return Effect::None;
                 }
                 self.editing = None;
                 Effect::None
@@ -1024,8 +2337,9 @@ impl App {
                 return;
             }
             editor.cursor -= 1;
-            let at = byte_index(&editor.buffer, editor.cursor);
-            editor.buffer.remove(at);
+            let start = byte_index(&editor.buffer, editor.cursor);
+            let end = byte_index(&editor.buffer, editor.cursor + 1);
+            editor.buffer.replace_range(start..end, "");
         }
         self.mirror_search();
     }
@@ -1047,12 +2361,22 @@ impl App {
             return Effect::None;
         };
         match editor.field {
-            Field::Memory if !valid_memory(&editor.buffer) => {
+            Field::Memory | Field::MemoryMax | Field::MemoryMin | Field::MemoryMinGlobal
+                if !editor.buffer.trim().is_empty() && !valid_memory(&editor.buffer) =>
+            {
                 self.note("Memory should look like 2G or 4096M", true);
+                return Effect::None;
+            }
+            Field::Rename if editor.buffer.trim().is_empty() => {
+                self.note("Name cannot be empty", true);
                 return Effect::None;
             }
             Field::Username if editor.buffer.trim().is_empty() => {
                 self.note("Username cannot be empty", true);
+                return Effect::None;
+            }
+            Field::InstanceName if editor.buffer.trim().is_empty() => {
+                self.note("Instance name cannot be empty", true);
                 return Effect::None;
             }
             Field::GameDir if editor.buffer.trim().is_empty() => {
@@ -1063,13 +2387,39 @@ impl App {
         }
         self.editing = None;
         match editor.field {
+            Field::InstanceName => {
+                let name = editor.buffer.trim().to_string();
+                let Some(catalog_id) = self.pending_catalog.clone() else {
+                    self.note("Choose a downloaded version first", true);
+                    return Effect::None;
+                };
+                self.pending_catalog = None;
+                return Effect::CreateNamed { catalog_id, name };
+            }
+            Field::PackPath => {
+                let path = editor.buffer.trim().to_string();
+                if path.is_empty() {
+                    self.note("Enter the path to a .mrpack file", true);
+                    return Effect::None;
+                }
+                self.creator = None;
+                let id = self.start_job("modpack".into(), false, true);
+                return Effect::ImportPack { id, path };
+            }
             Field::GameDir => {
                 self.game_dir = PathBuf::from(editor.buffer.trim());
                 self.version_selected = 0;
                 self.version_scroll = 0;
                 self.reload_installed();
+                self.reload_local();
             }
             Field::Memory => self.memory = editor.buffer.trim().to_string(),
+            Field::MemoryMinGlobal => self.memory_min = editor.buffer.trim().to_string(),
+            Field::JvmGlobal => self.jvm_args = editor.buffer.trim().to_string(),
+            Field::JavaOverride | Field::MemoryMin | Field::MemoryMax | Field::JvmArgs => {
+                self.write_draft(editor.field, editor.buffer.trim());
+                return Effect::PersistDraft;
+            }
             Field::Username => {
                 self.username = editor.buffer.trim().to_string();
                 self.sync_offline_profile();
@@ -1083,14 +2433,27 @@ impl App {
                 self.clamp_download();
                 return Effect::None;
             }
+            Field::Rename | Field::Description => {
+                self.write_draft(editor.field, editor.buffer.trim());
+                return Effect::PersistDraft;
+            }
         }
         self.note("Settings updated", false);
         Effect::Save
     }
 
-    fn commit_edit_if_any(&mut self) {
-        if self.editing.is_some() {
-            let _ = self.commit_edit();
+    fn write_draft(&mut self, field: Field, value: &str) {
+        let Some(draft) = self.draft.as_mut() else {
+            return;
+        };
+        match field {
+            Field::Rename => draft.name = value.to_string(),
+            Field::Description => draft.description = value.to_string(),
+            Field::JavaOverride => draft.java = value.to_string(),
+            Field::MemoryMin => draft.memory_min = value.to_string(),
+            Field::MemoryMax => draft.memory_max = value.to_string(),
+            Field::JvmArgs => draft.jvm_args = value.to_string(),
+            _ => {}
         }
     }
 
@@ -1148,11 +2511,44 @@ impl App {
         );
     }
 
-    pub fn mark_game_stopped(&mut self) {
-        self.game_running = false;
-        if self.job.as_ref().is_some_and(|job| job.launching) {
-            self.job = None;
+    fn cancel_job(&mut self) -> Effect {
+        let Some(job) = self.jobs.pop() else {
+            return Effect::None;
+        };
+        self.cancelled_jobs.insert(job.id);
+        if job.launching {
+            self.game_running = false;
+            self.stop_requested = true;
+            self.note("Stopped", false);
+            Effect::StopGame
+        } else {
+            self.note(format!("Cancelled {}", job.version), false);
+            Effect::CancelJob { id: job.id }
         }
+    }
+
+    pub fn mark_game_stopped(&mut self) {
+        self.stop_requested = true;
+        self.game_running = false;
+        if let Some(job) = self.jobs.iter().rev().find(|job| job.launching) {
+            self.cancelled_jobs.insert(job.id);
+        }
+        self.jobs.retain(|job| !job.launching);
+    }
+
+    pub fn overall_progress(&self) -> (u64, u64) {
+        let mut done = 0u64;
+        let mut total = 0u64;
+        for job in &self.jobs {
+            done += job.completed;
+            let units = if job.total == 0 {
+                job.completed.max(1)
+            } else {
+                job.total.max(job.completed)
+            };
+            total += units;
+        }
+        (done, total)
     }
 }
 
@@ -1162,17 +2558,25 @@ pub enum Click {
     Page(Page),
     Account(usize),
     Version(usize),
-    LaunchButton,
+    NewInstance,
+    Creator(usize),
+    RowLaunch(usize),
+    RowEdit(usize),
     Category(Category),
     DownloadRow(usize),
     InstallRow(usize),
+    LoadersRow(usize),
+    LoaderKind(usize),
+    LoaderSelect(usize),
+    LoaderAction(usize),
     Setting(usize),
     Search,
     SignIn,
     Save,
     Refresh,
     CancelLogin,
-    Stop,
+    CancelJob,
+    OpenDataDir,
 }
 
 /// Versions that already have both a json file and a client jar.
@@ -1249,6 +2653,49 @@ fn reveal(selected: usize, scroll: &mut usize, window: usize) {
     }
 }
 
+fn version_cmp(left: &str, right: &str) -> std::cmp::Ordering {
+    let mut left_parts = left.split(|ch: char| !ch.is_ascii_alphanumeric());
+    let mut right_parts = right.split(|ch: char| !ch.is_ascii_alphanumeric());
+    loop {
+        match (left_parts.next(), right_parts.next()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(left_part), Some(right_part)) => {
+                if left_part.is_empty() && right_part.is_empty() {
+                    continue;
+                }
+                let order = match (left_part.parse::<u64>(), right_part.parse::<u64>()) {
+                    (Ok(left_num), Ok(right_num)) => left_num.cmp(&right_num),
+                    _ => left_part.cmp(right_part),
+                };
+                if order != std::cmp::Ordering::Equal {
+                    return order;
+                }
+            }
+        }
+    }
+}
+
+pub fn entries_from_manifest(
+    manifest: &weathered_core::manifest::VersionManifest,
+) -> Vec<CatalogEntry> {
+    manifest
+        .versions
+        .iter()
+        .map(|entry| CatalogEntry {
+            id: entry.id.clone(),
+            kind: entry.version_type.clone(),
+            released: entry
+                .release_time
+                .as_deref()
+                .and_then(|time| time.split('T').next())
+                .unwrap_or("-")
+                .to_string(),
+        })
+        .collect()
+}
+
 fn byte_index(text: &str, chars: usize) -> usize {
     text.char_indices()
         .nth(chars)
@@ -1261,6 +2708,7 @@ fn byte_index(text: &str, chars: usize) -> usize {
 pub struct Screen {
     pub zones: Vec<Zone>,
     pub header: Rect,
+    pub data_path: Rect,
     pub nav: Rect,
     pub body: Rect,
     pub footer: Rect,
@@ -1270,14 +2718,17 @@ pub struct Screen {
     pub account_list: Rect,
     pub version_list: Rect,
     pub version_rows: Vec<Rect>,
-    pub launch_button: Rect,
+    pub row_launch: Vec<Rect>,
+    pub row_edit: Vec<Rect>,
+    pub new_instance: Rect,
     pub progress: Rect,
-    pub log: Rect,
+    pub cancel: Rect,
     pub download_tabs: Vec<Rect>,
     pub search: Rect,
     pub download_list: Rect,
     pub download_rows: Vec<Rect>,
     pub install_buttons: Vec<Rect>,
+    pub loader_buttons: Vec<Rect>,
     pub settings_list: Rect,
     pub setting_rows: Vec<Rect>,
     pub more_refresh: Rect,
@@ -1315,11 +2766,25 @@ pub fn layout(app: &App, area: Rect) -> Screen {
     ])
     .split(area);
     screen.header = chunks[0];
+    let title_w = 20.min(screen.header.width);
+    let path_w = screen.header.width.saturating_sub(title_w);
+    screen.data_path = Rect::new(
+        screen.header.x.saturating_add(title_w),
+        screen.header.y,
+        path_w,
+        1,
+    );
+    if path_w > 0 {
+        screen.zones.push(Zone {
+            rect: screen.data_path,
+            action: Click::OpenDataDir,
+        });
+    }
     screen.nav = chunks[1];
     screen.body = chunks[2];
     screen.footer = chunks[3];
 
-    let mut x = screen.nav.x.saturating_add(1);
+    let mut x = screen.nav.x.saturating_add(5);
     for page in [Page::Launch, Page::Download, Page::Settings, Page::More] {
         let width = (page.label().len() as u16).saturating_add(2);
         if x.saturating_add(width) > screen.nav.x.saturating_add(screen.nav.width) {
@@ -1339,11 +2804,36 @@ pub fn layout(app: &App, area: Rect) -> Screen {
         Page::Download => layout_download(app, &mut screen),
         Page::Settings => layout_settings(app, &mut screen),
         Page::More => layout_more(&mut screen),
+        Page::Edit => layout_edit(app, &mut screen),
+        Page::Loaders => layout_loaders(app, &mut screen),
     }
 
+    if let Some(editor) = &app.editing
+        && matches!(editor.field, Field::InstanceName | Field::PackPath)
+    {
+        let title = if editor.field == Field::InstanceName {
+            "Instance name"
+        } else {
+            "Modpack path"
+        };
+        let text = editor.buffer.chars().count().max(title.len()).max(24) as u16;
+        let width = text
+            .saturating_add(4)
+            .min(screen.body.width)
+            .max(16.min(screen.body.width));
+        // Border, one padding row, the input, the hint, one padding row, border.
+        let height = 6.min(screen.body.height);
+        screen.modal = Rect::new(
+            screen.body.x + screen.body.width.saturating_sub(width) / 2,
+            screen.body.y + screen.body.height.saturating_sub(height) / 2,
+            width,
+            height,
+        );
+    }
     if app.login.is_some() {
-        let width = screen.body.width.clamp(24, 54);
-        let height = screen.body.height.clamp(8, 12);
+        let width = 42.min(screen.body.width);
+        // Padding row, six text lines, the cancel control, padding row, and the border.
+        let height = 11.min(screen.body.height);
         let rect = Rect::new(
             screen.body.x + screen.body.width.saturating_sub(width) / 2,
             screen.body.y + screen.body.height.saturating_sub(height) / 2,
@@ -1368,7 +2858,6 @@ pub fn layout(app: &App, area: Rect) -> Screen {
 
 fn layout_launch(app: &App, screen: &mut Screen) {
     let body = screen.body;
-    let show_log = !app.log.is_empty() || app.job.as_ref().is_some_and(|job| job.launching);
     if body.width >= 78 {
         let left_width = 32.min(body.width / 3);
         screen.left = Rect::new(body.x, body.y, left_width, body.height);
@@ -1404,64 +2893,185 @@ fn layout_launch(app: &App, screen: &mut Screen) {
     }
 
     let right_inner = inner(screen.right);
-    let button_band = 7.min(right_inner.height.saturating_sub(3));
-    let log_h = if show_log {
-        5.min(
-            right_inner
-                .height
-                .saturating_sub(button_band)
-                .saturating_sub(3),
-        )
-    } else {
-        0
-    };
+    let progress_h = job_band(app);
+    let new_h = if app.creator.is_none() { 1 } else { 0 };
     let list_h = right_inner
         .height
-        .saturating_sub(button_band)
-        .saturating_sub(log_h);
+        .saturating_sub(progress_h)
+        .saturating_sub(new_h);
     screen.version_list = Rect::new(right_inner.x, right_inner.y, right_inner.width, list_h);
-    let band_y = right_inner.y.saturating_add(list_h);
-    let band = Rect::new(right_inner.x, band_y, right_inner.width, button_band);
-    screen.launch_button = centered(band, 24.min(band.width.saturating_sub(2)), 3);
-    if app.game_running {
-        screen.zones.push(Zone {
-            rect: screen.launch_button,
-            action: Click::Stop,
-        });
-    } else {
-        screen.zones.push(Zone {
-            rect: screen.launch_button,
-            action: Click::LaunchButton,
-        });
-    }
-    screen.version_rows = rows(screen.version_list, app.installed.len(), app.version_scroll);
-    for (offset, rect) in screen.version_rows.iter().copied().enumerate() {
-        screen.zones.push(Zone {
-            rect,
-            action: Click::Version(app.version_scroll + offset),
-        });
-    }
-    if log_h > 0 {
-        screen.log = Rect::new(
+    if new_h > 0 {
+        screen.new_instance = Rect::new(
             right_inner.x,
-            band.y.saturating_add(band.height),
+            right_inner.y.saturating_add(list_h),
             right_inner.width,
-            log_h,
-        );
-    }
-    if app.job.is_some() {
-        screen.progress = Rect::new(
-            band.x,
-            band.y.saturating_add(band.height.saturating_sub(1)),
-            band.width,
             1,
         );
+        screen.zones.push(Zone {
+            rect: screen.new_instance,
+            action: Click::NewInstance,
+        });
+    }
+    let list_len = if app.creator.is_some() {
+        app.creator_len()
+    } else {
+        app.instances.len()
+    };
+    screen.version_rows = rows(screen.version_list, list_len, app.version_scroll);
+    screen.row_launch.clear();
+    screen.row_edit.clear();
+    for (offset, rect) in screen.version_rows.iter().copied().enumerate() {
+        if app.creator.is_some() {
+            screen.row_launch.push(Rect::default());
+            screen.row_edit.push(Rect::default());
+            screen.zones.push(Zone {
+                rect,
+                action: Click::Creator(offset),
+            });
+            continue;
+        }
+        let index = app.version_scroll + offset;
+        if let Some((launch, edit)) = instance_action_rects(rect) {
+            let name_w = launch.x.saturating_sub(rect.x);
+            screen.zones.push(Zone {
+                rect: Rect::new(rect.x, rect.y, name_w, 1),
+                action: Click::Version(index),
+            });
+            screen.zones.push(Zone {
+                rect: launch,
+                action: Click::RowLaunch(index),
+            });
+            screen.zones.push(Zone {
+                rect: edit,
+                action: Click::RowEdit(index),
+            });
+            screen.row_launch.push(launch);
+            screen.row_edit.push(edit);
+        } else {
+            screen.zones.push(Zone {
+                rect,
+                action: Click::Version(index),
+            });
+            screen.row_launch.push(Rect::default());
+            screen.row_edit.push(Rect::default());
+        }
+    }
+    if progress_h > 0 {
+        place_cancel(
+            screen,
+            Rect::new(
+                right_inner.x,
+                right_inner.y.saturating_add(list_h).saturating_add(new_h),
+                right_inner.width,
+                progress_h,
+            ),
+        );
+    }
+}
+
+fn job_band(app: &App) -> u16 {
+    if app.jobs.is_empty() {
+        0
+    } else {
+        2 + (app.jobs.len().min(3) as u16)
+    }
+}
+
+/// A button chip exactly as wide as `label`, ending at `right`.
+fn button_chip(row: Rect, right: u16, label: &str) -> Rect {
+    let width = label.chars().count() as u16;
+    if width == 0 || right.saturating_sub(width) < row.x {
+        return Rect::default();
+    }
+    Rect::new(right - width, row.y, width, 1)
+}
+
+fn instance_action_rects(rect: Rect) -> Option<(Rect, Rect)> {
+    let right = rect.x.saturating_add(rect.width);
+    let edit = button_chip(rect, right, "[Edit]");
+    let launch = button_chip(rect, edit.x.saturating_sub(1), "[Launch]");
+    if launch.width == 0 || edit.width == 0 || launch.x < rect.x.saturating_add(8) {
+        return None;
+    }
+    Some((launch, edit))
+}
+
+fn download_action_rects(rect: Rect, action_label: &str) -> Option<(Rect, Rect)> {
+    let right = rect.x.saturating_add(rect.width);
+    let loaders = button_chip(rect, right, "[Loaders]");
+    let action = button_chip(rect, loaders.x.saturating_sub(1), action_label);
+    if action.width == 0 || loaders.width == 0 || action.x < rect.x.saturating_add(8) {
+        return None;
+    }
+    Some((action, loaders))
+}
+
+fn layout_loaders(app: &App, screen: &mut Screen) {
+    let body = screen.body;
+    screen.download_tabs.clear();
+    let mut x = body.x.saturating_add(1);
+    for (index, (kind, name)) in [
+        ("fabric", "Fabric"),
+        ("quilt", "Quilt"),
+        ("forge", "Forge"),
+        ("neoforge", "NeoForge"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let label = app.loader_tab_label(kind, name);
+        let width = (label.chars().count() as u16).saturating_add(2);
+        let rect = Rect::new(x, body.y, width, 1);
+        screen.zones.push(Zone {
+            rect,
+            action: Click::LoaderKind(index),
+        });
+        screen.download_tabs.push(rect);
+        x = x.saturating_add(width).saturating_add(1);
+    }
+    let list = Rect::new(
+        body.x,
+        body.y.saturating_add(1),
+        body.width,
+        body.height.saturating_sub(1),
+    );
+    screen.download_list = inner(list);
+    let visible = app.picker_visible();
+    let count = visible.len();
+    let scroll = app.loader_scroll(screen.download_list.height as usize);
+    screen.download_rows = rows(screen.download_list, count, scroll);
+    screen.install_buttons.clear();
+    for (offset, rect) in screen.download_rows.iter().copied().enumerate() {
+        let index = scroll + offset;
+        let label = visible
+            .get(index)
+            .map(|build| app.loader_action_label(&build.version))
+            .unwrap_or("[Download]");
+        let button = button_chip(rect, rect.x.saturating_add(rect.width), label);
+        if button.width > 0 {
+            let name_w = button.x.saturating_sub(rect.x);
+            screen.zones.push(Zone {
+                rect: Rect::new(rect.x, rect.y, name_w, 1),
+                action: Click::LoaderSelect(index),
+            });
+            screen.install_buttons.push(button);
+            screen.zones.push(Zone {
+                rect: button,
+                action: Click::LoaderAction(index),
+            });
+        } else {
+            screen.install_buttons.push(Rect::default());
+            screen.zones.push(Zone {
+                rect,
+                action: Click::LoaderSelect(index),
+            });
+        }
     }
 }
 
 fn layout_download(app: &App, screen: &mut Screen) {
     let body = screen.body;
-    let progress_h = if app.job.is_some() { 3 } else { 0 };
+    let progress_h = job_band(app);
     screen.download_tabs = Vec::new();
     let mut x = body.x.saturating_add(1);
     for category in [Category::Release, Category::Snapshot, Category::Old] {
@@ -1474,52 +3084,110 @@ fn layout_download(app: &App, screen: &mut Screen) {
         screen.download_tabs.push(rect);
         x = x.saturating_add(width).saturating_add(1);
     }
-    screen.search = Rect::new(
-        body.x.saturating_add(1),
-        body.y.saturating_add(1),
-        body.width.saturating_sub(2),
-        1,
-    );
-    screen.zones.push(Zone {
-        rect: screen.search,
-        action: Click::Search,
-    });
-    let list_y = body.y.saturating_add(3);
-    let list_h = body.height.saturating_sub(3).saturating_sub(progress_h);
+    let search_h = if app.search_open { 1 } else { 0 };
+    if search_h > 0 {
+        screen.search = Rect::new(
+            body.x.saturating_add(1),
+            body.y.saturating_add(1),
+            body.width.saturating_sub(2),
+            1,
+        );
+        screen.zones.push(Zone {
+            rect: screen.search,
+            action: Click::Search,
+        });
+    }
+    // Tabs occupy the first row. Search adds a row only while it is open.
+    let below_tabs = 1 + search_h;
+    let list_y = body.y.saturating_add(below_tabs);
+    let list_h = body
+        .height
+        .saturating_sub(below_tabs)
+        .saturating_sub(progress_h);
     let list = Rect::new(body.x, list_y, body.width, list_h);
     screen.download_list = inner(list);
-    let count = app.filtered().len();
+    let filtered = app.filtered();
+    let count = filtered.len();
     screen.download_rows = rows(screen.download_list, count, app.download_scroll);
     screen.install_buttons = Vec::new();
+    screen.loader_buttons = Vec::new();
     for (offset, rect) in screen.download_rows.iter().copied().enumerate() {
         let index = app.download_scroll + offset;
-        screen.zones.push(Zone {
-            rect,
-            action: Click::DownloadRow(index),
-        });
-        let button_w = 12.min(rect.width / 3);
-        if button_w >= 8 {
-            let button = Rect::new(
-                rect.x.saturating_add(rect.width.saturating_sub(button_w)),
-                rect.y,
-                button_w,
-                1,
-            );
-            screen.install_buttons.push(button);
+        let action_label = filtered
+            .get(index)
+            .map(|entry| app.download_action_label(&entry.id))
+            .unwrap_or("[Install]");
+        if let Some((action, loaders)) = download_action_rects(rect, action_label) {
+            let name_w = action.x.saturating_sub(rect.x);
             screen.zones.push(Zone {
-                rect: button,
+                rect: Rect::new(rect.x, rect.y, name_w, 1),
+                action: Click::DownloadRow(index),
+            });
+            screen.install_buttons.push(action);
+            screen.loader_buttons.push(loaders);
+            screen.zones.push(Zone {
+                rect: action,
                 action: Click::InstallRow(index),
             });
+            screen.zones.push(Zone {
+                rect: loaders,
+                action: Click::LoadersRow(index),
+            });
+        } else {
+            screen.zones.push(Zone {
+                rect,
+                action: Click::DownloadRow(index),
+            });
+            screen.install_buttons.push(Rect::default());
+            screen.loader_buttons.push(Rect::default());
         }
     }
     if progress_h > 0 {
-        screen.progress = Rect::new(
-            body.x.saturating_add(1),
-            body.y
-                .saturating_add(body.height.saturating_sub(progress_h)),
-            body.width.saturating_sub(2),
-            progress_h,
+        place_cancel(
+            screen,
+            Rect::new(
+                body.x.saturating_add(1),
+                body.y
+                    .saturating_add(body.height.saturating_sub(progress_h)),
+                body.width.saturating_sub(2),
+                progress_h,
+            ),
         );
+    }
+}
+
+fn place_cancel(screen: &mut Screen, area: Rect) {
+    let cancel_w = 10.min(area.width / 4);
+    if cancel_w >= 8 && area.width > cancel_w + 4 {
+        screen.cancel = Rect::new(
+            area.x.saturating_add(area.width.saturating_sub(cancel_w)),
+            area.y,
+            cancel_w,
+            1,
+        );
+        screen.progress = Rect::new(
+            area.x,
+            area.y,
+            area.width.saturating_sub(cancel_w).saturating_sub(1),
+            area.height,
+        );
+        screen.zones.push(Zone {
+            rect: screen.cancel,
+            action: Click::CancelJob,
+        });
+    } else {
+        screen.progress = area;
+    }
+}
+
+fn layout_edit(_app: &App, screen: &mut Screen) {
+    screen.settings_list = inner(screen.body);
+    screen.setting_rows = rows(screen.settings_list, 9, 0);
+    for (index, rect) in screen.setting_rows.iter().copied().enumerate() {
+        screen.zones.push(Zone {
+            rect,
+            action: Click::Setting(index),
+        });
     }
 }
 
@@ -1584,15 +3252,49 @@ fn rows(area: Rect, len: usize, scroll: usize) -> Vec<Rect> {
     out
 }
 
-fn centered(area: Rect, width: u16, height: u16) -> Rect {
-    let width = width.min(area.width);
-    let height = height.min(area.height);
-    Rect::new(
-        area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    )
+/// Status text after the game process ends.
+pub fn exit_notice(code: i32, log_path: &str, crash_report: &str) -> (String, bool) {
+    if code == 0 && crash_report.is_empty() {
+        return ("Game exited".into(), false);
+    }
+    let mut text = if code == 0 {
+        "Game crashed.".to_string()
+    } else {
+        format!("Game crashed (status {code}).")
+    };
+    if !log_path.is_empty() {
+        text.push_str(" Log: ");
+        text.push_str(log_path);
+    }
+    if !crash_report.is_empty() {
+        text.push_str(" Crash report: ");
+        text.push_str(crash_report);
+    }
+    (text, true)
+}
+
+/// Newest crash report written at or after `since`.
+pub fn newest_crash_report(game_dir: &Path, since: std::time::SystemTime) -> Option<PathBuf> {
+    let reports = game_dir.join("crash-reports");
+    let entries = std::fs::read_dir(reports).ok()?;
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) else {
+            continue;
+        };
+        if modified < since {
+            continue;
+        }
+        let replace = best.as_ref().is_none_or(|(time, _)| modified >= *time);
+        if replace {
+            best = Some((modified, path));
+        }
+    }
+    best.map(|(_, path)| path)
 }
 
 #[cfg(test)]
@@ -1620,11 +3322,265 @@ mod tests {
     }
 
     #[test]
+    fn q_and_e_move_pages_while_text_fields_keep_the_letters() {
+        let mut app = App::preview();
+        app.catalog_saved_at = weathered_core::cache::unix_now();
+        app.on_key(Key::Char('e'));
+        assert_eq!(app.page, Page::Download);
+        app.on_key(Key::Char('s'));
+        assert_eq!(app.page, Page::Download);
+        assert_eq!(app.download_selected, 1);
+        app.on_key(Key::Char('w'));
+        assert_eq!(app.download_selected, 0);
+        app.on_key(Key::Char('d'));
+        assert_eq!(app.page, Page::Download);
+        assert_eq!(app.focus, Focus::DownloadLoaders);
+        app.on_key(Key::Char('a'));
+        assert_eq!(app.focus, Focus::DownloadAction);
+        app.on_key(Key::Char('e'));
+        assert_eq!(app.page, Page::Settings);
+        app.on_key(Key::Char('a'));
+        assert_eq!(app.page, Page::Download);
+        assert_eq!(app.category, Category::Release);
+        app.on_key(Key::Char('q'));
+        assert_eq!(app.page, Page::Launch);
+        assert_eq!(app.focus, Focus::RowLaunch);
+        app.on_key(Key::Char('d'));
+        assert_eq!(app.focus, Focus::RowEdit);
+        app.on_key(Key::Char('d'));
+        assert_eq!(app.focus, Focus::RowEdit);
+        app.on_key(Key::Char('a'));
+        assert_eq!(app.focus, Focus::RowLaunch);
+        app.begin_edit(Field::Rename, String::new());
+        app.on_key(Key::Char('q'));
+        app.on_key(Key::Char('e'));
+        app.on_key(Key::Char('a'));
+        app.on_key(Key::Char('d'));
+        app.on_key(Key::Char('w'));
+        app.on_key(Key::Char('s'));
+        let editor = app.editing.clone().unwrap();
+        assert_eq!(editor.buffer, "qeadws");
+        assert_eq!(app.page, Page::Launch);
+    }
+
+    #[test]
+    fn startup_focuses_the_default_launch_button() {
+        let mut app = App::preview();
+        app.apply_startup_focus();
+        assert!(app.selected_is_default());
+        assert_eq!(app.focus, Focus::RowLaunch);
+        assert_eq!(app.on_key(Key::Enter), Effect::Launch);
+    }
+
+    #[test]
+    fn sideways_keys_move_across_the_row_buttons() {
+        let mut app = App::preview();
+        app.version_selected = 1;
+        app.focus = Focus::RowLaunch;
+        app.on_key(Key::Right);
+        assert_eq!(app.focus, Focus::RowEdit);
+        app.on_key(Key::Right);
+        assert_eq!(app.focus, Focus::RowEdit);
+        assert!(!app.selected_is_default());
+        app.on_key(Key::Left);
+        assert_eq!(app.focus, Focus::RowLaunch);
+        app.on_key(Key::Up);
+        assert_eq!(app.version_selected, 0);
+        assert_eq!(app.focus, Focus::RowLaunch);
+        app.on_key(Key::Right);
+        assert_eq!(app.focus, Focus::RowEdit);
+        app.on_key(Key::Left);
+        assert_eq!(app.focus, Focus::RowLaunch);
+    }
+
+    #[test]
+    fn enter_on_the_data_path_opens_the_directory() {
+        let mut app = App::preview();
+        app.focus = Focus::DataDir;
+        assert_eq!(app.on_key(Key::Enter), Effect::OpenDataDir);
+        app.screen = layout(&app, Rect::new(0, 0, 100, 36));
+        let path = app.screen.data_path;
+        assert!(path.width > 0);
+        assert_eq!(
+            app.on_mouse(Mouse::Click {
+                x: path.x + path.width - 1,
+                y: path.y,
+            }),
+            Effect::OpenDataDir
+        );
+    }
+
+    #[test]
+    fn description_edit_shows_each_key_and_escape_cancels_it() {
+        let mut app = App::preview();
+        app.draft = Some(InstanceDraft {
+            id: "vanilla".into(),
+            name: "Vanilla".into(),
+            description: "dda".into(),
+            java: String::new(),
+            memory_min: String::new(),
+            memory_max: String::new(),
+            jvm_args: String::new(),
+        });
+        app.page = Page::Edit;
+        app.setting_selected = 1;
+        app.begin_edit(Field::Description, "dda".into());
+        app.on_key(Key::Char('x'));
+        app.on_key(Key::Left);
+        app.on_key(Key::Backspace);
+        let editor = app.editing.clone().unwrap();
+        assert_eq!(editor.buffer, "ddx");
+        assert_eq!(editor.cursor, 2);
+        assert_eq!(app.on_key(Key::Esc), Effect::None);
+        assert!(app.editing.is_none());
+        assert_eq!(app.page, Page::Edit);
+        assert_eq!(app.draft.unwrap().description, "dda");
+    }
+
+    #[test]
+    fn a_crash_names_the_saved_log() {
+        let (text, error) = exit_notice(1, "/data/logs/launch-1.log", "");
+        assert!(error);
+        assert!(text.contains("crashed"));
+        assert!(text.contains("/data/logs/launch-1.log"));
+        let (clean, error) = exit_notice(0, "/data/logs/launch-1.log", "");
+        assert!(!error);
+        assert_eq!(clean, "Game exited");
+        let root = std::env::temp_dir().join(format!(
+            "weathered-crash-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let reports = root.join("crash-reports");
+        std::fs::create_dir_all(&reports).unwrap();
+        let old = reports.join("old.txt");
+        let old_file = std::fs::File::create(&old).unwrap();
+        old_file
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(120))
+            .unwrap();
+        drop(old_file);
+        let since = std::time::SystemTime::now() - std::time::Duration::from_secs(30);
+        let fresh = reports.join("crash.txt");
+        std::fs::write(&fresh, b"boom").unwrap();
+        let found = newest_crash_report(&root, since).unwrap();
+        assert_eq!(found, fresh);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ctrl_f_opens_search_and_the_first_escape_clears_it() {
+        let mut app = App::preview();
+        app.page = Page::Download;
+        app.start_job("1.21.1".into(), false, false);
+        assert!(!app.search_open);
+        app.on_key(Key::CtrlF);
+        assert!(app.search_open);
+        app.on_key(Key::Char('1'));
+        assert_eq!(app.on_key(Key::Esc), Effect::None);
+        assert!(!app.search_open);
+        assert!(app.query.is_empty());
+        assert!(!app.jobs.is_empty());
+        assert!(matches!(app.on_key(Key::Esc), Effect::CancelJob { .. }));
+    }
+
+    #[test]
+    fn edit_page_default_and_open_folder_are_direct_actions() {
+        let mut app = App::preview();
+        app.draft = Some(InstanceDraft {
+            id: "vanilla".into(),
+            name: "Vanilla".into(),
+            description: String::new(),
+            java: String::new(),
+            memory_min: String::new(),
+            memory_max: String::new(),
+            jvm_args: String::new(),
+        });
+        app.page = Page::Edit;
+        app.setting_selected = 2;
+        assert_eq!(app.on_key(Key::Enter), Effect::SetDefault);
+        assert_eq!(app.page, Page::Edit);
+        app.setting_selected = 7;
+        assert_eq!(app.on_key(Key::Enter), Effect::OpenFolder);
+        assert_eq!(app.page, Page::Edit);
+    }
+
+    #[test]
+    fn edit_page_delete_has_no_confirmation() {
+        let mut app = App::preview();
+        app.draft = Some(InstanceDraft {
+            id: "vanilla".into(),
+            name: "Vanilla".into(),
+            description: String::new(),
+            java: String::new(),
+            memory_min: String::new(),
+            memory_max: String::new(),
+            jvm_args: String::new(),
+        });
+        app.page = Page::Edit;
+        app.setting_selected = 8;
+        assert_eq!(app.on_key(Key::Enter), Effect::DeleteInstance);
+        assert_eq!(app.page, Page::Launch);
+    }
+
+    #[test]
+    fn download_sort_cycles_date_name_and_stored() {
+        let mut app = App::preview();
+        app.page = Page::Download;
+        app.category = Category::Release;
+        let ids: Vec<_> = app
+            .filtered()
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["1.21.1", "1.20.4"]);
+        assert_eq!(app.on_key(Key::Char('o')), Effect::Save);
+        assert_eq!(app.download_sort, DownloadSort::Oldest);
+        let ids: Vec<_> = app
+            .filtered()
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["1.20.4", "1.21.1"]);
+        app.catalog_items[0].game_version = "1.20.4".into();
+        app.download_sort = DownloadSort::Stored;
+        let ids: Vec<_> = app
+            .filtered()
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect();
+        assert_eq!(ids[0], "1.20.4");
+        app.download_sort = DownloadSort::Newest;
+        let ids: Vec<_> = app
+            .filtered()
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect();
+        assert_eq!(ids[0], "1.21.1");
+        assert_eq!(version_cmp("1.20.4", "1.21.1"), std::cmp::Ordering::Less);
+        assert_eq!(version_cmp("26.3", "26.10"), std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn sort_key_cycles_and_asks_to_save() {
+        let mut app = App::preview();
+        assert_eq!(app.on_key(Key::Char('o')), Effect::Save);
+        assert_eq!(app.sort_mode, SortMode::Created);
+        assert_eq!(app.on_key(Key::Char('o')), Effect::Save);
+        assert_eq!(app.sort_mode, SortMode::Played);
+    }
+
+    #[test]
     fn number_keys_switch_pages_and_q_quits() {
         let mut app = App::preview();
+        app.catalog_saved_at = weathered_core::cache::unix_now();
         assert_eq!(app.on_key(Key::Char('2')), Effect::None);
         assert_eq!(app.page, Page::Download);
-        assert_eq!(app.on_key(Key::Char('q')), Effect::Quit);
+        assert_eq!(app.on_key(Key::Char('q')), Effect::None);
+        assert_eq!(app.page, Page::Launch);
+        assert_eq!(app.on_key(Key::CtrlC), Effect::Quit);
         assert!(app.quit);
     }
 
@@ -1648,7 +3604,9 @@ mod tests {
     fn progress_updates_without_leaving_the_page() {
         let mut app = App::preview();
         app.page = Page::Download;
+        let id = app.start_job("1.20.4".into(), false, false);
         app.on_msg(Msg::Progress {
+            id,
             version: "1.20.4".into(),
             stage: "assets".into(),
             completed: 50,
@@ -1657,7 +3615,7 @@ mod tests {
             launching: false,
         });
         assert_eq!(app.page, Page::Download);
-        assert_eq!(app.job.as_ref().map(Job::percent), Some(25));
+        assert_eq!(app.jobs.first().map(Job::percent), Some(25));
     }
 
     #[test]
@@ -1675,7 +3633,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "weathered-scan-{}-{}",
             std::process::id(),
-            Instant::now().elapsed().as_nanos()
+            std::time::Instant::now().elapsed().as_nanos()
         ));
         let version = root.join("versions").join("1.2.3");
         std::fs::create_dir_all(&version).unwrap();
@@ -1708,15 +3666,23 @@ mod tests {
         assert_eq!(app.page, Page::Download);
 
         app.page = Page::Launch;
+        app.focus = Focus::RowLaunch;
         app.screen = layout(&app, Rect::new(0, 0, 100, 36));
-        assert!(app.screen.launch_button.height >= 3);
-        assert!(app.screen.launch_button.width >= 20);
+        let name = app.screen.version_rows[0];
+        let launch = app.screen.row_launch[0];
+        let name_effect = app.on_mouse(Mouse::Click {
+            x: name.x + 1,
+            y: name.y,
+        });
+        assert_eq!(name_effect, Effect::None);
+        assert_eq!(app.focus, Focus::RowLaunch);
+        assert!(app.jobs.is_empty());
         let effect = app.on_mouse(Mouse::Click {
-            x: app.screen.launch_button.x + 1,
-            y: app.screen.launch_button.y + 1,
+            x: launch.x + 1,
+            y: launch.y,
         });
         assert_eq!(effect, Effect::Launch);
-        assert!(app.job.is_some());
+        assert!(app.jobs.iter().any(|job| job.launching));
     }
 
     #[test]
@@ -1730,11 +3696,422 @@ mod tests {
             x: button.x + 1,
             y: button.y,
         });
-        assert_eq!(
+        assert!(matches!(
             effect,
             Effect::Install {
-                version: "1.20.4".into()
+                version,
+                loader,
+                loader_version: None,
+                create_instance: false,
+                ..
+            } if version == "1.20.4" && loader == "vanilla"
+        ));
+    }
+
+    #[test]
+    fn escape_cancels_a_running_download_and_unlocks_the_ui() {
+        let mut app = App::preview();
+        app.page = Page::Download;
+        app.catalog_items.clear();
+        app.start_job("26.3".into(), false, false);
+        assert_eq!(app.on_key(Key::CtrlC), Effect::Quit);
+        app.quit = false;
+        assert!(!app.jobs.is_empty());
+        assert!(matches!(app.on_key(Key::Esc), Effect::CancelJob { .. }));
+        assert!(app.jobs.is_empty());
+        app.screen = layout(&app, Rect::new(0, 0, 100, 36));
+        let button = app.screen.install_buttons[0];
+        let effect = app.on_mouse(Mouse::Click {
+            x: button.x + 1,
+            y: button.y,
+        });
+        assert!(matches!(effect, Effect::Install { .. }));
+        assert_eq!(app.jobs.len(), 1);
+        let again = app.on_mouse(Mouse::Click {
+            x: app.screen.install_buttons[1].x + 1,
+            y: app.screen.install_buttons[1].y,
+        });
+        assert!(matches!(again, Effect::Install { .. }));
+        assert_eq!(app.jobs.len(), 2);
+        app.screen = layout(&app, Rect::new(0, 0, 100, 36));
+        assert!(app.screen.cancel.width >= 8);
+        let effect = app.on_mouse(Mouse::Click {
+            x: app.screen.cancel.x + 1,
+            y: app.screen.cancel.y,
+        });
+        assert!(matches!(effect, Effect::CancelJob { .. }));
+        assert_eq!(app.jobs.len(), 1);
+    }
+
+    #[test]
+    fn uppercase_shortcuts_match_lowercase_outside_text_fields() {
+        let mut app = App::preview();
+        app.on_key(Key::Char('S'));
+        assert_eq!(app.version_selected, 1);
+        app.on_key(Key::Char('W'));
+        assert_eq!(app.version_selected, 0);
+        app.begin_edit(Field::Rename, String::new());
+        app.on_key(Key::Char('W'));
+        assert_eq!(app.editing.unwrap().buffer, "W");
+        assert_eq!(app.version_selected, 0);
+    }
+
+    #[test]
+    fn new_instance_download_opens_the_download_page() {
+        let mut app = App::preview();
+        app.catalog_saved_at = weathered_core::cache::unix_now();
+        app.screen = layout(&app, Rect::new(0, 0, 100, 36));
+        let button = app.screen.new_instance;
+        app.on_mouse(Mouse::Click {
+            x: button.x + 1,
+            y: button.y,
+        });
+        assert_eq!(app.creator, Some(CreatorStep::Source));
+        assert_eq!(app.on_key(Key::Enter), Effect::None);
+        assert_eq!(app.creator, None);
+        assert_eq!(app.page, Page::Download);
+        assert_eq!(app.focus, Focus::DownloadAction);
+    }
+
+    #[test]
+    fn a_stored_version_asks_for_an_instance_name() {
+        let mut app = App::preview();
+        app.catalog_saved_at = weathered_core::cache::unix_now();
+        app.page = Page::Download;
+        app.focus = Focus::DownloadAction;
+        app.screen = layout(&app, Rect::new(0, 0, 100, 36));
+        let name = app.screen.download_rows[0];
+        assert_eq!(
+            app.on_mouse(Mouse::Click {
+                x: name.x + 1,
+                y: name.y,
+            }),
+            Effect::None
+        );
+        assert!(app.jobs.is_empty());
+        assert_eq!(app.focus, Focus::DownloadAction);
+        let button = app.screen.install_buttons[0];
+        assert_eq!(
+            app.on_mouse(Mouse::Click {
+                x: button.x + 1,
+                y: button.y,
+            }),
+            Effect::None
+        );
+        let editor = app.editing.clone().unwrap();
+        assert_eq!(editor.field, Field::InstanceName);
+        assert_eq!(editor.buffer, "1.21.1");
+        assert_eq!(
+            app.on_key(Key::Enter),
+            Effect::CreateNamed {
+                catalog_id: "vanilla-1.21.1".into(),
+                name: "1.21.1".into(),
             }
         );
+    }
+
+    #[test]
+    fn loaders_page_downloads_or_creates_from_the_selected_build() {
+        let mut app = App::preview();
+        app.page = Page::Loaders;
+        app.focus = Focus::LoaderButton;
+        app.picker = Some(LoaderPicker {
+            game_version: "1.21.1".into(),
+            loader: "fabric".into(),
+            builds: vec![
+                LoaderBuildRow {
+                    version: "0.16.9".into(),
+                    stable: true,
+                    recommended: true,
+                },
+                LoaderBuildRow {
+                    version: "0.17.0-beta".into(),
+                    stable: false,
+                    recommended: false,
+                },
+            ],
+            show_unstable: false,
+            selected: 0,
+            loading: false,
+            error: String::new(),
+            unsupported: false,
+            create_instance: false,
+        });
+        assert_eq!(app.picker_visible().len(), 1);
+        app.on_key(Key::Char('b'));
+        assert_eq!(app.picker_visible().len(), 2);
+        app.on_key(Key::Char('b'));
+        let effect = app.on_key(Key::Enter);
+        assert!(matches!(
+            effect,
+            Effect::Install {
+                loader,
+                loader_version: Some(version),
+                create_instance: false,
+                ..
+            } if loader == "fabric" && version == "0.16.9"
+        ));
+        app.jobs.clear();
+        app.catalog_items.push(CatalogRow {
+            id: "fabric-1.21.1-0.16.9".into(),
+            name: "Fabric 1.21.1".into(),
+            kind: "fabric".into(),
+            game_version: "1.21.1".into(),
+            launchable: true,
+            loader_version: "0.16.9".into(),
+        });
+        assert_eq!(app.on_key(Key::Enter), Effect::None);
+        assert_eq!(app.editing.as_ref().unwrap().buffer, "1.21.1-fabric");
+        app.on_key(Key::Esc);
+        assert!(app.editing.is_none());
+        assert_eq!(app.on_key(Key::Esc), Effect::None);
+        assert_eq!(app.page, Page::Download);
+        assert_eq!(app.focus, Focus::DownloadAction);
+    }
+
+    #[test]
+    fn a_fresh_manifest_cache_opens_without_another_fetch() {
+        let root = std::env::temp_dir().join(format!(
+            "weathered-manifest-{}-{}",
+            std::process::id(),
+            weathered_core::cache::unix_now()
+        ));
+        let path = weathered_core::paths::DataLayout::new(&root)
+            .cache_dir()
+            .join("version_manifest_v2.json");
+        weathered_core::cache::write(
+            &path,
+            br#"{"latest":{"release":"1.21.1","snapshot":"24w14a"},"versions":[{"id":"1.21.1","type":"release","url":"https://example.invalid/v.json","time":"2024-08-08T12:00:00+00:00","releaseTime":"2024-08-08T12:00:00+00:00","sha1":"abc","complianceLevel":1}]}"#,
+        )
+        .unwrap();
+        let mut app = App::empty(root.clone());
+        app.load_cached_catalog();
+        assert!(app.catalog_ready);
+        assert_eq!(app.catalog[0].id, "1.21.1");
+        assert_eq!(app.on_key(Key::Char('e')), Effect::None);
+        assert_eq!(app.page, Page::Download);
+        app.catalog_saved_at = 1;
+        assert_eq!(
+            app.on_key(Key::Char('r')),
+            Effect::RefreshCache { force: true }
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn row_buttons_are_only_as_wide_as_their_labels() {
+        let mut app = App::preview();
+        app.page = Page::Download;
+        app.screen = layout(&app, Rect::new(0, 0, 100, 36));
+        let row = app.screen.download_rows[0];
+        let action = app.screen.install_buttons[0];
+        let loaders = app.screen.loader_buttons[0];
+        assert_eq!(action.width as usize, "[Create instance]".len());
+        assert_eq!(loaders.width as usize, "[Loaders]".len());
+        assert_eq!(loaders.x + loaders.width, row.x + row.width);
+        assert_eq!(action.x + action.width + 1, loaders.x);
+        assert_eq!(
+            app.screen.install_buttons[1].width as usize,
+            "[Install]".len()
+        );
+        assert_eq!(
+            app.on_mouse(Mouse::Click {
+                x: action.x + action.width,
+                y: action.y,
+            }),
+            Effect::None
+        );
+        app.page = Page::Launch;
+        app.screen = layout(&app, Rect::new(0, 0, 100, 36));
+        let launch = app.screen.row_launch[0];
+        let edit = app.screen.row_edit[0];
+        assert_eq!(launch.width as usize, "[Launch]".len());
+        assert_eq!(edit.width as usize, "[Edit]".len());
+        assert_eq!(launch.x + launch.width + 1, edit.x);
+    }
+
+    #[test]
+    fn loader_tabs_wait_for_the_inflight_request_and_do_not_retry() {
+        let mut app = App::preview();
+        app.catalog_saved_at = weathered_core::cache::unix_now();
+        app.page = Page::Download;
+        app.screen = layout(&app, Rect::new(0, 0, 100, 36));
+        let button = app.screen.loader_buttons[0];
+        let effect = app.on_mouse(Mouse::Click {
+            x: button.x + 1,
+            y: button.y,
+        });
+        match effect {
+            Effect::LoadLoaders {
+                version,
+                loaders,
+                force,
+            } => {
+                assert_eq!(version, "1.21.1");
+                assert!(!force);
+                assert_eq!(
+                    loaders,
+                    ["fabric", "quilt", "forge", "neoforge"]
+                        .map(str::to_string)
+                        .to_vec()
+                );
+            }
+            other => panic!("expected one fetch for each loader, got {other:?}"),
+        }
+        assert_eq!(app.loader_inflight.len(), 4);
+        for _ in 0..6 {
+            assert_eq!(app.on_key(Key::Char('d')), Effect::None);
+            assert_eq!(app.on_key(Key::Char('a')), Effect::None);
+        }
+        assert_eq!(app.loader_inflight.len(), 4);
+        assert_eq!(app.picker.as_ref().unwrap().loader, "fabric");
+
+        app.on_msg(Msg::LoaderBuilds {
+            game: "1.21.1".into(),
+            loader: "quilt".into(),
+            builds: vec![LoaderBuildRow {
+                version: "0.27.0".into(),
+                stable: true,
+                recommended: true,
+            }],
+            saved_at: weathered_core::cache::unix_now(),
+            error: String::new(),
+            unsupported: false,
+        });
+        assert_eq!(app.picker.as_ref().unwrap().loader, "fabric");
+        assert!(app.picker.as_ref().unwrap().builds.is_empty());
+        assert_eq!(app.on_key(Key::Char('d')), Effect::None);
+        let picker = app.picker.as_ref().unwrap();
+        assert_eq!(picker.loader, "quilt");
+        assert_eq!(picker.builds[0].version, "0.27.0");
+        assert!(!picker.loading);
+        assert!(!app.loader_inflight.contains("quilt\n1.21.1"));
+
+        app.on_msg(Msg::LoaderBuilds {
+            game: "9.9.9".into(),
+            loader: "quilt".into(),
+            builds: vec![LoaderBuildRow {
+                version: "stale".into(),
+                stable: true,
+                recommended: false,
+            }],
+            saved_at: weathered_core::cache::unix_now(),
+            error: String::new(),
+            unsupported: false,
+        });
+        assert_eq!(app.picker.as_ref().unwrap().builds[0].version, "0.27.0");
+        assert_eq!(
+            app.loader_cache.get("quilt\n9.9.9").unwrap().builds[0].version,
+            "stale"
+        );
+
+        app.on_msg(Msg::LoaderBuilds {
+            game: "1.21.1".into(),
+            loader: "forge".into(),
+            builds: Vec::new(),
+            saved_at: 0,
+            error: "forge down".into(),
+            unsupported: false,
+        });
+        assert_eq!(app.on_key(Key::Char('d')), Effect::None);
+        let picker = app.picker.as_ref().unwrap();
+        assert_eq!(picker.loader, "forge");
+        assert_eq!(picker.error, "forge down");
+        assert!(!picker.loading);
+        assert!(!app.loader_inflight.contains("forge\n1.21.1"));
+        assert_eq!(app.on_key(Key::Char('a')), Effect::None);
+        assert_eq!(app.on_key(Key::Char('d')), Effect::None);
+        assert!(!app.loader_inflight.contains("forge\n1.21.1"));
+        assert_eq!(
+            app.on_key(Key::Char('r')),
+            Effect::RefreshCache { force: true }
+        );
+        app.on_msg(Msg::LoaderBuilds {
+            game: "1.21.1".into(),
+            loader: "neoforge".into(),
+            builds: Vec::new(),
+            saved_at: 0,
+            error: "NeoForge does not support Minecraft 1.21.1".into(),
+            unsupported: true,
+        });
+        assert_eq!(app.on_key(Key::Char('d')), Effect::None);
+        let picker = app.picker.as_ref().unwrap();
+        assert!(picker.unsupported);
+        assert!(picker.error.is_empty());
+        assert_eq!(app.loader_tab_state("neoforge"), "unsupported");
+        assert_eq!(app.loader_tab_label("neoforge", "NeoForge"), "NeoForge");
+        assert_eq!(app.loader_tab_label("fabric", "Fabric"), "Fabric...");
+    }
+
+    #[test]
+    fn a_launch_job_shows_stage_progress() {
+        let mut app = App::preview();
+        let id = app.start_job("26.3".into(), true, false);
+        assert_eq!(app.jobs[0].detail, "Resolving files");
+        assert_eq!(app.jobs[0].percent(), 0);
+        app.on_msg(Msg::Progress {
+            id,
+            version: "26.3".into(),
+            stage: "assets".into(),
+            completed: 400,
+            total: 2000,
+            detail: "Linking assets".into(),
+            launching: true,
+        });
+        assert_eq!(app.jobs[0].stage, "assets");
+        assert_eq!(app.jobs[0].detail, "Linking assets");
+        assert_eq!(app.jobs[0].percent(), 20);
+        assert_eq!(app.overall_progress(), (400, 2000));
+    }
+
+    #[test]
+    fn instance_name_dialog_fits_and_an_outside_click_cancels() {
+        let mut app = App::preview();
+        app.catalog_saved_at = weathered_core::cache::unix_now();
+        app.page = Page::Download;
+        app.focus = Focus::DownloadAction;
+        app.screen = layout(&app, Rect::new(0, 0, 100, 36));
+        let button = app.screen.install_buttons[0];
+        assert_eq!(
+            app.on_mouse(Mouse::Click {
+                x: button.x + 1,
+                y: button.y,
+            }),
+            Effect::None
+        );
+        app.screen = layout(&app, Rect::new(0, 0, 100, 36));
+        assert_eq!(app.screen.modal.height, 6);
+        assert_eq!(
+            app.on_mouse(Mouse::Click {
+                x: app.screen.modal.x + 2,
+                y: app.screen.modal.y + 1,
+            }),
+            Effect::None
+        );
+        assert!(app.editing.is_some());
+        assert_eq!(app.on_mouse(Mouse::Click { x: 1, y: 1 }), Effect::None);
+        assert!(app.editing.is_none());
+        assert!(app.pending_catalog.is_none());
+
+        app.login = Some(LoginPrompt {
+            url: "https://example.invalid".into(),
+            code: "ABCD".into(),
+            message: "waiting".into(),
+        });
+        app.screen = layout(&app, Rect::new(0, 0, 100, 36));
+        assert_eq!(app.screen.modal.height, 11);
+        assert_eq!(
+            app.on_mouse(Mouse::Click {
+                x: app.screen.modal.x + 2,
+                y: app.screen.modal.y + 1,
+            }),
+            Effect::None
+        );
+        assert!(app.login.is_some());
+        assert_eq!(
+            app.on_mouse(Mouse::Click { x: 1, y: 1 }),
+            Effect::CancelLogin
+        );
+        assert!(app.login.is_none());
     }
 }

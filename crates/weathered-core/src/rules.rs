@@ -93,10 +93,10 @@ pub fn rules_allow(rules: &[Rule], os: &OsInfo, features: &FeatureSet) -> bool {
 }
 
 fn rule_matches(rule: &Rule, os: &OsInfo, features: &FeatureSet) -> bool {
-    if let Some(constraint) = &rule.os {
-        if !os_matches(constraint, os) {
-            return false;
-        }
+    if let Some(constraint) = &rule.os
+        && !os_matches(constraint, os)
+    {
+        return false;
     }
     if let Some(required) = &rule.features {
         for (name, expected) in required {
@@ -109,15 +109,15 @@ fn rule_matches(rule: &Rule, os: &OsInfo, features: &FeatureSet) -> bool {
 }
 
 fn os_matches(constraint: &OsConstraint, os: &OsInfo) -> bool {
-    if let Some(name) = &constraint.name {
-        if !name.eq_ignore_ascii_case(os.name.mojang()) {
-            return false;
-        }
+    if let Some(name) = &constraint.name
+        && !name.eq_ignore_ascii_case(os.name.mojang())
+    {
+        return false;
     }
-    if let Some(arch) = &constraint.arch {
-        if !os.arch.matches_mojang(arch) {
-            return false;
-        }
+    if let Some(arch) = &constraint.arch
+        && !os.arch.matches_mojang(arch)
+    {
+        return false;
     }
     if let Some(pattern) = &constraint.version {
         let Ok(expression) = regex::Regex::new(pattern) else {

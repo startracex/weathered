@@ -1,12 +1,12 @@
 //! Paint the terminal UI.
 
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
-use ratatui::Frame;
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 
-use super::model::{contains, layout, App, Category, Field, Page, SettingKind};
+use super::model::{App, Category, Field, Focus, Page, SettingKind, contains, layout, percent};
 use super::theme::{self, ACCENT, BG, BORDER, LAUNCH, ON_ACCENT, TEXT};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -17,7 +17,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     frame.render_widget(Block::default().style(theme::base()), area);
     if area.width < 40 || area.height < 12 {
-        let message = Paragraph::new("Resize the terminal to at least 40×12.  q quits.")
+        let message = Paragraph::new("Resize the terminal to at least 40×12.  Ctrl+C quits.")
             .style(theme::base())
             .alignment(ratatui::layout::Alignment::Center);
         frame.render_widget(message, area);
@@ -31,36 +31,85 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Page::Download => draw_download(frame, app),
         Page::Settings => draw_settings(frame, app),
         Page::More => draw_more(frame, app),
+        Page::Edit => draw_edit(frame, app),
+        Page::Loaders => draw_loaders(frame, app),
     }
     draw_footer(frame, app);
+    if app.screen.cancel.width > 0 {
+        let style = if hot(app, app.screen.cancel) {
+            theme::selected()
+        } else {
+            Style::default().fg(ON_ACCENT).bg(ACCENT)
+        };
+        frame.render_widget(
+            Paragraph::new(center("Cancel", app.screen.cancel.width as usize)).style(style),
+            app.screen.cancel,
+        );
+    }
+    if app
+        .editing
+        .as_ref()
+        .is_some_and(|editor| matches!(editor.field, Field::InstanceName | Field::PackPath))
+    {
+        draw_prompt(frame, app);
+    }
     if app.login.is_some() {
         draw_login(frame, app);
     }
 }
 
 fn draw_header(frame: &mut Frame, app: &App) {
-    let width = app.screen.header.width as usize;
-    let path = app.screen.header.width.saturating_sub(28) as usize;
-    let dir = shorten(&app.game_dir.display().to_string(), path);
-    let left = " weathered  launcher";
-    let gap = width.saturating_sub(left.chars().count() + dir.chars().count());
-    let line = Line::from(vec![
-        Span::styled(
-            " weathered",
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            " Weathered Launcher",
             Style::default()
                 .fg(ACCENT)
                 .bg(BG)
                 .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  launcher", theme::muted()),
-        Span::styled(" ".repeat(gap), theme::base()),
-        Span::styled(dir, theme::muted()),
-    ]);
-    frame.render_widget(Paragraph::new(line).style(theme::base()), app.screen.header);
+        ))
+        .style(theme::base()),
+        app.screen.header,
+    );
+    if app.screen.data_path.width == 0 {
+        return;
+    }
+    let dir = shorten(
+        &app.game_dir.display().to_string(),
+        app.screen.data_path.width as usize,
+    );
+    let path_style = if app.focus == Focus::DataDir {
+        theme::muted().add_modifier(Modifier::UNDERLINED)
+    } else {
+        theme::muted()
+    };
+    frame.render_widget(
+        Paragraph::new(dir)
+            .alignment(ratatui::layout::Alignment::Right)
+            .style(path_style),
+        app.screen.data_path,
+    );
 }
 
 fn draw_nav(frame: &mut Frame, app: &App) {
     frame.render_widget(Block::default().style(theme::base()), app.screen.nav);
+    frame.render_widget(
+        Paragraph::new("[Q]").style(theme::muted()),
+        Rect::new(app.screen.nav.x, app.screen.nav.y, 3, 1),
+    );
+    if app.screen.nav.width > 4 {
+        frame.render_widget(
+            Paragraph::new("[E]").style(theme::muted()),
+            Rect::new(
+                app.screen
+                    .nav
+                    .x
+                    .saturating_add(app.screen.nav.width.saturating_sub(4)),
+                app.screen.nav.y,
+                3,
+                1,
+            ),
+        );
+    }
     for (index, page) in [Page::Launch, Page::Download, Page::Settings, Page::More]
         .into_iter()
         .enumerate()
@@ -68,7 +117,9 @@ fn draw_nav(frame: &mut Frame, app: &App) {
         let Some(rect) = app.screen.tabs.get(index).copied() else {
             continue;
         };
-        let active = app.page == page;
+        let active = app.page == page
+            || (app.page == Page::Edit && page == Page::Launch)
+            || (app.page == Page::Loaders && page == Page::Download);
         let hovered = hot(app, rect) && !active;
         let style = if active {
             theme::selected()
@@ -82,22 +133,61 @@ fn draw_nav(frame: &mut Frame, app: &App) {
     }
 }
 
+fn key_hints(app: &App) -> String {
+    let movement = match app.page {
+        Page::Settings | Page::Edit => " [Q][E] pages [W][S] move",
+        _ => " [Q][E] pages [W][A][S][D] move",
+    };
+    let actions = match app.page {
+        Page::Launch => "Enter launch  O sort  N new",
+        Page::Download => "Enter install  O sort  R refresh",
+        Page::Loaders => "Enter download  B unstable  R refresh  Esc back",
+        Page::Settings => "Enter edit",
+        Page::Edit => "Enter change  Esc back",
+        Page::More => "Enter refresh",
+    };
+    let ctrl = match app.page {
+        Page::Download => "Ctrl+F search  Ctrl+R refresh  Ctrl+C quit",
+        Page::Loaders => "Ctrl+R refresh  Ctrl+C quit",
+        _ => "Ctrl+C quit",
+    };
+    if app.editing.is_some() {
+        return format!("{movement}  Enter save  Esc cancel  {ctrl}");
+    }
+    if app.search_open && app.page == Page::Download {
+        return format!("{movement}  Esc clear  {ctrl}");
+    }
+    if app.page == Page::Loaders || app.jobs.is_empty() {
+        format!("{movement}  {actions}  {ctrl}")
+    } else {
+        format!("{movement}  {actions}  Esc cancel  {ctrl}")
+    }
+}
+
 fn draw_footer(frame: &mut Frame, app: &App) {
     let style = if app.status_error {
         theme::danger()
     } else {
         theme::muted()
     };
-    let hints = "1-4 pages   ↑↓ move   enter   click & wheel   q quit";
+    let hints = key_hints(app);
     let width = app.screen.footer.width as usize;
-    let text = if app.status.is_empty() {
-        hints.to_string()
+    let status = app.status.trim();
+    let text = if status.is_empty() {
+        hints.clone()
     } else {
-        let combined = format!(" {}  ·  {hints}", app.status);
+        let combined = format!(" {status}  ·  {hints}");
         if combined.chars().count() <= width {
             combined
         } else {
-            format!(" {}", app.status)
+            let hint_len = hints.chars().count();
+            let room = width.saturating_sub(hint_len.saturating_add(6));
+            if room < 4 {
+                format!(" {hints}")
+            } else {
+                let short: String = status.chars().take(room).collect();
+                format!(" {short}  ·  {hints}")
+            }
         }
     };
     frame.render_widget(
@@ -108,91 +198,485 @@ fn draw_footer(frame: &mut Frame, app: &App) {
 
 fn draw_launch(frame: &mut Frame, app: &App) {
     frame.render_widget(panel("Account"), app.screen.left);
-    frame.render_widget(panel("Play"), app.screen.right);
+    frame.render_widget(panel("Instances"), app.screen.right);
     draw_account_card(frame, app);
 
-    for (offset, rect) in app.screen.version_rows.iter().copied().enumerate() {
-        let index = app.version_scroll + offset;
-        let Some(version) = app.installed.get(index) else {
+    if app.creator.is_some() {
+        draw_creator(frame, app);
+    } else {
+        for (offset, rect) in app.screen.version_rows.iter().copied().enumerate() {
+            let index = app.version_scroll + offset;
+            let Some(instance) = app.instances.get(index) else {
+                continue;
+            };
+            let selected = index == app.version_selected;
+            let style = row_style(selected, hot(app, rect));
+            let mark = if selected { "▸" } else { " " };
+            let pin = if instance.id == app.default_instance {
+                "*"
+            } else {
+                " "
+            };
+            let launch = app
+                .screen
+                .row_launch
+                .get(offset)
+                .copied()
+                .unwrap_or_default();
+            let edit = app.screen.row_edit.get(offset).copied().unwrap_or_default();
+            let reserved = if launch.width > 0 {
+                rect.width.saturating_sub(launch.x.saturating_sub(rect.x))
+            } else {
+                0
+            };
+            let label = format!(
+                " {mark}{pin} {}  {}  {}",
+                instance.name, instance.game_version, instance.loader
+            );
+            frame.render_widget(
+                Paragraph::new(fit(&label, rect.width.saturating_sub(reserved) as usize))
+                    .style(style),
+                rect,
+            );
+            paint_row_button(
+                frame,
+                launch,
+                "[Launch]",
+                ">Launch<",
+                button_face(app.focus == Focus::RowLaunch && selected, hot(app, launch)),
+            );
+            paint_row_button(
+                frame,
+                edit,
+                "[Edit]",
+                ">Edit<",
+                button_face(app.focus == Focus::RowEdit && selected, hot(app, edit)),
+            );
+        }
+        if app.instances.is_empty() {
+            let note = Rect::new(
+                app.screen.version_list.x,
+                app.screen.version_list.y,
+                app.screen.version_list.width,
+                1,
+            );
+            frame.render_widget(
+                Paragraph::new("  No instances yet.").style(theme::muted().bg(theme::SURFACE)),
+                note,
+            );
+        }
+        if app.screen.new_instance.height > 0 {
+            let style = if hot(app, app.screen.new_instance) {
+                theme::selected()
+            } else {
+                theme::hover()
+            };
+            frame.render_widget(
+                Paragraph::new(fit(
+                    " + New instance",
+                    app.screen.new_instance.width as usize,
+                ))
+                .style(style),
+                app.screen.new_instance,
+            );
+        }
+    }
+
+    draw_jobs(frame, app);
+}
+
+enum ButtonFace {
+    Idle,
+    Hover,
+    Focused,
+}
+
+fn button_face(focused: bool, hovered: bool) -> ButtonFace {
+    if focused {
+        ButtonFace::Focused
+    } else if hovered {
+        ButtonFace::Hover
+    } else {
+        ButtonFace::Idle
+    }
+}
+
+fn paint_row_button(
+    frame: &mut Frame,
+    rect: Rect,
+    idle: &str,
+    focused_label: &str,
+    face: ButtonFace,
+) {
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+    let (label, style) = match face {
+        ButtonFace::Focused => (focused_label, theme::focused_control()),
+        ButtonFace::Hover => (idle, theme::hover().add_modifier(Modifier::BOLD)),
+        ButtonFace::Idle => (idle, theme::row_button()),
+    };
+    let width = (label.chars().count() as u16).min(rect.width);
+    if width == 0 {
+        return;
+    }
+    let chip = Rect::new(
+        rect.x.saturating_add(rect.width.saturating_sub(width)),
+        rect.y,
+        width,
+        1,
+    );
+    frame.render_widget(Paragraph::new(label).style(style), chip);
+}
+
+fn draw_edit(frame: &mut Frame, app: &App) {
+    frame.render_widget(panel("Edit instance"), app.screen.body);
+    let draft = app.draft.as_ref();
+    let rows = [
+        ("Name", draft.map(|item| item.name.as_str()).unwrap_or("")),
+        (
+            "Description",
+            draft.map(|item| item.description.as_str()).unwrap_or(""),
+        ),
+        (
+            "Default",
+            if draft.is_some_and(|item| item.id == app.default_instance) {
+                "this instance"
+            } else {
+                "set as default"
+            },
+        ),
+        ("Java", ""),
+        ("Memory min", ""),
+        ("Memory max", ""),
+        ("JVM args", ""),
+        ("Open folder", "file manager"),
+        ("Delete", "remove this instance"),
+    ];
+    for (index, (label, value)) in rows.iter().enumerate() {
+        let Some(rect) = app.screen.setting_rows.get(index).copied() else {
             continue;
         };
-        let selected = index == app.version_selected;
+        let shown = if let Some(text) = live_edit(app, index) {
+            text
+        } else {
+            match index {
+                3 => inherit_label(
+                    draft.map(|item| item.java.as_str()).unwrap_or(""),
+                    &app.java_path,
+                    "auto",
+                ),
+                4 => inherit_label(
+                    draft.map(|item| item.memory_min.as_str()).unwrap_or(""),
+                    &app.memory_min,
+                    "unset",
+                ),
+                5 => inherit_label(
+                    draft.map(|item| item.memory_max.as_str()).unwrap_or(""),
+                    &app.memory,
+                    "2G",
+                ),
+                6 => inherit_label(
+                    draft.map(|item| item.jvm_args.as_str()).unwrap_or(""),
+                    &app.jvm_args,
+                    "none",
+                ),
+                _ => (*value).to_string(),
+            }
+        };
+        let selected = index == app.setting_selected;
         let style = row_style(selected, hot(app, rect));
-        let mark = if selected { "▸" } else { " " };
-        let label = format!(" {mark} {:<18} {}", version.id, version.kind);
+        let line = format!("  {:<14} {shown}", label);
         frame.render_widget(
-            Paragraph::new(fit(&label, rect.width as usize)).style(style),
+            Paragraph::new(fit(&line, rect.width as usize)).style(style),
             rect,
         );
     }
-    if app.installed.is_empty() {
-        let note = Rect::new(
-            app.screen.version_list.x,
-            app.screen.version_list.y,
-            app.screen.version_list.width,
+}
+
+fn live_edit(app: &App, index: usize) -> Option<String> {
+    let editor = app.editing.as_ref()?;
+    let field = match index {
+        0 => Field::Rename,
+        1 => Field::Description,
+        3 => Field::JavaOverride,
+        4 => Field::MemoryMin,
+        5 => Field::MemoryMax,
+        6 => Field::JvmArgs,
+        _ => return None,
+    };
+    if editor.field != field {
+        return None;
+    }
+    Some(with_cursor(&editor.buffer, editor.cursor))
+}
+
+fn with_cursor(buffer: &str, cursor: usize) -> String {
+    let mut text = String::new();
+    let mut placed = false;
+    for (index, ch) in buffer.chars().enumerate() {
+        if index == cursor {
+            text.push('█');
+            placed = true;
+        }
+        text.push(ch);
+    }
+    if !placed {
+        text.push('█');
+    }
+    text
+}
+
+fn inherit_label(override_value: &str, global: &str, fallback: &str) -> String {
+    if override_value.trim().is_empty() {
+        let shown = if global.trim().is_empty() {
+            fallback
+        } else {
+            global
+        };
+        format!("inherit global ({shown})")
+    } else {
+        override_value.to_string()
+    }
+}
+
+fn draw_loaders(frame: &mut Frame, app: &App) {
+    let tabs = [
+        ("fabric", "Fabric"),
+        ("quilt", "Quilt"),
+        ("forge", "Forge"),
+        ("neoforge", "NeoForge"),
+    ];
+    let current = app
+        .picker
+        .as_ref()
+        .map(|picker| picker.loader.clone())
+        .unwrap_or_else(|| "fabric".into());
+    for (index, (kind, name)) in tabs.iter().enumerate() {
+        let Some(rect) = app.screen.download_tabs.get(index).copied() else {
+            continue;
+        };
+        let state = app.loader_tab_state(kind);
+        let active = current == *kind && state != "unsupported";
+        let style = if state == "unsupported" {
+            theme::muted()
+        } else if state == "error" {
+            theme::danger()
+        } else if active {
+            theme::selected()
+        } else if state == "loading" {
+            theme::muted()
+        } else if hot(app, rect) {
+            theme::hover()
+        } else {
+            theme::base()
+        };
+        let label = app.loader_tab_label(kind, name);
+        frame.render_widget(Paragraph::new(format!(" {label} ")).style(style), rect);
+    }
+    let show_unstable = app
+        .picker
+        .as_ref()
+        .is_some_and(|picker| picker.show_unstable);
+    let toggle = if show_unstable {
+        "[x] unstable"
+    } else {
+        "[ ] unstable"
+    };
+    let toggle_w = toggle.len() as u16;
+    if app.screen.body.width > toggle_w.saturating_add(2) {
+        let toggle_rect = Rect::new(
+            app.screen.body.x.saturating_add(
+                app.screen
+                    .body
+                    .width
+                    .saturating_sub(toggle_w)
+                    .saturating_sub(1),
+            ),
+            app.screen.body.y,
+            toggle_w,
             1,
         );
-        frame.render_widget(
-            Paragraph::new("  No versions yet. Open Download.")
-                .style(theme::muted().bg(theme::SURFACE)),
-            note,
-        );
+        let tabs_end = app
+            .screen
+            .download_tabs
+            .last()
+            .map(|rect| rect.x.saturating_add(rect.width))
+            .unwrap_or(0);
+        if toggle_rect.x > tabs_end {
+            frame.render_widget(Paragraph::new(toggle).style(theme::muted()), toggle_rect);
+        }
     }
-
-    let running = app.game_running;
-    let preparing = app.job.as_ref().is_some_and(|job| job.launching) && !running;
-    if app.screen.launch_button.y > app.screen.version_list.y {
-        let caption = match app.selected_version() {
-            Some(version) => format!("{}   ·   {}", version.id, app.memory),
-            None => "Install a version to play".into(),
+    let outer = expand(app.screen.download_list);
+    if outer.height > 0 {
+        let title = app
+            .picker
+            .as_ref()
+            .map(|picker| format!(" {} · {} ", picker.loader, picker.game_version))
+            .unwrap_or_else(|| " Loaders ".into());
+        frame.render_widget(panel(&title), outer);
+    }
+    let visible = app.picker_visible();
+    let scroll = app.loader_scroll(app.screen.download_rows.len().max(1));
+    let selected = app
+        .picker
+        .as_ref()
+        .map(|picker| picker.selected)
+        .unwrap_or(0);
+    if visible.is_empty() {
+        let (message, style) = match app.picker.as_ref() {
+            Some(picker) if picker.loading => (
+                "  Loading loader builds...".to_string(),
+                theme::muted().bg(theme::SURFACE),
+            ),
+            Some(picker) if picker.unsupported => (
+                format!(
+                    "  {} does not support Minecraft {}",
+                    display_loader(&picker.loader),
+                    picker.game_version
+                ),
+                theme::muted().bg(theme::SURFACE),
+            ),
+            Some(picker) if !picker.error.is_empty() => (
+                format!("  {}", picker.error),
+                theme::danger().bg(theme::SURFACE),
+            ),
+            _ => (
+                "  No builds for this version.".to_string(),
+                theme::muted().bg(theme::SURFACE),
+            ),
         };
-        let width = app.screen.right.width.saturating_sub(2);
-        let x = app.screen.right.x.saturating_add(1);
         frame.render_widget(
-            Paragraph::new(center(&caption, width as usize))
-                .style(theme::muted().bg(theme::SURFACE)),
-            Rect::new(x, app.screen.launch_button.y.saturating_sub(1), width, 1),
+            Paragraph::new(message)
+                .style(style)
+                .wrap(Wrap { trim: false }),
+            app.screen.download_list,
         );
+        return;
     }
-    let (label, style) = if running {
-        ("STOP", theme::selected())
-    } else if preparing {
-        ("PREPARING", theme::disabled_button())
-    } else if app.selected_version().is_none() {
-        ("NO VERSION", theme::disabled_button())
-    } else if hot(app, app.screen.launch_button) {
-        (
-            "LAUNCH",
-            theme::launch_button().add_modifier(Modifier::REVERSED),
-        )
-    } else {
-        ("LAUNCH", theme::launch_button())
-    };
-    paint_button(frame, app.screen.launch_button, label, style);
-
-    if let Some(job) = &app.job {
-        draw_job(
+    for (offset, rect) in app.screen.download_rows.iter().copied().enumerate() {
+        let index = scroll + offset;
+        let Some(build) = visible.get(index) else {
+            continue;
+        };
+        let is_selected = index == selected;
+        let style = if is_selected {
+            theme::selected()
+        } else if build.recommended {
+            theme::title()
+        } else if hot(app, rect) && !button_hot(app, offset) {
+            theme::hover()
+        } else {
+            theme::surface()
+        };
+        let mark = if build.recommended { "*" } else { " " };
+        let button = app
+            .screen
+            .install_buttons
+            .get(offset)
+            .copied()
+            .unwrap_or_default();
+        let reserved = if button.width > 0 {
+            rect.width.saturating_sub(button.x.saturating_sub(rect.x))
+        } else {
+            0
+        };
+        let label = format!(" {mark} {}", build.version);
+        frame.render_widget(
+            Paragraph::new(fit(&label, rect.width.saturating_sub(reserved) as usize)).style(style),
+            rect,
+        );
+        let identity = app
+            .picker
+            .as_ref()
+            .map(|picker| (picker.loader.clone(), picker.game_version.clone()));
+        let stored = identity.is_some_and(|(loader, game)| {
+            app.loader_item(&loader, &game, &build.version).is_some()
+        });
+        let (idle, focused_label) = if stored {
+            ("[Create instance]", ">Create instance<")
+        } else {
+            ("[Download]", ">Download<")
+        };
+        paint_row_button(
             frame,
-            app.screen.progress,
-            &job.stage,
-            job.percent(),
-            &job.detail,
+            button,
+            idle,
+            focused_label,
+            button_face(
+                app.focus == Focus::LoaderButton && is_selected,
+                hot(app, button),
+            ),
         );
     }
-    if app.screen.log.height > 0 {
-        let lines: Vec<Line> = app
-            .log
-            .iter()
-            .rev()
-            .take(app.screen.log.height as usize)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .map(|line| Line::from(fit(line, app.screen.log.width as usize)))
-            .collect();
+}
+
+fn draw_prompt(frame: &mut Frame, app: &App) {
+    let Some(editor) = &app.editing else {
+        return;
+    };
+    let title = if editor.field == Field::InstanceName {
+        "Instance name"
+    } else {
+        "Modpack path"
+    };
+    frame.render_widget(Clear, app.screen.modal);
+    frame.render_widget(panel(title), app.screen.modal);
+    let inner = inner_of(app.screen.modal);
+    if inner.height == 0 {
+        return;
+    }
+    let value = with_cursor(&editor.buffer, editor.cursor);
+    let text_x = inner.x.saturating_add(1);
+    let text_w = inner.width.saturating_sub(2);
+    frame.render_widget(
+        Paragraph::new(fit(&value, text_w as usize)).style(theme::surface()),
+        Rect::new(text_x, inner.y.saturating_add(1), text_w, 1),
+    );
+    if inner.height > 2 {
         frame.render_widget(
-            Paragraph::new(lines).style(theme::muted().bg(theme::SURFACE)),
-            app.screen.log,
+            Paragraph::new("Enter save  Esc cancel").style(theme::muted().bg(theme::SURFACE)),
+            Rect::new(text_x, inner.y.saturating_add(2), text_w, 1),
+        );
+    }
+}
+
+fn display_loader(kind: &str) -> &str {
+    match kind {
+        "fabric" => "Fabric",
+        "quilt" => "Quilt",
+        "forge" => "Forge",
+        "neoforge" => "NeoForge",
+        other => other,
+    }
+}
+
+fn draw_creator(frame: &mut Frame, app: &App) {
+    let title = "New instance";
+    let heading = Rect::new(
+        app.screen.version_list.x,
+        app.screen.version_list.y,
+        app.screen.version_list.width,
+        1,
+    );
+    if app.screen.version_rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new(fit(title, heading.width as usize))
+                .style(theme::muted().bg(theme::SURFACE)),
+            heading,
+        );
+    }
+    for (offset, rect) in app.screen.version_rows.iter().copied().enumerate() {
+        let selected = offset == app.creator_selected;
+        let style = row_style(selected, hot(app, rect));
+        let mark = if selected { "▸" } else { " " };
+        let label = match offset {
+            0 => "Download",
+            _ => "Import modpack",
+        };
+        frame.render_widget(
+            Paragraph::new(fit(&format!(" {mark} {label}"), rect.width as usize)).style(style),
+            rect,
         );
     }
 }
@@ -289,35 +773,23 @@ fn draw_download(frame: &mut Frame, app: &App) {
     } else {
         app.query.as_str()
     };
-    let search = format!(" search  {query}");
-    let search_style =
-        if matches!(app.focus, super::model::Focus::Search) || hot(app, app.screen.search) {
-            theme::hover()
-        } else {
-            theme::base()
-        };
-    frame.render_widget(
-        Paragraph::new(fit(&search, app.screen.search.width as usize)).style(search_style),
-        app.screen.search,
-    );
-    let columns = Rect::new(
-        app.screen.search.x,
-        app.screen.search.y.saturating_add(1),
-        app.screen.search.width,
-        1,
-    );
-    frame.render_widget(
-        Paragraph::new(fit(
-            "  version               released      status",
-            columns.width as usize,
-        ))
-        .style(theme::muted()),
-        columns,
-    );
-
+    if app.search_open {
+        let search = format!(" search  {query}");
+        let search_style =
+            if matches!(app.focus, super::model::Focus::Search) || hot(app, app.screen.search) {
+                theme::hover()
+            } else {
+                theme::base()
+            };
+        frame.render_widget(
+            Paragraph::new(fit(&search, app.screen.search.width as usize)).style(search_style),
+            app.screen.search,
+        );
+    }
     let outer = expand(app.screen.download_list);
     if outer.height > 0 {
-        frame.render_widget(panel("Versions"), outer);
+        let title = format!("Versions · {}", app.download_sort.label());
+        frame.render_widget(panel(&title), outer);
     }
     let filtered = app.filtered();
     for (offset, rect) in app.screen.download_rows.iter().copied().enumerate() {
@@ -326,40 +798,69 @@ fn draw_download(frame: &mut Frame, app: &App) {
             continue;
         };
         let selected = index == app.download_selected;
-        let style = row_style(selected, hot(app, rect) && !button_hot(app, offset));
-        let status = if app.installed_ids.contains(&entry.id) {
-            "installed"
+        let style = row_style(
+            selected,
+            hot(app, rect) && !download_button_hot(app, offset),
+        );
+        let status = if app.in_store(&entry.id) {
+            "in store"
         } else {
-            "not installed"
+            "not stored"
         };
         let mark = if selected { "▸" } else { " " };
+        let action = app
+            .screen
+            .install_buttons
+            .get(offset)
+            .copied()
+            .unwrap_or_default();
+        let loaders = app
+            .screen
+            .loader_buttons
+            .get(offset)
+            .copied()
+            .unwrap_or_default();
+        let reserved = if action.width > 0 {
+            rect.width.saturating_sub(action.x.saturating_sub(rect.x))
+        } else {
+            0
+        };
         let label = format!(" {mark} {:<20} {:<12} {}", entry.id, entry.released, status);
         frame.render_widget(
-            Paragraph::new(fit(&label, rect.width as usize)).style(style),
+            Paragraph::new(fit(&label, rect.width.saturating_sub(reserved) as usize)).style(style),
             rect,
         );
-        if let Some(button) = app.screen.install_buttons.get(offset).copied() {
-            let busy = app.job.as_ref().is_some_and(|job| job.version == entry.id);
-            let caption = if busy {
-                "wait"
-            } else if app.installed_ids.contains(&entry.id) {
-                "reinstall"
-            } else {
-                "install"
-            };
-            let button_style = if hot(app, button) && !busy {
-                theme::selected()
-            } else if busy {
-                theme::disabled_button()
-            } else {
-                Style::default().fg(ON_ACCENT).bg(ACCENT)
-            };
-            frame.render_widget(
-                Paragraph::new(fit(&format!(" {caption} "), button.width as usize))
-                    .style(button_style),
-                button,
-            );
-        }
+        let busy = app
+            .jobs
+            .iter()
+            .any(|job| !job.launching && job.version == entry.id);
+        let stored = app.vanilla_item(&entry.id).is_some();
+        let (idle, focused_label) = if busy {
+            ("[wait]", "[wait]")
+        } else if stored {
+            ("[Create instance]", ">Create instance<")
+        } else {
+            ("[Install]", ">Install<")
+        };
+        let face = if busy {
+            ButtonFace::Idle
+        } else {
+            button_face(
+                app.focus == Focus::DownloadAction && selected,
+                hot(app, action),
+            )
+        };
+        paint_row_button(frame, action, idle, focused_label, face);
+        paint_row_button(
+            frame,
+            loaders,
+            "[Loaders]",
+            ">Loaders<",
+            button_face(
+                app.focus == Focus::DownloadLoaders && selected,
+                hot(app, loaders),
+            ),
+        );
     }
     if !app.catalog_ready {
         frame.render_widget(
@@ -373,14 +874,61 @@ fn draw_download(frame: &mut Frame, app: &App) {
             app.screen.download_list,
         );
     }
-    if let Some(job) = &app.job {
-        draw_job(
-            frame,
-            app.screen.progress,
-            &job.stage,
-            job.percent(),
-            &job.detail,
+    draw_jobs(frame, app);
+}
+
+fn draw_jobs(frame: &mut Frame, app: &App) {
+    if app.jobs.is_empty() || app.screen.progress.height == 0 {
+        return;
+    }
+    let mut y = app.screen.progress.y;
+    let width = app.screen.progress.width;
+    let x = app.screen.progress.x;
+    for job in app
+        .jobs
+        .iter()
+        .rev()
+        .take(3)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        if y >= app
+            .screen
+            .progress
+            .y
+            .saturating_add(app.screen.progress.height)
+        {
+            break;
+        }
+        let line = if job.total == 0 {
+            format!(" {}  {}  {}", job.version, job.stage, job.detail)
+        } else {
+            format!(" {} {}%  {}", job.version, job.percent(), job.detail)
+        };
+        frame.render_widget(
+            Paragraph::new(fit(&line, width as usize)).style(theme::muted().bg(theme::SURFACE)),
+            Rect::new(x, y, width, 1),
         );
+        y = y.saturating_add(1);
+    }
+    let (done, total) = app.overall_progress();
+    let bar_area = Rect::new(
+        x,
+        y,
+        width,
+        app.screen
+            .progress
+            .height
+            .saturating_sub(y.saturating_sub(app.screen.progress.y)),
+    );
+    if bar_area.height > 0 {
+        let stage = if app.jobs.len() == 1 {
+            app.jobs[0].stage.as_str()
+        } else {
+            "downloads"
+        };
+        draw_job(frame, bar_area, stage, percent(done, total), "");
     }
 }
 
@@ -397,7 +945,7 @@ fn draw_settings(frame: &mut Frame, app: &App) {
         let value = if let Some(editor) = &app.editing {
             if let SettingKind::Edit(field) = row.kind {
                 if editor.field == field {
-                    editor.buffer.clone() + "█"
+                    with_cursor(&editor.buffer, editor.cursor)
                 } else {
                     row.value.clone()
                 }
@@ -430,16 +978,13 @@ fn draw_more(frame: &mut Frame, app: &App) {
             "Weathered Launcher",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )),
-        Line::from("A Minecraft: Java Edition launcher, named for weathered copper."),
+        Line::from("A Minecraft: Java Edition launcher. Instances keep their own worlds,"),
+        Line::from("and downloaded files are stored once and shared."),
         Line::from(""),
-        Line::from("The Launch page picks an installed version and an account."),
-        Line::from("Download installs a release, snapshot, or old version."),
-        Line::from("Settings stores the game directory, memory, Java, and username."),
+        Line::from("Launch starts a game. Download fetches a version. Settings holds"),
+        Line::from("Java, memory, and the account. The footer lists the keys."),
         Line::from(""),
-        Line::from("Mouse: click tabs, rows, and buttons. The wheel scrolls lists."),
-        Line::from("Keys: 1–4 switch pages, arrows move, enter activates, q quits."),
-        Line::from(""),
-        Line::from("Microsoft login uses a device code. Set an Azure client id first."),
+        Line::from("License: MIT. Copyright (c) 2026 Weathered Contributors."),
     ];
     let text_area = Rect::new(
         inner.x,
@@ -468,6 +1013,7 @@ fn draw_login(frame: &mut Frame, app: &App) {
     let Some(login) = &app.login else {
         return;
     };
+    frame.render_widget(Clear, app.screen.modal);
     frame.render_widget(panel("Microsoft sign-in"), app.screen.modal);
     let inner = inner_of(app.screen.modal);
     let lines = vec![
@@ -485,10 +1031,10 @@ fn draw_login(frame: &mut Frame, app: &App) {
         Line::from(login.message.clone()),
     ];
     let text = Rect::new(
-        inner.x,
-        inner.y,
-        inner.width,
-        inner.height.saturating_sub(2),
+        inner.x.saturating_add(1),
+        inner.y.saturating_add(1),
+        inner.width.saturating_sub(2),
+        inner.height.saturating_sub(3),
     );
     frame.render_widget(
         Paragraph::new(lines)
@@ -525,18 +1071,6 @@ fn draw_job(frame: &mut Frame, rect: Rect, stage: &str, percent: u16, detail: &s
     }
 }
 
-fn paint_button(frame: &mut Frame, rect: Rect, label: &str, style: Style) {
-    if rect.width == 0 || rect.height == 0 {
-        return;
-    }
-    frame.render_widget(Block::default().style(style), rect);
-    let mid = rect.y + rect.height / 2;
-    frame.render_widget(
-        Paragraph::new(center(label, rect.width as usize)).style(style),
-        Rect::new(rect.x, mid, rect.width, 1),
-    );
-}
-
 fn panel(title: &str) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
@@ -566,6 +1100,16 @@ fn button_hot(app: &App, offset: usize) -> bool {
         .get(offset)
         .copied()
         .is_some_and(|rect| hot(app, rect))
+}
+
+fn download_button_hot(app: &App, offset: usize) -> bool {
+    button_hot(app, offset)
+        || app
+            .screen
+            .loader_buttons
+            .get(offset)
+            .copied()
+            .is_some_and(|rect| hot(app, rect))
 }
 
 fn inner_of(rect: Rect) -> Rect {
@@ -648,8 +1192,8 @@ fn shorten(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn frame_text(buffer: &ratatui::buffer::Buffer) -> String {
         let mut out = String::new();
@@ -669,12 +1213,27 @@ mod tests {
         let mut app = App::preview();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let text = frame_text(terminal.backend().buffer());
-        assert!(text.contains("weathered"), "{text}");
+        assert!(text.contains("Weathered Launcher"), "{text}");
         assert!(text.contains("Launch"), "{text}");
         assert!(text.contains("Download"), "{text}");
         assert!(text.contains("Settings"), "{text}");
         assert!(text.contains("More"), "{text}");
-        assert!(text.contains("LAUNCH"), "{text}");
+        assert!(!text.contains("LAUNCH"), "{text}");
+        assert!(
+            text.contains("[Launch]") || text.contains(">Launch<"),
+            "{text}"
+        );
+        assert!(text.contains("[Edit]"), "{text}");
+        assert!(text.contains("[Q][E] pages"), "{text}");
+        app.note("x".repeat(400), false);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let crowded = frame_text(terminal.backend().buffer());
+        assert!(crowded.contains("[Q][E] pages"), "{crowded}");
+        assert!(crowded.contains("Ctrl+C quit"), "{crowded}");
+        assert!(text.contains("[W][A][S][D] move"), "{text}");
+        assert!(text.contains(">Launch<"), "{text}");
+        assert!(text.contains("O sort"), "{text}");
+        assert!(text.contains("Ctrl+C quit"), "{text}");
         assert!(text.contains("Steve"), "{text}");
         assert!(text.contains("1.21.1"), "{text}");
         assert!(text.contains("q quit") || text.contains("quit"), "{text}");
@@ -686,22 +1245,97 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::preview();
         app.page = Page::Download;
-        app.job = Some(super::super::model::Job {
+        app.jobs.push(super::super::model::Job {
+            id: 1,
             version: "1.20.4".into(),
             stage: "assets".into(),
             completed: 1200,
             total: 3890,
             detail: "icons/icon.png".into(),
             launching: false,
+            create_instance: false,
         });
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let text = frame_text(terminal.backend().buffer());
         assert!(text.contains("Release"), "{text}");
         assert!(text.contains("Snapshot"), "{text}");
-        assert!(text.contains("install"), "{text}");
+        assert!(text.contains("Old"), "{text}");
+        assert!(!text.contains("Fabric"), "{text}");
+        assert!(
+            text.contains("[Create instance]") || text.contains(">Create instance<"),
+            "{text}"
+        );
+        assert!(text.contains("[Loaders]"), "{text}");
+        assert!(text.contains("[wait]"), "{text}");
         assert!(text.contains("1.21.1"), "{text}");
         assert!(text.contains("assets 30%"), "{text}");
         assert!(text.contains('█'), "{text}");
+        assert!(text.contains("Versions · newest"), "{text}");
+        assert_eq!(
+            expand(app.screen.download_list).y,
+            app.screen.download_tabs[0].y + 1
+        );
+    }
+
+    #[test]
+    fn row_button_fill_stops_at_the_label() {
+        let backend = TestBackend::new(100, 36);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::preview();
+        app.page = Page::Download;
+        app.focus = Focus::DownloadAction;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let create = app.screen.install_buttons[0];
+        let install = app.screen.install_buttons[1];
+        assert_eq!(create.width as usize, "[Create instance]".len());
+        assert_eq!(install.width as usize, "[Install]".len());
+        let chip = buffer[(install.x, install.y)].style();
+        let beside = buffer[(install.x - 1, install.y)].style();
+        assert_ne!(chip.bg, beside.bg);
+        let focused = buffer[(create.x, create.y)].style();
+        let before = buffer[(create.x - 1, create.y)].style();
+        assert_ne!(focused.bg, before.bg);
+        assert!(focused.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn focused_row_button_uses_a_different_face() {
+        let backend = TestBackend::new(100, 36);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::preview();
+        app.focus = Focus::RowLaunch;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let text = frame_text(&buffer);
+        assert!(text.contains(">Launch<"), "{text}");
+        assert!(text.contains("[Edit]"), "{text}");
+        let launch = app.screen.row_launch[0];
+        let edit = app.screen.row_edit[0];
+        let launch_style = buffer[(launch.x, launch.y)].style();
+        let edit_style = buffer[(edit.x, edit.y)].style();
+        assert_ne!(launch_style.bg, edit_style.bg);
+        assert!(launch_style.add_modifier.contains(Modifier::BOLD));
+        assert!(!edit_style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn search_is_the_only_row_between_tabs_and_versions() {
+        let backend = TestBackend::new(100, 36);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::preview();
+        app.page = Page::Download;
+        app.search_open = true;
+        app.query = "1.20".into();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(
+            app.screen.search.y,
+            app.screen.download_tabs[0].y.saturating_add(1)
+        );
+        assert_eq!(
+            expand(app.screen.download_list).y,
+            app.screen.download_tabs[0].y + 2
+        );
     }
 
     #[test]
@@ -717,5 +1351,95 @@ mod tests {
         assert!(text.contains("Username"), "{text}");
         assert!(text.contains("Sign in with Microsoft"), "{text}");
         assert!(text.contains("Save"), "{text}");
+    }
+
+    #[test]
+    fn edit_page_is_full_screen_and_shows_inherited_settings() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::preview();
+        app.page = Page::Edit;
+        app.draft = Some(super::super::model::InstanceDraft {
+            id: "vanilla".into(),
+            name: "Vanilla".into(),
+            description: "world".into(),
+            java: String::new(),
+            memory_min: String::new(),
+            memory_max: String::new(),
+            jvm_args: String::new(),
+        });
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let text = frame_text(terminal.backend().buffer());
+        assert!(text.contains("Edit instance"), "{text}");
+        assert!(text.contains("inherit global"), "{text}");
+        assert!(text.contains("Delete"), "{text}");
+        assert!(text.contains("Open folder"), "{text}");
+        assert!(!text.contains("Account"), "{text}");
+    }
+
+    #[test]
+    fn edit_field_shows_the_cursor_while_typing() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::preview();
+        app.page = Page::Edit;
+        app.setting_selected = 1;
+        app.draft = Some(super::super::model::InstanceDraft {
+            id: "vanilla".into(),
+            name: "Vanilla".into(),
+            description: "dda".into(),
+            java: String::new(),
+            memory_min: String::new(),
+            memory_max: String::new(),
+            jvm_args: String::new(),
+        });
+        app.on_key(super::super::model::Key::Enter);
+        app.on_key(super::super::model::Key::Char('x'));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let text = frame_text(terminal.backend().buffer());
+        assert!(text.contains("ddax█"), "{text}");
+    }
+
+    #[test]
+    fn big_launch_is_hidden_for_a_non_default_instance() {
+        let backend = TestBackend::new(100, 36);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::preview();
+        app.version_selected = 1;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let text = frame_text(terminal.backend().buffer());
+        assert!(text.contains("[Launch]"), "{text}");
+        assert!(text.contains("[Edit]"), "{text}");
+        assert!(!text.contains("LAUNCH"), "{text}");
+    }
+
+    #[test]
+    fn more_page_is_a_short_overview_and_the_license() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::preview();
+        app.page = Page::More;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let text = frame_text(terminal.backend().buffer());
+        assert!(text.contains("Weathered Launcher"), "{text}");
+        assert!(text.contains("MIT"), "{text}");
+        assert!(!text.contains("Azure"), "{text}");
+        assert!(!text.contains("client id"), "{text}");
+    }
+
+    #[test]
+    fn download_search_stays_hidden_until_ctrl_f() {
+        let backend = TestBackend::new(100, 36);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::preview();
+        app.page = Page::Download;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.screen.search.height, 0);
+        app.search_open = true;
+        app.query = "1.20".into();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let shown = frame_text(terminal.backend().buffer());
+        assert!(app.screen.search.height > 0);
+        assert!(shown.contains(" search  1.20"), "{shown}");
     }
 }

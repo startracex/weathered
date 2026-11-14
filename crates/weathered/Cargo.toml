@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 authors.workspace = true
+repository.workspace = true
 description = "Weathered Launcher, a command-line Minecraft: Java Edition launcher"
 readme = "../../README.md"
 autobins = false

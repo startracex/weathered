@@ -7,9 +7,9 @@ use serde::Deserialize;
 use crate::download::{self, sha1_hex};
 use crate::error::{Error, IoResultExt, Result};
 use crate::manifest::VersionManifest;
-use crate::paths::{validate_version_id, GamePaths};
+use crate::paths::{GamePaths, validate_version_id};
 use crate::platform::OsInfo;
-use crate::rules::{rules_allow, FeatureSet, Rule};
+use crate::rules::{FeatureSet, Rule, rules_allow};
 
 /// A resolved version, including every parent it inherits from.
 #[derive(Debug, Clone)]
@@ -122,6 +122,16 @@ pub struct Library {
     pub downloads: Option<LibraryDownloads>,
     /// Legacy base URL. Joined with the Maven path when `downloads` is absent.
     pub url: Option<String>,
+    /// SHA-1 published beside the Maven coordinate. Fabric and Quilt use this
+    /// instead of `downloads.artifact`.
+    #[serde(default)]
+    pub sha1: Option<String>,
+    /// SHA-512 published beside the Maven coordinate.
+    #[serde(default)]
+    pub sha512: Option<String>,
+    /// Size in bytes published beside the Maven coordinate.
+    #[serde(default)]
+    pub size: Option<u64>,
     /// OS and feature rules. Missing rules mean the library is included.
     pub rules: Option<Vec<Rule>>,
     /// Old-style native classifier names keyed by OS.
@@ -582,10 +592,12 @@ mod tests {
         )
         .unwrap();
         assert!(legacy.arguments.is_none());
-        assert!(legacy
-            .minecraft_arguments
-            .unwrap()
-            .contains("${auth_player_name}"));
+        assert!(
+            legacy
+                .minecraft_arguments
+                .unwrap()
+                .contains("${auth_player_name}")
+        );
     }
 
     #[test]

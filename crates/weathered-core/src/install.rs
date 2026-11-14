@@ -1,7 +1,7 @@
 //! Download a Minecraft version into a game directory.
 
 use crate::assets::{self, reconstruct_assets};
-use crate::download::{self, sha1_hex, RemoteFile};
+use crate::download::{self, RemoteFile, sha1_hex};
 use crate::error::{Error, Result};
 use crate::java::{self, JavaInstallation, JavaMode};
 use crate::library::{self, plan_libraries};
@@ -205,6 +205,7 @@ async fn install_client(
             url: url.to_string(),
             dest: dest.clone(),
             sha1: artifact.sha1.clone(),
+            sha512: None,
             size: artifact.size,
             executable: false,
         }],
@@ -281,6 +282,7 @@ async fn install_logging(
             url: logging.file.url.clone(),
             dest: paths.log_config(&logging.file.id),
             sha1: Some(logging.file.sha1.clone()),
+            sha512: None,
             size: Some(logging.file.size),
             executable: false,
         }],

@@ -6,9 +6,9 @@ use std::process::Command;
 
 use serde::Deserialize;
 
-use crate::download::{self, sha1_hex, RemoteFile};
+use crate::download::{self, RemoteFile, sha1_hex};
 use crate::error::{Error, IoResultExt, Result};
-use crate::paths::{safe_rel_path, GamePaths};
+use crate::paths::{GamePaths, safe_rel_path};
 use crate::platform::{Arch, OsInfo, OsName};
 use crate::progress::ProgressSink;
 use crate::version::JavaVersionSpec;
@@ -60,6 +60,41 @@ fn parse_major(version: &str) -> Option<u32> {
     }
 }
 
+fn probe_cache() -> &'static std::sync::Mutex<HashMap<(PathBuf, u64), JavaInstallation>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<(PathBuf, u64), JavaInstallation>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn binary_stamp(path: &Path) -> (PathBuf, u64) {
+    let modified = std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    (path.to_path_buf(), modified)
+}
+
+/// `java -version`, reused while the binary's modification time is unchanged.
+pub fn probe_java_cached(path: &Path) -> Option<JavaInstallation> {
+    let key = binary_stamp(path);
+    if let Some(found) = probe_cache()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .get(&key)
+        .cloned()
+    {
+        return Some(found);
+    }
+    let found = probe_java(path)?;
+    probe_cache()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .insert(key, found.clone());
+    Some(found)
+}
+
 /// Run `java -version` and read the major version.
 pub fn probe_java(path: &Path) -> Option<JavaInstallation> {
     let output = Command::new(path).arg("-version").output().ok()?;
@@ -104,7 +139,7 @@ pub fn detect_vendored_runtimes(paths: &GamePaths) -> Vec<JavaInstallation> {
             let Some(binary) = find_java_binary(&platform.path()) else {
                 continue;
             };
-            if let Some(mut installation) = probe_java(&binary) {
+            if let Some(mut installation) = probe_java_cached(&binary) {
                 let name = component.file_name();
                 installation.source = format!("mojang:{}", name.to_string_lossy());
                 found.push(installation);
@@ -155,10 +190,10 @@ pub async fn resolve_java(
 
     if request.mode != JavaMode::ForceDownload {
         if let Some(spec) = request.spec {
-            if let Some(vendored) = find_vendored(paths, &spec.component, request.os) {
-                if vendored.major == spec.major_version {
-                    return Ok((vendored, download::DownloadStats::default()));
-                }
+            if let Some(vendored) = find_vendored(paths, &spec.component, request.os)
+                && vendored.major == spec.major_version
+            {
+                return Ok((vendored, download::DownloadStats::default()));
             }
             if let Some(system) = select_major(&detect_system_javas(), spec.major_version) {
                 return Ok((system, download::DownloadStats::default()));
@@ -193,7 +228,7 @@ fn find_vendored(paths: &GamePaths, component: &str, os: &OsInfo) -> Option<Java
     let key = runtime_platform_key(os).ok()?;
     let root = paths.runtime_dir(component, key);
     let binary = find_java_binary(&root)?;
-    let mut installation = probe_java(&binary)?;
+    let mut installation = probe_java_cached(&binary)?;
     installation.source = format!("mojang:{component}");
     Some(installation)
 }
@@ -389,6 +424,7 @@ pub fn plan_runtime(manifest: &JavaRuntimeManifest, root: &Path) -> Result<Runti
                     url: raw.url.clone().unwrap_or_default(),
                     dest,
                     sha1: raw.sha1.clone(),
+                    sha512: None,
                     size: raw.size,
                     executable: file.executable,
                 });
@@ -474,11 +510,7 @@ fn java_on_path() -> Option<PathBuf> {
 }
 
 fn java_exe() -> &'static str {
-    if cfg!(windows) {
-        "java.exe"
-    } else {
-        "java"
-    }
+    if cfg!(windows) { "java.exe" } else { "java" }
 }
 
 fn search_roots() -> Vec<PathBuf> {
@@ -501,7 +533,7 @@ fn search_roots() -> Vec<PathBuf> {
         for base in [
             r"C:\Program Files\Java",
             r"C:\Program Files\Eclipse Adoptium",
-            r"C:\Program Files\Microsoft",
+            r"C:\Program Files\Microsoft\jdk",
             r"C:\Program Files\Zulu",
             r"C:\Program Files\BellSoft",
             r"C:\Program Files (x86)\Java",
@@ -513,7 +545,10 @@ fn search_roots() -> Vec<PathBuf> {
 }
 
 fn collect_binaries(dir: &Path, depth: usize, out: &mut Vec<(PathBuf, String)>) {
-    if depth > 6 || !dir.is_dir() {
+    // `jdk-<ver>/bin/java` is two directories under a vendor root. Walking
+    // deeper than that, especially through `Program Files\Microsoft`, spends
+    // the minute before a launch reports any progress.
+    if depth > 3 || !dir.is_dir() {
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -551,7 +586,7 @@ fn dedup_probes(candidates: Vec<(PathBuf, String)>) -> Vec<JavaInstallation> {
         if !seen.insert(key) {
             continue;
         }
-        if let Some(mut installation) = probe_java(&path) {
+        if let Some(mut installation) = probe_java_cached(&path) {
             installation.source = source;
             found.push(installation);
         }

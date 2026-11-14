@@ -14,7 +14,7 @@ use crate::paths::GamePaths;
 use crate::platform::OsInfo;
 use crate::progress::ProgressSink;
 use crate::rules::FeatureSet;
-use crate::version::{self, resolve_argument_list, VersionInfo};
+use crate::version::{self, VersionInfo, resolve_argument_list};
 use crate::{LAUNCHER_NAME, LAUNCHER_VERSION};
 
 /// Everything required to build a command line.
@@ -279,25 +279,25 @@ fn ensure_installed(
     )))
 }
 
-fn game_assets_dir(paths: &GamePaths, index_name: &str) -> PathBuf {
+pub(crate) fn game_assets_dir(paths: &GamePaths, index_name: &str) -> PathBuf {
     if index_name.is_empty() {
         return paths.assets();
     }
     let index_path = paths.asset_index(index_name);
-    if let Ok(bytes) = std::fs::read(&index_path) {
-        if let Ok(index) = serde_json::from_slice::<AssetIndex>(&bytes) {
-            if index.map_to_resources {
-                return paths.resources();
-            }
-            if index.virtual_assets {
-                return paths.virtual_assets(index_name);
-            }
+    if let Ok(bytes) = std::fs::read(&index_path)
+        && let Ok(index) = serde_json::from_slice::<AssetIndex>(&bytes)
+    {
+        if index.map_to_resources {
+            return paths.resources();
+        }
+        if index.virtual_assets {
+            return paths.virtual_assets(index_name);
         }
     }
     paths.assets()
 }
 
-fn logging_argument(version: &VersionInfo, paths: &GamePaths) -> Option<String> {
+pub(crate) fn logging_argument(version: &VersionInfo, paths: &GamePaths) -> Option<String> {
     let logging = version.logging.as_ref()?.client.as_ref()?;
     let path = paths.log_config(&logging.file.id);
     if !path.is_file() {
@@ -399,6 +399,35 @@ fn memory_arg(memory: &str) -> Option<String> {
         None
     } else {
         Some(format!("-Xmx{memory}"))
+    }
+}
+
+/// Insert a minimum heap and extra arguments ahead of the version's JVM args.
+pub fn apply_jvm_overrides(plan: &mut LaunchPlan, memory_min: &str, extra: &str) {
+    if let Some(min) = memory_flag("-Xms", memory_min) {
+        plan.jvm_args.insert(0, min);
+    }
+    let extra: Vec<String> = extra.split_whitespace().map(str::to_string).collect();
+    if extra.is_empty() {
+        return;
+    }
+    let at = plan
+        .jvm_args
+        .iter()
+        .position(|arg| arg.starts_with("-Xmx"))
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    for (offset, arg) in extra.into_iter().enumerate() {
+        plan.jvm_args.insert(at + offset, arg);
+    }
+}
+
+fn memory_flag(flag: &str, memory: &str) -> Option<String> {
+    let memory = memory.trim();
+    if memory.is_empty() || memory == "0" {
+        None
+    } else {
+        Some(format!("{flag}{memory}"))
     }
 }
 
@@ -733,18 +762,21 @@ mod tests {
         assert_eq!(plan.main_class, "net.minecraft.client.main.Main");
         assert_eq!(plan.jvm_args[0], "-Xmx2G");
         let natives = PathBuf::from("/natives").display().to_string();
-        assert!(plan
-            .jvm_args
-            .iter()
-            .any(|arg| arg == &format!("-Djava.library.path={natives}")));
-        assert!(plan
-            .jvm_args
-            .iter()
-            .any(|arg| arg == "-Dminecraft.launcher.brand=weathered"));
-        assert!(plan
-            .jvm_args
-            .iter()
-            .any(|arg| arg == "-Dminecraft.launcher.version=0.1.0"));
+        assert!(
+            plan.jvm_args
+                .iter()
+                .any(|arg| arg == &format!("-Djava.library.path={natives}"))
+        );
+        assert!(
+            plan.jvm_args
+                .iter()
+                .any(|arg| arg == "-Dminecraft.launcher.brand=weathered")
+        );
+        assert!(
+            plan.jvm_args
+                .iter()
+                .any(|arg| arg == "-Dminecraft.launcher.version=0.1.0")
+        );
         assert!(plan.jvm_args.iter().any(|arg| arg == "-cp"));
         let classpath = plan
             .jvm_args
@@ -755,10 +787,12 @@ mod tests {
         assert!(classpath.contains(&library));
         assert!(classpath.contains(':'));
         assert!(!classpath.contains(';'));
-        assert!(!plan
-            .jvm_args
-            .iter()
-            .any(|arg| arg.contains("XstartOnFirstThread")));
+        assert!(
+            !plan
+                .jvm_args
+                .iter()
+                .any(|arg| arg.contains("XstartOnFirstThread"))
+        );
         assert!(!plan.jvm_args.iter().any(|arg| arg.contains("HeapDump")));
         assert!(!plan.jvm_args.iter().any(|arg| arg.contains("Windows 10")));
         assert!(!plan.jvm_args.iter().any(|arg| arg == "-Xss1M"));
@@ -770,10 +804,11 @@ mod tests {
         assert_eq!(plan.game_args[3], "1.21.1");
         assert_eq!(plan.game_args[4], "--gameDir");
         assert_eq!(plan.game_args[5], game_dir);
-        assert!(plan
-            .game_args
-            .iter()
-            .any(|arg| arg == "5627dd98-e6be-3c21-b8a8-e92344183641"));
+        assert!(
+            plan.game_args
+                .iter()
+                .any(|arg| arg == "5627dd98-e6be-3c21-b8a8-e92344183641")
+        );
         assert!(plan.game_args.iter().any(|arg| arg == "0"));
         assert!(plan.game_args.iter().any(|arg| arg == "legacy"));
         assert!(!plan.game_args.iter().any(|arg| arg == "--demo"));
@@ -784,14 +819,16 @@ mod tests {
     fn windows_10_and_32_bit_rules() {
         let windows_10 = OsInfo::new(OsName::Windows, Arch::X86_64, "10.0.19045.3803");
         let plan = build_launch_plan(spec_for(MODERN, windows_10, FeatureSet::default())).unwrap();
-        assert!(plan
-            .jvm_args
-            .iter()
-            .any(|arg| arg == "-XX:HeapDumpPath=heapdump"));
-        assert!(plan
-            .jvm_args
-            .iter()
-            .any(|arg| arg == "-Dos.name=Windows 10"));
+        assert!(
+            plan.jvm_args
+                .iter()
+                .any(|arg| arg == "-XX:HeapDumpPath=heapdump")
+        );
+        assert!(
+            plan.jvm_args
+                .iter()
+                .any(|arg| arg == "-Dos.name=Windows 10")
+        );
         assert!(plan.jvm_args.iter().any(|arg| arg == "-Dos.version=10.0"));
         assert!(!plan.jvm_args.iter().any(|arg| arg == "-Xss1M"));
         let classpath = plan
@@ -803,10 +840,11 @@ mod tests {
 
         let windows_7 = OsInfo::new(OsName::Windows, Arch::X86, "6.1.7601");
         let plan = build_launch_plan(spec_for(MODERN, windows_7, FeatureSet::default())).unwrap();
-        assert!(plan
-            .jvm_args
-            .iter()
-            .any(|arg| arg == "-XX:HeapDumpPath=heapdump"));
+        assert!(
+            plan.jvm_args
+                .iter()
+                .any(|arg| arg == "-XX:HeapDumpPath=heapdump")
+        );
         assert!(!plan.jvm_args.iter().any(|arg| arg.contains("Windows 10")));
         assert!(plan.jvm_args.iter().any(|arg| arg == "-Xss1M"));
     }
@@ -826,10 +864,11 @@ mod tests {
         spec.width = Some(854);
         spec.height = Some(480);
         let plan = build_launch_plan(spec).unwrap();
-        assert!(plan
-            .jvm_args
-            .iter()
-            .any(|arg| arg == "-XstartOnFirstThread"));
+        assert!(
+            plan.jvm_args
+                .iter()
+                .any(|arg| arg == "-XstartOnFirstThread")
+        );
         assert!(!plan.jvm_args.iter().any(|arg| arg == "-Xss1M"));
         assert!(plan.game_args.iter().any(|arg| arg == "--demo"));
         let width = plan
@@ -867,10 +906,11 @@ mod tests {
             PathBuf::from("/resources").display().to_string()
         );
         let natives = PathBuf::from("/natives").display().to_string();
-        assert!(plan
-            .jvm_args
-            .iter()
-            .any(|arg| arg == &format!("-Djava.library.path={natives}")));
+        assert!(
+            plan.jvm_args
+                .iter()
+                .any(|arg| arg == &format!("-Djava.library.path={natives}"))
+        );
         assert!(plan.jvm_args.iter().any(|arg| arg == "-cp"));
     }
 
@@ -907,5 +947,21 @@ mod tests {
         assert!(!shown.contains("secret-token"));
         assert!(shown.contains("***"));
         assert!(plan.game_args.iter().any(|arg| arg == "secret-token"));
+    }
+
+    #[test]
+    fn jvm_overrides_insert_a_minimum_heap_and_extra_arguments() {
+        let spec = spec_for(
+            MODERN,
+            OsInfo::new(OsName::Linux, Arch::X86_64, ""),
+            FeatureSet::default(),
+        );
+        let mut plan = build_launch_plan(spec).unwrap();
+        apply_jvm_overrides(&mut plan, "512M", "-Dexample=1");
+        assert_eq!(plan.jvm_args[0], "-Xms512M");
+        assert!(plan.jvm_args.iter().any(|arg| arg == "-Dexample=1"));
+        let before = plan.jvm_args.len();
+        apply_jvm_overrides(&mut plan, "", "");
+        assert_eq!(plan.jvm_args.len(), before);
     }
 }

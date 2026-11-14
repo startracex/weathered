@@ -9,7 +9,7 @@ use crate::download::RemoteFile;
 use crate::error::{Error, IoResultExt, Result};
 use crate::paths::{portable, safe_rel_path};
 use crate::platform::{Arch, OsInfo};
-use crate::rules::{rules_allow, FeatureSet};
+use crate::rules::{FeatureSet, rules_allow};
 use crate::version::Library;
 
 const LIBRARIES_BASE: &str = "https://libraries.minecraft.net/";
@@ -75,7 +75,7 @@ pub fn parse_maven(name: &str) -> Result<MavenCoord> {
         _ => {
             return Err(Error::Maven {
                 name: name.to_string(),
-            })
+            });
         }
     };
     if group.is_empty() || artifact.is_empty() || version.is_empty() {
@@ -149,13 +149,13 @@ pub fn plan_libraries(
                     &library.name,
                 )?;
                 classpath.push(dest.clone());
-                if let Some(classifier) = coord.classifier.as_deref() {
-                    if native_matches(classifier, os) {
-                        natives.push(NativeJar {
-                            jar: dest,
-                            exclude: excludes(library),
-                        });
-                    }
+                if let Some(classifier) = coord.classifier.as_deref()
+                    && native_matches(classifier, os)
+                {
+                    natives.push(NativeJar {
+                        jar: dest,
+                        exclude: excludes(library),
+                    });
                 }
             }
         } else {
@@ -169,8 +169,9 @@ pub fn plan_libraries(
                 RemoteFile {
                     url,
                     dest: dest.clone(),
-                    sha1: None,
-                    size: None,
+                    sha1: library.sha1.clone(),
+                    sha512: library.sha512.clone(),
+                    size: library.size,
                     executable: false,
                 },
             );
@@ -303,6 +304,7 @@ fn stage_download(
             url,
             dest,
             sha1: artifact.sha1.clone(),
+            sha512: None,
             size: artifact.size,
             executable,
         },
@@ -513,10 +515,11 @@ mod tests {
         assert_eq!(plan.natives.len(), 1);
         assert!(portable(&plan.natives[0].jar).ends_with("natives-linux.jar"));
         assert_eq!(plan.natives[0].exclude, vec!["META-INF/".to_string()]);
-        assert!(plan
-            .downloads
-            .iter()
-            .any(|file| file.sha1.as_deref() == Some("linux")));
+        assert!(
+            plan.downloads
+                .iter()
+                .any(|file| file.sha1.as_deref() == Some("linux"))
+        );
         assert!(!plan.downloads.iter().any(|file| file.url.contains("objc")));
 
         let windows = plan_libraries(
@@ -628,13 +631,68 @@ mod tests {
         .unwrap();
         assert_eq!(mac.natives.len(), 1);
         assert!(portable(&mac.natives[0].jar).contains("natives-macos-arm64"));
-        assert!(mac
-            .classpath
+        assert!(
+            mac.classpath
+                .iter()
+                .any(|path| portable(path).contains("natives-macos.jar"))
+        );
+        assert!(
+            mac.classpath
+                .iter()
+                .any(|path| portable(path).contains("natives-macos-arm64.jar"))
+        );
+    }
+
+    #[test]
+    fn fabric_style_library_keeps_sha1_size_and_maven_url() {
+        let version = parse_version(
+            br#"{
+              "id": "fabric-loader-0.20.1-26.3",
+              "libraries": [
+                {
+                  "name": "net.fabricmc:fabric-loader:0.20.1",
+                  "url": "https://maven.fabricmc.net/"
+                },
+                {
+                  "name": "org.ow2.asm:asm:9.8",
+                  "url": "https://maven.fabricmc.net/",
+                  "sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "sha512": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                  "size": 12345
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+        let plan = plan_libraries(
+            version.libraries.as_deref().unwrap(),
+            Path::new("libraries"),
+            &os(OsName::Linux, Arch::X86_64),
+            &FeatureSet::default(),
+        )
+        .unwrap();
+        let loader = plan
+            .downloads
             .iter()
-            .any(|path| portable(path).contains("natives-macos.jar")));
-        assert!(mac
-            .classpath
+            .find(|file| file.url.contains("fabric-loader"))
+            .unwrap();
+        assert_eq!(
+            loader.url,
+            "https://maven.fabricmc.net/net/fabricmc/fabric-loader/0.20.1/fabric-loader-0.20.1.jar"
+        );
+        assert!(loader.sha1.is_none());
+        assert!(loader.size.is_none());
+        let asm = plan
+            .downloads
             .iter()
-            .any(|path| portable(path).contains("natives-macos-arm64.jar")));
+            .find(|file| file.url.contains("/asm/"))
+            .unwrap();
+        assert_eq!(
+            asm.sha1.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(asm.sha512.as_deref().map(str::len), Some(128));
+        assert_eq!(asm.size, Some(12345));
+        assert!(asm.url.ends_with("org/ow2/asm/asm/9.8/asm-9.8.jar"));
     }
 }
