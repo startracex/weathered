@@ -4,7 +4,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 
 use super::model::{App, Category, Field, Focus, Page, SettingKind, contains, layout, percent};
 use super::theme::{self, ACCENT, BG, BORDER, LAUNCH, ON_ACCENT, TEXT};
@@ -32,6 +32,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Page::Settings => draw_settings(frame, app),
         Page::More => draw_more(frame, app),
         Page::Edit => draw_edit(frame, app),
+        Page::Loaders => draw_loaders(frame, app),
     }
     draw_footer(frame, app);
     if app.screen.cancel.width > 0 {
@@ -45,8 +46,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             app.screen.cancel,
         );
     }
-    if app.picker.is_some() {
-        draw_picker(frame, app);
+    if app
+        .editing
+        .as_ref()
+        .is_some_and(|editor| matches!(editor.field, Field::InstanceName | Field::PackPath))
+    {
+        draw_prompt(frame, app);
     }
     if app.login.is_some() {
         draw_login(frame, app);
@@ -112,7 +117,9 @@ fn draw_nav(frame: &mut Frame, app: &App) {
         let Some(rect) = app.screen.tabs.get(index).copied() else {
             continue;
         };
-        let active = app.page == page || (app.page == Page::Edit && page == Page::Launch);
+        let active = app.page == page
+            || (app.page == Page::Edit && page == Page::Launch)
+            || (app.page == Page::Loaders && page == Page::Download);
         let hovered = hot(app, rect) && !active;
         let style = if active {
             theme::selected()
@@ -133,28 +140,27 @@ fn key_hints(app: &App) -> String {
     };
     let actions = match app.page {
         Page::Launch => "Enter launch  O sort  N new",
-        Page::Download => "Enter install  O sort",
+        Page::Download => "Enter install  O sort  R refresh",
+        Page::Loaders => "Enter download  B unstable  R refresh  Esc back",
         Page::Settings => "Enter edit",
         Page::Edit => "Enter change  Esc back",
         Page::More => "Enter refresh",
     };
-    let ctrl = if app.page == Page::Download && app.picker.is_none() {
-        "Ctrl+F search  Ctrl+C quit"
-    } else {
-        "Ctrl+C quit"
+    let ctrl = match app.page {
+        Page::Download => "Ctrl+F search  Ctrl+R refresh  Ctrl+C quit",
+        Page::Loaders => "Ctrl+R refresh  Ctrl+C quit",
+        _ => "Ctrl+C quit",
     };
     if app.editing.is_some() {
         return format!("{movement}  Enter save  Esc cancel  {ctrl}");
     }
-    if app.picker.is_some() {
-        return format!("{movement}  Enter choose  B unstable  Esc close  Ctrl+C quit");
+    if app.search_open && app.page == Page::Download {
+        return format!("{movement}  Esc clear  {ctrl}");
     }
-    if !app.jobs.is_empty() {
-        format!("{movement}  {actions}  Esc cancel  {ctrl}")
-    } else if app.search_open {
-        format!("{movement}  Esc clear  {ctrl}")
-    } else {
+    if app.page == Page::Loaders || app.jobs.is_empty() {
         format!("{movement}  {actions}  {ctrl}")
+    } else {
+        format!("{movement}  {actions}  Esc cancel  {ctrl}")
     }
 }
 
@@ -419,68 +425,176 @@ fn inherit_label(override_value: &str, global: &str, fallback: &str) -> String {
     }
 }
 
-fn draw_picker(frame: &mut Frame, app: &App) {
-    let Some(picker) = &app.picker else {
-        return;
-    };
-    let area = app.screen.body;
-    let width = area.width.clamp(24, 56);
-    let height = area.height.clamp(8, 16);
-    let rect = Rect::new(
-        area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    );
-    frame.render_widget(panel(&format!(" {} ", picker.loader)), rect);
-    let inner = inner_of(rect);
-    let toggle = if picker.show_unstable {
+fn draw_loaders(frame: &mut Frame, app: &App) {
+    let kinds = ["fabric", "quilt", "forge", "neoforge"];
+    let labels = ["Fabric", "Quilt", "Forge", "NeoForge"];
+    let current = app
+        .picker
+        .as_ref()
+        .map(|picker| picker.loader.clone())
+        .unwrap_or_else(|| "fabric".into());
+    for (index, label) in labels.iter().enumerate() {
+        let Some(rect) = app.screen.download_tabs.get(index).copied() else {
+            continue;
+        };
+        let active = current == kinds[index];
+        let style = if active {
+            theme::selected()
+        } else if hot(app, rect) {
+            theme::hover()
+        } else {
+            theme::base()
+        };
+        frame.render_widget(Paragraph::new(format!(" {label} ")).style(style), rect);
+    }
+    let show_unstable = app
+        .picker
+        .as_ref()
+        .is_some_and(|picker| picker.show_unstable);
+    let toggle = if show_unstable {
         "[x] unstable"
     } else {
         "[ ] unstable"
     };
-    let heading = if picker.loading {
-        "Loading versions..."
-    } else if !picker.error.is_empty() {
-        picker.error.as_str()
-    } else {
-        toggle
-    };
-    frame.render_widget(
-        Paragraph::new(fit(heading, inner.width as usize)).style(theme::muted().bg(theme::SURFACE)),
-        Rect::new(inner.x, inner.y, inner.width, 1),
-    );
-    let visible: Vec<_> = picker
-        .builds
-        .iter()
-        .filter(|build| picker.show_unstable || build.stable)
-        .collect();
-    for (index, build) in visible
-        .iter()
-        .enumerate()
-        .take(inner.height.saturating_sub(1) as usize)
-    {
-        let y = inner.y.saturating_add(1 + index as u16);
-        let selected = index == picker.selected;
-        let mark = if build.recommended { "*" } else { " " };
-        let label = format!(" {mark} {}", build.version);
-        let style = if selected {
+    let toggle_w = toggle.len() as u16;
+    if app.screen.body.width > toggle_w.saturating_add(2) {
+        let toggle_rect = Rect::new(
+            app.screen.body.x.saturating_add(
+                app.screen
+                    .body
+                    .width
+                    .saturating_sub(toggle_w)
+                    .saturating_sub(1),
+            ),
+            app.screen.body.y,
+            toggle_w,
+            1,
+        );
+        let tabs_end = app
+            .screen
+            .download_tabs
+            .last()
+            .map(|rect| rect.x.saturating_add(rect.width))
+            .unwrap_or(0);
+        if toggle_rect.x > tabs_end {
+            frame.render_widget(Paragraph::new(toggle).style(theme::muted()), toggle_rect);
+        }
+    }
+    let outer = expand(app.screen.download_list);
+    if outer.height > 0 {
+        let title = app
+            .picker
+            .as_ref()
+            .map(|picker| format!(" {} · {} ", picker.loader, picker.game_version))
+            .unwrap_or_else(|| " Loaders ".into());
+        frame.render_widget(panel(&title), outer);
+    }
+    let visible = app.picker_visible();
+    let scroll = app.loader_scroll(app.screen.download_rows.len().max(1));
+    let selected = app
+        .picker
+        .as_ref()
+        .map(|picker| picker.selected)
+        .unwrap_or(0);
+    if visible.is_empty() {
+        let message = match app.picker.as_ref() {
+            Some(picker) if picker.loading => "  Loading loader builds...".to_string(),
+            Some(picker) if !picker.error.is_empty() => picker.error.clone(),
+            _ => "  No builds for this version.".to_string(),
+        };
+        frame.render_widget(
+            Paragraph::new(message).style(theme::muted().bg(theme::SURFACE)),
+            app.screen.download_list,
+        );
+        return;
+    }
+    for (offset, rect) in app.screen.download_rows.iter().copied().enumerate() {
+        let index = scroll + offset;
+        let Some(build) = visible.get(index) else {
+            continue;
+        };
+        let is_selected = index == selected;
+        let style = if is_selected {
             theme::selected()
+        } else if build.recommended {
+            theme::title()
+        } else if hot(app, rect) && !button_hot(app, offset) {
+            theme::hover()
         } else {
             theme::surface()
         };
+        let mark = if build.recommended { "*" } else { " " };
+        let button = app
+            .screen
+            .install_buttons
+            .get(offset)
+            .copied()
+            .unwrap_or_default();
+        let reserved = if button.width > 0 {
+            rect.width.saturating_sub(button.x.saturating_sub(rect.x))
+        } else {
+            0
+        };
+        let label = format!(" {mark} {}", build.version);
         frame.render_widget(
-            Paragraph::new(fit(&label, inner.width as usize)).style(style),
-            Rect::new(inner.x, y, inner.width, 1),
+            Paragraph::new(fit(&label, rect.width.saturating_sub(reserved) as usize)).style(style),
+            rect,
+        );
+        let identity = app
+            .picker
+            .as_ref()
+            .map(|picker| (picker.loader.clone(), picker.game_version.clone()));
+        let stored = identity.is_some_and(|(loader, game)| {
+            app.loader_item(&loader, &game, &build.version).is_some()
+        });
+        let (idle, focused_label) = if stored {
+            ("[Create instance]", ">Create instance<")
+        } else {
+            ("[Download]", ">Download<")
+        };
+        paint_row_button(
+            frame,
+            button,
+            idle,
+            focused_label,
+            button_face(
+                app.focus == Focus::LoaderButton && is_selected,
+                hot(app, button),
+            ),
+        );
+    }
+}
+
+fn draw_prompt(frame: &mut Frame, app: &App) {
+    let Some(editor) = &app.editing else {
+        return;
+    };
+    let title = if editor.field == Field::InstanceName {
+        "Instance name"
+    } else {
+        "Modpack path"
+    };
+    frame.render_widget(Clear, app.screen.modal);
+    frame.render_widget(panel(title), app.screen.modal);
+    let inner = inner_of(app.screen.modal);
+    if inner.height == 0 {
+        return;
+    }
+    let value = with_cursor(&editor.buffer, editor.cursor);
+    frame.render_widget(
+        Paragraph::new(fit(&value, inner.width as usize)).style(theme::surface()),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+    if inner.height > 1 {
+        frame.render_widget(
+            Paragraph::new("Enter save  Esc cancel").style(theme::muted().bg(theme::SURFACE)),
+            Rect::new(inner.x, inner.y.saturating_add(1), inner.width, 1),
         );
     }
 }
 
 fn draw_creator(frame: &mut Frame, app: &App) {
-    let title = match app.creator {
-        Some(super::model::CreatorStep::Pick) => "Pick downloaded",
-        _ => "New instance",
-    };
+    let title = "New instance";
     let heading = Rect::new(
         app.screen.version_list.x,
         app.screen.version_list.y,
@@ -498,18 +612,9 @@ fn draw_creator(frame: &mut Frame, app: &App) {
         let selected = offset == app.creator_selected;
         let style = row_style(selected, hot(app, rect));
         let mark = if selected { "▸" } else { " " };
-        let label = match app.creator {
-            Some(super::model::CreatorStep::Source) => match offset {
-                0 => "From downloaded",
-                1 => "Download new",
-                _ => "Import modpack",
-            },
-            Some(super::model::CreatorStep::Pick) => app
-                .catalog_items
-                .get(offset)
-                .map(|item| item.name.as_str())
-                .unwrap_or(""),
-            None => "",
+        let label = match offset {
+            0 => "Download",
+            _ => "Import modpack",
         };
         frame.render_widget(
             Paragraph::new(fit(&format!(" {mark} {label}"), rect.width as usize)).style(style),
@@ -581,17 +686,9 @@ fn draw_account_card(frame: &mut Frame, app: &App) {
 }
 
 fn draw_download(frame: &mut Frame, app: &App) {
-    for (index, category) in [
-        Category::Release,
-        Category::Snapshot,
-        Category::Old,
-        Category::Fabric,
-        Category::Quilt,
-        Category::Forge,
-        Category::NeoForge,
-    ]
-    .into_iter()
-    .enumerate()
+    for (index, category) in [Category::Release, Category::Snapshot, Category::Old]
+        .into_iter()
+        .enumerate()
     {
         let Some(rect) = app.screen.download_tabs.get(index).copied() else {
             continue;
@@ -643,43 +740,69 @@ fn draw_download(frame: &mut Frame, app: &App) {
             continue;
         };
         let selected = index == app.download_selected;
-        let style = row_style(selected, hot(app, rect) && !button_hot(app, offset));
+        let style = row_style(
+            selected,
+            hot(app, rect) && !download_button_hot(app, offset),
+        );
         let status = if app.in_store(&entry.id) {
             "in store"
         } else {
             "not stored"
         };
         let mark = if selected { "▸" } else { " " };
+        let action = app
+            .screen
+            .install_buttons
+            .get(offset)
+            .copied()
+            .unwrap_or_default();
+        let loaders = app
+            .screen
+            .loader_buttons
+            .get(offset)
+            .copied()
+            .unwrap_or_default();
+        let reserved = if action.width > 0 {
+            rect.width.saturating_sub(action.x.saturating_sub(rect.x))
+        } else {
+            0
+        };
         let label = format!(" {mark} {:<20} {:<12} {}", entry.id, entry.released, status);
         frame.render_widget(
-            Paragraph::new(fit(&label, rect.width as usize)).style(style),
+            Paragraph::new(fit(&label, rect.width.saturating_sub(reserved) as usize)).style(style),
             rect,
         );
-        if let Some(button) = app.screen.install_buttons.get(offset).copied() {
-            let busy = app
-                .jobs
-                .iter()
-                .any(|job| !job.launching && job.version == entry.id);
-            let caption = if busy {
-                "wait"
-            } else if app.in_store(&entry.id) {
-                "reinstall"
-            } else {
-                "install"
-            };
-            let button_style = if hot(app, button) && !busy {
-                theme::selected()
-            } else if busy {
-                theme::disabled_button()
-            } else {
-                Style::default().fg(ON_ACCENT).bg(ACCENT)
-            };
-            frame.render_widget(
-                Paragraph::new(fit(&format!(" {caption} "), button.width as usize))
-                    .style(button_style),
-                button,
-            );
-        }
+        let busy = app
+            .jobs
+            .iter()
+            .any(|job| !job.launching && job.version == entry.id);
+        let stored = app.vanilla_item(&entry.id).is_some();
+        let (idle, focused_label) = if busy {
+            ("[wait]", "[wait]")
+        } else if stored {
+            ("[Create instance]", ">Create instance<")
+        } else {
+            ("[Install]", ">Install<")
+        };
+        let face = if busy {
+            ButtonFace::Idle
+        } else {
+            button_face(
+                app.focus == Focus::DownloadAction && selected,
+                hot(app, action),
+            )
+        };
+        paint_row_button(frame, action, idle, focused_label, face);
+        paint_row_button(
+            frame,
+            loaders,
+            "[Loaders]",
+            ">Loaders<",
+            button_face(
+                app.focus == Focus::DownloadLoaders && selected,
+                hot(app, loaders),
+            ),
+        );
     }
     if !app.catalog_ready {
         frame.render_widget(
@@ -828,6 +951,7 @@ fn draw_login(frame: &mut Frame, app: &App) {
     let Some(login) = &app.login else {
         return;
     };
+    frame.render_widget(Clear, app.screen.modal);
     frame.render_widget(panel("Microsoft sign-in"), app.screen.modal);
     let inner = inner_of(app.screen.modal);
     let lines = vec![
@@ -914,6 +1038,16 @@ fn button_hot(app: &App, offset: usize) -> bool {
         .get(offset)
         .copied()
         .is_some_and(|rect| hot(app, rect))
+}
+
+fn download_button_hot(app: &App, offset: usize) -> bool {
+    button_hot(app, offset)
+        || app
+            .screen
+            .loader_buttons
+            .get(offset)
+            .copied()
+            .is_some_and(|rect| hot(app, rect))
 }
 
 fn inner_of(rect: Rect) -> Rect {
@@ -1058,7 +1192,14 @@ mod tests {
         let text = frame_text(terminal.backend().buffer());
         assert!(text.contains("Release"), "{text}");
         assert!(text.contains("Snapshot"), "{text}");
-        assert!(text.contains("install"), "{text}");
+        assert!(text.contains("Old"), "{text}");
+        assert!(!text.contains("Fabric"), "{text}");
+        assert!(
+            text.contains("[Create instance]") || text.contains(">Create instance<"),
+            "{text}"
+        );
+        assert!(text.contains("[Loaders]"), "{text}");
+        assert!(text.contains("[wait]"), "{text}");
         assert!(text.contains("1.21.1"), "{text}");
         assert!(text.contains("assets 30%"), "{text}");
         assert!(text.contains('█'), "{text}");

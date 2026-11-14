@@ -150,7 +150,7 @@ fn loader_nodes(value: &serde_json::Value) -> Vec<&serde_json::Value> {
 }
 
 /// One loader build the user can pick.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoaderBuild {
     /// Version passed to the downloader. Forge uses `1.21.1-52.0.28`.
     pub version: String,

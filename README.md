@@ -14,8 +14,8 @@ Synergies AB.
 
 - Lists releases and snapshots from Mojang's version manifest (`release` and `snapshot` select the latest of each).
 - Stores the client jar, libraries, assets, loader files, and modpack files once, keyed by SHA-512.
-- Downloads vanilla, Fabric, and Quilt profiles into that store. Forge and NeoForge installers can be stored, but they are not launched yet.
-- Creates isolated instances from a downloaded profile, from a new download, or from a Modrinth `.mrpack`.
+- Downloads vanilla, Fabric, Quilt, Forge, and NeoForge profiles into that store, and launches them.
+- Creates a vanilla instance from a stored Minecraft version, a loader instance from a stored loader build, or an instance from a Modrinth `.mrpack`.
 - Downloads run concurrently, up to a configurable limit shared by every install, and report each job plus one overall progress bar.
 - Applies library and argument rules for Windows, macOS, and Linux, including architecture and feature flags.
 - Merges `inheritsFrom` versions: child libraries are prepended, and argument lists are concatenated.
@@ -64,9 +64,9 @@ weathered accounts list
 
 ### Instances
 
-An instance is a name plus a Minecraft version, an optional loader, and its own game directory. Create one from a profile that is already in the store, or let `instance create` download it first. `instance import` reads a Modrinth `.mrpack`: it downloads the Minecraft version and Fabric or Quilt loader, stores each mod once, then copies the mods and `overrides/` into the new instance.
+An instance is a name plus a Minecraft version, an optional loader, and its own game directory. `instance create` uses a profile that is already in the store, or downloads it first. `instance import` reads a Modrinth `.mrpack`: it downloads the Minecraft version and Fabric or Quilt loader, stores each mod once, then copies the mods and `overrides/` into the new instance.
 
-The Launch page lists those instances. **New instance** offers the same three sources: already downloaded, download now, or import a `.mrpack`. Press `n` on the Launch page to open that flow. Launch uses the selected instance.
+The Launch page lists those instances. **New instance** offers Download, which opens the Download page, or import a `.mrpack`. Press `n` on the Launch page to open that flow. The Download page installs a vanilla version or creates a vanilla instance from one that is already stored. Its Loaders page does the same for Fabric, Quilt, Forge, and NeoForge. Launch uses the selected instance.
 
 Libraries are not copied into the instance. The classpath points at the shared store. The client jar, version JSON, mods, configs, and pack overrides are copied, so the instance keeps its own copies of those files. Asset bytes stay in the store and are hard-linked (or copied, when a link is not possible) into a shared `assets/objects/<sha1>` tree, because the game looks assets up by SHA-1.
 
@@ -95,13 +95,15 @@ If the data directory already contains `versions/<id>/<id>.jar` from an earlier 
 
 `weathered` with no subcommand opens the full-screen UI. `weathered tui` does the same thing.
 
-The layout follows Plain Craft Launcher: a top bar for Launch, Download, Settings, and More; a launch page with the account on the left and the instance list on the right; a download page split into release, snapshot, old, Fabric, Quilt, Forge, and NeoForge; and a settings page for the data directory, Java, memory, JVM arguments, offline username, and Microsoft sign-in. The screen is dark, with a weathered-copper teal for the selection and a greener Launch control.
+The layout follows Plain Craft Launcher: a top bar for Launch, Download, Settings, and More; a launch page with the account on the left and the instance list on the right; a download page split into release, snapshot, and old versions; and a settings page for the data directory, Java, memory, JVM arguments, offline username, and Microsoft sign-in. The screen is dark, with a weathered-copper teal for the selection and a black-and-gold focus on the row buttons.
 
 The footer lists `[Q][E] pages` with `[W][A][S][D] move`, then that page's actions, then the Ctrl combinations. Letter shortcuts ignore Caps Lock. On an instance row, left and right switch only between Launch and Edit. The focused button is the gold label, such as `>Launch<`, and a newly selected row starts on Launch. Clicking the name selects that row. Clicking `[Launch]` starts the game, and clicking `[Edit]` opens the editor. At startup the default instance's Launch button is focused, so Enter starts the game. Several versions can download at once, sharing one file-concurrency limit. Esc cancels the latest job. A download does not block launching a different instance. The path in the top bar opens the data directory. Tab reaches it and Enter opens it. Text fields still accept `q`, `e`, `w`, `s`, `a`, and `d` as letters, including their case. While a field is open, the characters you type stay on screen with a cursor. Enter saves the field and Esc discards it. Ctrl+C quits.
 
-The search box on Download stays hidden until Ctrl+F, and it is the only extra row between the category tabs and the version list. The first Esc clears that search. A later Esc cancels a download, closes the loader picker, or leaves the edit page. `O` cycles the instance list between name, creation time, and last played, and cycles the download list between newest, oldest, version name, and stored-first. The version panel title shows the current download order. Both choices are saved. The default instance stays pinned at the top.
+The search box on Download stays hidden until Ctrl+F, and it is the only extra row between the category tabs and the version list. The first Esc clears that search. A later Esc cancels a download or leaves the edit page. `O` cycles the instance list between name, creation time, and last played, and cycles the download list between newest, oldest, version name, and stored-first. The version panel title shows the current download order. Both choices are saved. The default instance stays pinned at the top. `R` and Ctrl+R refresh the version list. The list is cached in memory for the session and under `<data>/cache/` for an hour, shown immediately, and refreshed in the background. A failed refresh keeps the cached list so the page still works offline.
 
-Each instance row ends with Launch and Edit. The focused one is drawn in gold, and the row name is not a separate stop. Clicking the name selects the row. Clicking Launch starts the game. Edit is its own page, with the account panel left off. It renames the instance, edits the description, sets or clears the default, deletes the instance, and sets Java, minimum memory, maximum memory, and JVM arguments. An empty override shows `inherit global` and uses the settings page value. Clearing the field returns it to that inherited value. Open folder opens the instance game directory in the system file manager. Actions run immediately. Delete removes only that instance directory. The shared store stays. Game output is written to `<data>/logs/launch-<timestamp>.log`. If the game crashes, the status line gives that path and any new file in the instance `crash-reports` directory. Fabric, Quilt, Forge, and NeoForge installs open a loader-version list first. The newest stable or recommended build is selected. `B` shows unstable builds.
+Each instance row ends with Launch and Edit. The focused one is drawn in gold, and the row name is not a separate stop. Clicking the name selects the row. Clicking Launch starts the game. Edit is its own page, with the account panel left off. It renames the instance, edits the description, sets or clears the default, deletes the instance, and sets Java, minimum memory, maximum memory, and JVM arguments. An empty override shows `inherit global` and uses the settings page value. Clearing the field returns it to that inherited value. Open folder opens the instance game directory in the system file manager. Actions run immediately. Delete removes only that instance directory. The shared store stays. Game output is written to `<data>/logs/launch-<timestamp>.log`. If the game crashes, the status line gives that path and any new file in the instance `crash-reports` directory.
+
+Each download row ends with the same kind of button. `[Install]` stores a vanilla version that is not downloaded yet. When it is already in the store the button becomes `[Create instance]` and asks for a name, defaulting to the version id. `[Loaders]` opens a page for that Minecraft version. That page lists Fabric, Quilt, Forge, and NeoForge builds. `A` and `D` switch loader, `B` shows unstable builds, and the recommended or newest stable build is highlighted. `[Download]` stores a build. `[Create instance]` on a stored build makes an instance that includes the loader. Esc returns to the version list at the same row. The Microsoft sign-in dialog is cleared before it is drawn and sized to its text.
 
 ```sh
 weathered --game-dir ~/.local/share/weathered
@@ -126,8 +128,8 @@ Download progress stays on screen while files are fetched:
 ```text
   Release   Snapshot   Old
 ╭ Versions · newest ─────────────────────────────────────────────────────────────╮
-│ ▸ 1.21.1               2024-08-08   in store                        reinstall  │
-│   1.20.4               2023-12-07   not stored                      install    │
+│ ▸ 1.21.1               2024-08-08   in store   [Create instance] [Loaders] │
+│   1.20.4               2023-12-07   not stored [Install]          [Loaders] │
 ╰────────────────────────────────────────────────────────────────────────────────╯
   assets 30%  icons/icon.png
  █████████████████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
@@ -268,7 +270,7 @@ GitHub Actions runs the same three commands on Linux, macOS, and Windows.
 ## Known gaps
 
 - There is a terminal UI, not a desktop window. The game itself still opens in its own window.
-- Fabric, Quilt, Forge 1.13+, and NeoForge can be downloaded and launched. The terminal asks which loader build to use and can show unstable builds. Forge builds from before 1.13 use a different installer and are refused with an explanation. LiteLoader and OptiFine are not installed.
+- Fabric, Quilt, Forge 1.13+, and NeoForge can be downloaded and launched from the Loaders page. `B` shows unstable builds. Forge builds from before 1.13 use a different installer and are refused with an explanation. LiteLoader and OptiFine are not installed.
 - CurseForge modpacks are not imported. A CurseForge zip names project and file ids, and downloading them needs an API key this launcher does not ship. Modrinth `.mrpack` files are supported for vanilla, Fabric, and Quilt. Forge and NeoForge packs are still refused because those installers need the processor step, which the pack import does not run on its own.
 - LiteLoader and OptiFine are not installed. `inheritsFrom` is implemented, so a version JSON that is already on disk can still be launched.
 - Microsoft login requires your own Azure client id, and Xbox Live may reject it.

@@ -350,6 +350,75 @@ pub async fn list_loader_builds(
     }
 }
 
+/// `<data>/cache/loaders/<loader>-<game>.json`.
+pub fn loader_cache_path(layout: &DataLayout, loader: &str, game: &str) -> std::path::PathBuf {
+    let token = |value: &str| {
+        value
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_' {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+    };
+    layout
+        .cache_dir()
+        .join("loaders")
+        .join(format!("{}-{}.json", token(loader), token(game)))
+}
+
+/// Loader builds previously written by [`list_loader_builds_cached`].
+pub fn read_loader_cache(path: &std::path::Path) -> Option<(i64, Vec<catalog::LoaderBuild>)> {
+    let (saved, bytes) = crate::cache::read(path)?;
+    let builds = serde_json::from_slice(&bytes).ok()?;
+    Some((saved, builds))
+}
+
+/// Loader builds from `<data>/cache`, refreshed from the network when stale.
+///
+/// A fresh file is returned without a request. A failed request returns the
+/// stale file when one exists.
+pub async fn list_loader_builds_cached(
+    client: &reqwest::Client,
+    loader: Loader,
+    game: &str,
+    cache_path: &std::path::Path,
+    force: bool,
+    cancel: &CancelFlag,
+    progress: &ProgressSink,
+) -> Result<Vec<catalog::LoaderBuild>> {
+    let cached = crate::cache::read(cache_path).and_then(|(saved, bytes)| {
+        let builds = serde_json::from_slice::<Vec<catalog::LoaderBuild>>(&bytes).ok()?;
+        Some((saved, builds))
+    });
+    if !force
+        && let Some((saved, builds)) = cached.clone()
+        && crate::cache::is_fresh(saved, crate::cache::FRESH_SECS)
+    {
+        return Ok(builds);
+    }
+    match list_loader_builds(client, loader, game, cancel, progress).await {
+        Ok(builds) => {
+            if let Ok(bytes) = serde_json::to_vec(&builds) {
+                let _ = crate::cache::write(cache_path, &bytes);
+            }
+            Ok(builds)
+        }
+        Err(err) => {
+            if let Some((_, builds)) = cached
+                && !builds.is_empty()
+            {
+                Ok(builds)
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
 async fn download_installer(
     client: &reqwest::Client,
     layout: &DataLayout,

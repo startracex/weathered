@@ -77,10 +77,17 @@ pub async fn run(game_dir: Option<PathBuf>) -> Result<i32> {
     app.sync_profiles_from_disk();
     app.reload_installed();
     app.reload_local();
-    app.note("Loading version list...", false);
-
+    app.load_cached_catalog();
+    if app.catalog_ready {
+        app.note(format!("{} versions", app.catalog.len()), false);
+    } else {
+        app.note("Loading version list...", false);
+    }
     let (tx, mut rx) = mpsc::channel::<Msg>(512);
-    spawn_catalog(tx.clone(), app.game_dir.clone());
+    if !weathered_core::cache::is_fresh(app.catalog_saved_at, weathered_core::cache::FRESH_SECS) {
+        app.catalog_refreshing = true;
+        spawn_catalog(tx.clone(), app.game_dir.clone(), false);
+    }
     spawn_javas(tx.clone(), app.game_dir.clone());
 
     let mut guard = TerminalGuard::enter()?;
@@ -165,9 +172,42 @@ async fn dispatch(
             }
         }
         Effect::RefreshManifest => {
-            app.catalog_ready = false;
-            app.note("Loading version list...", false);
-            spawn_catalog(tx.clone(), app.game_dir.clone());
+            app.catalog_refreshing = true;
+            if app.catalog_ready {
+                app.note("Refreshing version list...", false);
+            } else {
+                app.note("Loading version list...", false);
+            }
+            spawn_catalog(tx.clone(), app.game_dir.clone(), true);
+        }
+        Effect::RefreshCache { force } => {
+            app.catalog_refreshing = true;
+            if force {
+                app.note("Refreshing version list...", false);
+            } else if !app.catalog_ready {
+                app.note("Loading version list...", false);
+            }
+            spawn_catalog(tx.clone(), app.game_dir.clone(), force);
+            if force
+                && app.page == model::Page::Loaders
+                && let Some(picker) = app.picker.clone()
+            {
+                stop_download(picker_task);
+                let cancel = CancelFlag::new();
+                let handle = spawn_loader_list(
+                    tx.clone(),
+                    app.game_dir.clone(),
+                    picker.game_version,
+                    picker.loader,
+                    true,
+                    cancel.clone(),
+                );
+                *picker_task = Some(DownloadTask {
+                    id: 0,
+                    cancel,
+                    handle,
+                });
+            }
         }
         Effect::Install {
             id,
@@ -193,20 +233,23 @@ async fn dispatch(
         Effect::OpenPicker {
             version,
             loader,
-            create_instance,
+            force,
         } => {
             stop_download(picker_task);
             let cancel = CancelFlag::new();
-            let handle =
-                spawn_loader_list(tx.clone(), version, loader, create_instance, cancel.clone());
+            let handle = spawn_loader_list(
+                tx.clone(),
+                app.game_dir.clone(),
+                version,
+                loader,
+                force,
+                cancel.clone(),
+            );
             *picker_task = Some(DownloadTask {
                 id: 0,
                 cancel,
                 handle,
             });
-        }
-        Effect::ClosePicker => {
-            stop_download(picker_task);
         }
         Effect::DeleteInstance => {
             let layout = DataLayout::new(&app.game_dir);
@@ -300,8 +343,8 @@ async fn dispatch(
                 Err(err) => app.note(err.to_string(), true),
             }
         }
-        Effect::CreateInstance { catalog_id } => {
-            spawn_create(tx.clone(), app.game_dir.clone(), catalog_id);
+        Effect::CreateNamed { catalog_id, name } => {
+            spawn_create(tx.clone(), app.game_dir.clone(), catalog_id, Some(name));
         }
         Effect::ImportPack { id, path } => {
             let cancel = CancelFlag::new();
@@ -402,49 +445,81 @@ struct LaunchParams {
     account_uuid: String,
 }
 
-fn spawn_catalog(tx: mpsc::Sender<Msg>, game_dir: PathBuf) {
+fn spawn_catalog(tx: mpsc::Sender<Msg>, game_dir: PathBuf, force: bool) {
     tokio::spawn(async move {
+        let cache = DataLayout::new(&game_dir)
+            .cache_dir()
+            .join("version_manifest_v2.json");
+        let mut showed = false;
+        if let Some((saved, bytes)) = weathered_core::cache::read(&cache)
+            && let Ok(manifest) = manifest::parse_manifest(&bytes)
+        {
+            showed = true;
+            let _ = tx
+                .send(Msg::Catalog {
+                    entries: model::entries_from_manifest(&manifest),
+                    saved_at: saved,
+                })
+                .await;
+            if !force && weathered_core::cache::is_fresh(saved, weathered_core::cache::FRESH_SECS) {
+                let _ = tx.send(Msg::CatalogSettled).await;
+                return;
+            }
+        }
         let client = match build_http_client() {
             Ok(client) => client,
             Err(err) => {
                 let _ = tx
                     .send(Msg::Notice {
-                        text: err.to_string(),
-                        error: true,
+                        text: if showed {
+                            "Offline. Showing the cached version list.".into()
+                        } else {
+                            err.to_string()
+                        },
+                        error: !showed,
                     })
                     .await;
+                let _ = tx.send(Msg::CatalogSettled).await;
                 return;
             }
         };
-        let paths = GamePaths::new(game_dir);
-        match manifest::fetch_manifest(&client, &paths.manifest_cache()).await {
+        match manifest::fetch_manifest(&client, &cache).await {
             Ok(fetched) => {
-                let entries = fetched
-                    .manifest
-                    .versions
-                    .into_iter()
-                    .map(|entry| model::CatalogEntry {
-                        id: entry.id,
-                        kind: entry.version_type,
-                        released: entry
-                            .release_time
-                            .as_deref()
-                            .and_then(|time| time.split('T').next())
-                            .unwrap_or("-")
-                            .to_string(),
+                if fetched.from_cache {
+                    let _ = tx
+                        .send(Msg::Notice {
+                            text: "Offline. Showing the cached version list.".into(),
+                            error: false,
+                        })
+                        .await;
+                } else if let Ok(bytes) = std::fs::read(&cache) {
+                    let _ = weathered_core::cache::write(&cache, &bytes);
+                }
+                let saved = weathered_core::cache::read(&cache)
+                    .map(|(saved, _)| saved)
+                    .unwrap_or(0);
+                let _ = tx
+                    .send(Msg::Catalog {
+                        entries: model::entries_from_manifest(&fetched.manifest),
+                        saved_at: saved,
                     })
-                    .collect();
-                let _ = tx.send(Msg::Catalog(entries)).await;
+                    .await;
             }
             Err(err) => {
+                let text = if showed {
+                    "Offline. Showing the cached version list.".to_string()
+                } else {
+                    err.to_string()
+                };
                 let _ = tx
                     .send(Msg::Notice {
-                        text: err.to_string(),
-                        error: true,
+                        text,
+                        error: !showed,
                     })
                     .await;
             }
         }
+        let _ = tx.send(Msg::CatalogSettled).await;
     });
 }
 
@@ -504,36 +579,55 @@ fn stop_all_downloads(tasks: &mut Vec<DownloadTask>) {
 
 fn spawn_loader_list(
     tx: mpsc::Sender<Msg>,
+    game_dir: PathBuf,
     version: String,
     loader: String,
-    _create_instance: bool,
+    force: bool,
     cancel: CancelFlag,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let sink = ProgressSink::noop();
+        let cache = content::loader_cache_path(&DataLayout::new(&game_dir), &loader, &version);
         let outcome = async {
             cancel.check()?;
             let client = build_http_client()?;
             let parsed = Loader::parse(&loader)?;
-            content::list_loader_builds(&client, parsed, &version, &cancel, &sink).await
+            content::list_loader_builds_cached(
+                &client, parsed, &version, &cache, force, &cancel, &sink,
+            )
+            .await
         }
         .await;
-        let (builds, error) = match outcome {
-            Ok(builds) => (
-                builds
-                    .into_iter()
-                    .map(|build| model::LoaderBuildRow {
-                        version: build.version,
-                        stable: build.stable,
-                        recommended: build.recommended,
-                    })
-                    .collect(),
-                String::new(),
-            ),
+        let (builds, saved_at, error) = match outcome {
+            Ok(builds) => {
+                let saved = weathered_core::cache::read(&cache)
+                    .map(|(saved, _)| saved)
+                    .unwrap_or_else(weathered_core::cache::unix_now);
+                (
+                    builds
+                        .into_iter()
+                        .map(|build| model::LoaderBuildRow {
+                            version: build.version,
+                            stable: build.stable,
+                            recommended: build.recommended,
+                        })
+                        .collect(),
+                    saved,
+                    String::new(),
+                )
+            }
             Err(err) if err.is_cancelled() => return,
-            Err(err) => (Vec::new(), err.to_string()),
+            Err(err) => (Vec::new(), 0, err.to_string()),
         };
-        let _ = tx.send(Msg::LoaderBuilds { builds, error }).await;
+        let _ = tx
+            .send(Msg::LoaderBuilds {
+                game: version,
+                loader,
+                builds,
+                saved_at,
+                error,
+            })
+            .await;
     })
 }
 
@@ -613,7 +707,12 @@ fn spawn_install(
     })
 }
 
-fn spawn_create(tx: mpsc::Sender<Msg>, game_dir: PathBuf, catalog_id: String) {
+fn spawn_create(
+    tx: mpsc::Sender<Msg>,
+    game_dir: PathBuf,
+    catalog_id: String,
+    name: Option<String>,
+) {
     tokio::task::spawn_blocking(move || {
         let layout = DataLayout::new(&game_dir);
         let item = match weathered_core::catalog::CatalogItem::load(&layout, &catalog_id) {
@@ -626,7 +725,8 @@ fn spawn_create(tx: mpsc::Sender<Msg>, game_dir: PathBuf, catalog_id: String) {
                 return;
             }
         };
-        match instance::create(&layout, &item.name, &catalog_id, "", "") {
+        let name = name.unwrap_or(item.name);
+        match instance::create(&layout, &name, &catalog_id, "", "") {
             Ok(instance) => {
                 let _ = tx.blocking_send(Msg::InstallFinished {
                     id: 0,
@@ -1090,6 +1190,11 @@ fn map_key(key: crossterm::event::KeyEvent) -> Option<Key> {
         && matches!(key.code, KeyCode::Char('f') | KeyCode::Char('F'))
     {
         return Some(Key::CtrlF);
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R'))
+    {
+        return Some(Key::CtrlR);
     }
     Some(match key.code {
         KeyCode::Char(ch) => Key::Char(ch),

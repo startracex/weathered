@@ -47,6 +47,11 @@ impl DataLayout {
         self.instance_dir(id).join("game")
     }
 
+    /// Downloaded manifests and loader lists, with timestamp sidecars.
+    pub fn cache_dir(&self) -> PathBuf {
+        self.root.join("cache")
+    }
+
     /// Version JSON cache used while resolving Mojang documents.
     pub fn meta(&self) -> GamePaths {
         GamePaths::new(self.root.join("meta"))
