@@ -565,9 +565,11 @@ pub async fn prepare_launch(
         return Ok(plan);
     }
     let paths = GamePaths::new(&game_dir);
+    emit_launch(progress, "version", 0, 0, "Reading the version");
     let manifest = empty_manifest();
     let resolved =
         version::load_resolved(client, &paths, &manifest, &instance.version_id, false).await?;
+    emit_launch(progress, "libraries", 0, 0, "Checking libraries");
     let store = Store::open(layout.store_root())?;
     let (classpath, natives) = classpath_from_store(
         &store,
@@ -584,6 +586,7 @@ pub async fn prepare_launch(
             client_jar.display()
         )));
     }
+    emit_launch(progress, "natives", 0, 0, "Extracting natives");
     let natives_dir = paths.natives_dir(&resolved.info.id);
     let natives_for_task = natives.clone();
     let natives_dest = natives_dir.clone();
@@ -605,8 +608,16 @@ pub async fn prepare_launch(
         let store = store.clone();
         let layout = layout.clone();
         let index_id = index_ref.id.clone();
+        let progress = progress.clone();
         tokio::task::spawn_blocking(move || {
-            content::publish_assets(&store, &layout, &index_id, &bytes, &CancelFlag::new())
+            content::publish_assets_with_progress(
+                &store,
+                &layout,
+                &index_id,
+                &bytes,
+                &CancelFlag::new(),
+                &progress,
+            )
         })
         .await
         .map_err(|err| Error::message(format!("could not link assets: {err}")))??;
@@ -621,6 +632,7 @@ pub async fn prepare_launch(
         store.copy_to(&sha512, &paths.log_config(&logging.file.id))?;
     }
 
+    emit_launch(progress, "java", 0, 0, "Finding Java");
     let data_paths = GamePaths::new(&layout.root);
     let (java_install, _) = java::resolve_java(
         client,
@@ -667,6 +679,21 @@ pub async fn prepare_launch(
     })?;
     launch::apply_jvm_overrides(&mut plan, &memory_min, &extra_jvm);
     Ok(plan)
+}
+
+fn emit_launch(
+    progress: &crate::progress::ProgressSink,
+    stage: &str,
+    completed: u64,
+    total: u64,
+    detail: &str,
+) {
+    progress.emit(crate::progress::ProgressEvent {
+        stage: stage.to_string(),
+        completed,
+        total,
+        detail: detail.to_string(),
+    });
 }
 
 fn inherited(instance_value: &str, global: &str) -> String {
@@ -977,6 +1004,79 @@ mod tests {
         assert_eq!(created[0].version_id, "1.2.3");
         assert!(version.join("1.2.3.jar").is_file());
         assert!(migrate_legacy(&layout).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn preparing_an_installed_instance_reports_stages_and_stays_local() {
+        let (root, data) = layout();
+        let store = Store::open(data.store_root()).unwrap();
+        let client_bytes = b"client-jar-bytes";
+        let client_sha1 = crate::download::sha1_hex(client_bytes);
+        store
+            .ingest(client_bytes, Some(&client_sha1), None, None)
+            .unwrap();
+        let json = format!(
+            r#"{{"id":"26.3","type":"release","mainClass":"net.minecraft.client.main.Main","downloads":{{"client":{{"sha1":"{client_sha1}","size":16,"url":"https://example.invalid/client.jar"}}}}}}"#
+        );
+        let stored_json = store.ingest(json.as_bytes(), None, None, None).unwrap();
+        let item = CatalogItem {
+            id: "vanilla-26.3".into(),
+            kind: "vanilla".into(),
+            name: "26.3".into(),
+            game_version: "26.3".into(),
+            loader_version: String::new(),
+            version_id: "26.3".into(),
+            version_json_sha512: stored_json.sha512,
+            parent_json_sha512: String::new(),
+            parent_id: String::new(),
+            client_sha1,
+            launchable: true,
+            note: String::new(),
+        };
+        item.save(&data).unwrap();
+        let instance = create(&data, "26.3", "vanilla-26.3", "", "").unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = events.clone();
+        let sink = crate::progress::ProgressSink::new(move |event| {
+            recorded.lock().unwrap().push(event.stage);
+        });
+        let http = reqwest::Client::builder().build().unwrap();
+        let started = std::time::Instant::now();
+        let result = prepare_launch(
+            &http,
+            &data,
+            &instance.id,
+            LaunchRequest {
+                version_id: instance.id.clone(),
+                session: crate::auth::offline_session("Steve"),
+                java: None,
+                memory: "2G".into(),
+                os: OsInfo::current(),
+                features: FeatureSet::default(),
+                client_id: String::new(),
+                quick_play_path: String::new(),
+                quick_play_singleplayer: String::new(),
+                quick_play_multiplayer: String::new(),
+                quick_play_realms: String::new(),
+                width: None,
+                height: None,
+                java_mode: JavaMode::Skip,
+                concurrency: 1,
+            },
+            &sink,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        let stages = events.lock().unwrap().clone();
+        assert!(stages.iter().any(|stage| stage == "version"), "{stages:?}");
+        assert!(stages.iter().any(|stage| stage == "libraries"));
+        assert!(stages.iter().any(|stage| stage == "java"));
+        assert!(
+            elapsed.as_secs() < 5,
+            "installed-instance prep took {elapsed:?}, stages {stages:?}, result {result:?}"
+        );
+        let _ = result;
         let _ = std::fs::remove_dir_all(root);
     }
 }

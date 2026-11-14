@@ -230,6 +230,8 @@ pub enum Msg {
         /// Unix time of the list that was just applied. Zero means "do not cache".
         saved_at: i64,
         error: String,
+        /// The loader publishes nothing for this Minecraft version.
+        unsupported: bool,
     },
     /// A catalog refresh finished, including one that failed after showing a cache.
     CatalogSettled,
@@ -283,6 +285,8 @@ pub struct LoaderList {
     pub saved_at: i64,
     pub loading: bool,
     pub error: String,
+    /// The metadata says this loader has no builds for the game version.
+    pub unsupported: bool,
 }
 
 /// Fabric, Quilt, Forge, or NeoForge version list.
@@ -295,6 +299,8 @@ pub struct LoaderPicker {
     pub selected: usize,
     pub loading: bool,
     pub error: String,
+    /// Grey tab: this loader does not support the Minecraft version.
+    pub unsupported: bool,
     pub create_instance: bool,
 }
 
@@ -1067,8 +1073,9 @@ impl App {
                 builds,
                 saved_at,
                 error,
+                unsupported,
             } => {
-                self.store_loader_result(&game, &loader, builds, saved_at, error);
+                self.store_loader_result(&game, &loader, builds, saved_at, error, unsupported);
             }
             Msg::Catalog { entries, saved_at } => {
                 self.catalog = entries;
@@ -1741,6 +1748,7 @@ impl App {
             selected: 0,
             loading: true,
             error: String::new(),
+            unsupported: false,
             create_instance: false,
         });
         let loaders = self.request_loader_lists(&version, &Self::loader_kinds(), false);
@@ -1764,8 +1772,8 @@ impl App {
         format!("{loader}\n{game}")
     }
 
-    /// How a loader tab should be labeled: the name, a loading mark, or an error mark.
-    pub fn loader_tab_label(&self, kind: &str, name: &str) -> String {
+    /// `loading`, `unsupported`, `error`, or `ready` for one loader tab.
+    pub fn loader_tab_state(&self, kind: &str) -> &'static str {
         let game = self
             .picker
             .as_ref()
@@ -1773,12 +1781,20 @@ impl App {
             .unwrap_or("");
         let key = Self::loader_cache_key(kind, game);
         match self.loader_cache.get(&key) {
-            Some(list) if list.loading || self.loader_inflight.contains(&key) => {
-                format!("{name}…")
-            }
-            Some(list) if !list.error.is_empty() && list.builds.is_empty() => format!("{name}!"),
-            _ if self.loader_inflight.contains(&key) => format!("{name}…"),
-            _ => name.to_string(),
+            Some(list) if list.loading || self.loader_inflight.contains(&key) => "loading",
+            Some(list) if list.unsupported => "unsupported",
+            Some(list) if !list.error.is_empty() && list.builds.is_empty() => "error",
+            _ if self.loader_inflight.contains(&key) => "loading",
+            _ => "ready",
+        }
+    }
+
+    /// Tab text. A loading tab ends with `...`. Other states keep the plain name.
+    pub fn loader_tab_label(&self, kind: &str, name: &str) -> String {
+        if self.loader_tab_state(kind) == "loading" {
+            format!("{name}...")
+        } else {
+            name.to_string()
         }
     }
 
@@ -1807,6 +1823,7 @@ impl App {
                     saved_at: saved,
                     loading: false,
                     error: String::new(),
+                    unsupported: false,
                 },
             );
         }
@@ -1832,6 +1849,7 @@ impl App {
             entry.loading = true;
             if force {
                 entry.error.clear();
+                entry.unsupported = false;
             }
             need.push((*loader).to_string());
         }
@@ -1842,7 +1860,7 @@ impl App {
         let Some(list) = self.loader_cache.get(key) else {
             return false;
         };
-        if list.builds.is_empty() && !list.error.is_empty() {
+        if list.unsupported || (list.builds.is_empty() && !list.error.is_empty()) {
             return true;
         }
         if list.builds.is_empty() && list.error.is_empty() && list.saved_at > 0 {
@@ -1863,6 +1881,7 @@ impl App {
                 picker.builds.clear();
                 picker.loading = self.loader_inflight.contains(&key);
                 picker.error.clear();
+                picker.unsupported = false;
                 picker.selected = 0;
             }
             return;
@@ -1875,6 +1894,7 @@ impl App {
             picker.builds = list.builds;
             picker.loading = list.loading;
             picker.error = list.error;
+            picker.unsupported = list.unsupported;
             if replaced {
                 picker.selected = 0;
             }
@@ -1891,12 +1911,18 @@ impl App {
         builds: Vec<LoaderBuildRow>,
         saved_at: i64,
         error: String,
+        unsupported: bool,
     ) {
         let key = Self::loader_cache_key(loader, game);
         self.loader_inflight.remove(&key);
         let entry = self.loader_cache.entry(key).or_default();
         let had_builds = !entry.builds.is_empty();
-        if !builds.is_empty() {
+        if unsupported {
+            entry.builds.clear();
+            entry.error.clear();
+            entry.unsupported = true;
+            entry.saved_at = weathered_core::cache::unix_now();
+        } else if !builds.is_empty() {
             entry.builds = builds;
             entry.saved_at = if saved_at > 0 {
                 saved_at
@@ -1904,8 +1930,10 @@ impl App {
                 weathered_core::cache::unix_now()
             };
             entry.error.clear();
+            entry.unsupported = false;
         } else if !had_builds {
             entry.error = error.clone();
+            entry.unsupported = false;
             if error.is_empty() {
                 entry.saved_at = weathered_core::cache::unix_now();
             }
@@ -1961,6 +1989,16 @@ impl App {
         let Some(picker) = self.picker.clone() else {
             return Effect::None;
         };
+        if picker.unsupported {
+            self.note(
+                format!(
+                    "{} does not support Minecraft {}",
+                    picker.loader, picker.game_version
+                ),
+                true,
+            );
+            return Effect::None;
+        }
         let visible = self.picker_visible();
         let Some(build) = visible.get(picker.selected) else {
             return Effect::None;
@@ -2502,11 +2540,13 @@ impl App {
         let mut done = 0u64;
         let mut total = 0u64;
         for job in &self.jobs {
-            if job.launching {
-                continue;
-            }
             done += job.completed;
-            total += job.total.max(job.completed).max(1);
+            let units = if job.total == 0 {
+                job.completed.max(1)
+            } else {
+                job.total.max(job.completed)
+            };
+            total += units;
         }
         (done, total)
     }
@@ -2781,8 +2821,8 @@ pub fn layout(app: &App, area: Rect) -> Screen {
             .saturating_add(4)
             .min(screen.body.width)
             .max(16.min(screen.body.width));
-        // Border, the input line, the hint, and the bottom border.
-        let height = 4.min(screen.body.height);
+        // Border, one padding row, the input, the hint, one padding row, border.
+        let height = 6.min(screen.body.height);
         screen.modal = Rect::new(
             screen.body.x + screen.body.width.saturating_sub(width) / 2,
             screen.body.y + screen.body.height.saturating_sub(height) / 2,
@@ -2792,8 +2832,8 @@ pub fn layout(app: &App, area: Rect) -> Screen {
     }
     if app.login.is_some() {
         let width = 42.min(screen.body.width);
-        // Six text lines, the cancel control, and the border.
-        let height = 9.min(screen.body.height);
+        // Padding row, six text lines, the cancel control, padding row, and the border.
+        let height = 11.min(screen.body.height);
         let rect = Rect::new(
             screen.body.x + screen.body.width.saturating_sub(width) / 2,
             screen.body.y + screen.body.height.saturating_sub(height) / 2,
@@ -3794,6 +3834,7 @@ mod tests {
             selected: 0,
             loading: false,
             error: String::new(),
+            unsupported: false,
             create_instance: false,
         });
         assert_eq!(app.picker_visible().len(), 1);
@@ -3935,6 +3976,7 @@ mod tests {
             }],
             saved_at: weathered_core::cache::unix_now(),
             error: String::new(),
+            unsupported: false,
         });
         assert_eq!(app.picker.as_ref().unwrap().loader, "fabric");
         assert!(app.picker.as_ref().unwrap().builds.is_empty());
@@ -3955,6 +3997,7 @@ mod tests {
             }],
             saved_at: weathered_core::cache::unix_now(),
             error: String::new(),
+            unsupported: false,
         });
         assert_eq!(app.picker.as_ref().unwrap().builds[0].version, "0.27.0");
         assert_eq!(
@@ -3968,6 +4011,7 @@ mod tests {
             builds: Vec::new(),
             saved_at: 0,
             error: "forge down".into(),
+            unsupported: false,
         });
         assert_eq!(app.on_key(Key::Char('d')), Effect::None);
         let picker = app.picker.as_ref().unwrap();
@@ -3982,6 +4026,42 @@ mod tests {
             app.on_key(Key::Char('r')),
             Effect::RefreshCache { force: true }
         );
+        app.on_msg(Msg::LoaderBuilds {
+            game: "1.21.1".into(),
+            loader: "neoforge".into(),
+            builds: Vec::new(),
+            saved_at: 0,
+            error: "NeoForge does not support Minecraft 1.21.1".into(),
+            unsupported: true,
+        });
+        assert_eq!(app.on_key(Key::Char('d')), Effect::None);
+        let picker = app.picker.as_ref().unwrap();
+        assert!(picker.unsupported);
+        assert!(picker.error.is_empty());
+        assert_eq!(app.loader_tab_state("neoforge"), "unsupported");
+        assert_eq!(app.loader_tab_label("neoforge", "NeoForge"), "NeoForge");
+        assert_eq!(app.loader_tab_label("fabric", "Fabric"), "Fabric...");
+    }
+
+    #[test]
+    fn a_launch_job_shows_stage_progress() {
+        let mut app = App::preview();
+        let id = app.start_job("26.3".into(), true, false);
+        assert_eq!(app.jobs[0].detail, "Resolving files");
+        assert_eq!(app.jobs[0].percent(), 0);
+        app.on_msg(Msg::Progress {
+            id,
+            version: "26.3".into(),
+            stage: "assets".into(),
+            completed: 400,
+            total: 2000,
+            detail: "Linking assets".into(),
+            launching: true,
+        });
+        assert_eq!(app.jobs[0].stage, "assets");
+        assert_eq!(app.jobs[0].detail, "Linking assets");
+        assert_eq!(app.jobs[0].percent(), 20);
+        assert_eq!(app.overall_progress(), (400, 2000));
     }
 
     #[test]
@@ -4000,7 +4080,7 @@ mod tests {
             Effect::None
         );
         app.screen = layout(&app, Rect::new(0, 0, 100, 36));
-        assert_eq!(app.screen.modal.height, 4);
+        assert_eq!(app.screen.modal.height, 6);
         assert_eq!(
             app.on_mouse(Mouse::Click {
                 x: app.screen.modal.x + 2,
@@ -4019,7 +4099,7 @@ mod tests {
             message: "waiting".into(),
         });
         app.screen = layout(&app, Rect::new(0, 0, 100, 36));
-        assert_eq!(app.screen.modal.height, 9);
+        assert_eq!(app.screen.modal.height, 11);
         assert_eq!(
             app.on_mouse(Mouse::Click {
                 x: app.screen.modal.x + 2,

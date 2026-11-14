@@ -292,6 +292,45 @@ async fn download_meta_loader(
     Ok(item)
 }
 
+/// URL of the Fabric or Quilt loader list for one Minecraft version.
+///
+/// Fabric's list is game-version specific (`/v2/versions/loader/<mc>`), even
+/// when the same loader build appears for several versions.
+pub fn loader_versions_url(loader: Loader, game: &str) -> Option<String> {
+    match loader {
+        Loader::Fabric => Some(format!("{FABRIC_META}/{game}")),
+        Loader::Quilt => Some(format!("{QUILT_META}/{game}")),
+        _ => None,
+    }
+}
+
+/// URL of the Fabric or Quilt game-version list.
+pub fn loader_games_url(loader: Loader) -> Option<&'static str> {
+    match loader {
+        Loader::Fabric => Some("https://meta.fabricmc.net/v2/versions/game"),
+        Loader::Quilt => Some("https://meta.quiltmc.org/v3/versions/game"),
+        _ => None,
+    }
+}
+
+/// Version ids from a Fabric or Quilt `/versions/game` document.
+pub fn parse_game_versions(bytes: &[u8]) -> Vec<String> {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return Vec::new();
+    };
+    let Some(items) = value.as_array() else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            item.get("version")
+                .and_then(|version| version.as_str())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
 /// Loader builds for the version picker.
 pub async fn list_loader_builds(
     client: &reqwest::Client,
@@ -303,19 +342,22 @@ pub async fn list_loader_builds(
     cancel.check()?;
     emit_stage(progress, "loader", "loader versions");
     match loader {
-        Loader::Fabric => {
-            let url = format!("{FABRIC_META}/{game}");
-            let bytes = get_bytes_cancellable(client, &url, cancel).await?;
-            let value =
-                serde_json::from_slice(&bytes).map_err(|err| Error::json("fabric loaders", err))?;
-            Ok(catalog::parse_loader_builds(&value))
-        }
-        Loader::Quilt => {
-            let url = format!("{QUILT_META}/{game}");
-            let bytes = get_bytes_cancellable(client, &url, cancel).await?;
-            let value =
-                serde_json::from_slice(&bytes).map_err(|err| Error::json("quilt loaders", err))?;
-            Ok(catalog::parse_loader_builds(&value))
+        Loader::Fabric | Loader::Quilt => {
+            let url = loader_versions_url(loader, game).unwrap_or_default();
+            let bytes = match get_bytes_cancellable(client, &url, cancel).await {
+                Ok(bytes) => bytes,
+                Err(err) if err.is_unsupported() => {
+                    return Err(Error::unsupported(loader.as_str(), game));
+                }
+                Err(err) => return Err(err),
+            };
+            let value = serde_json::from_slice(&bytes)
+                .map_err(|err| Error::json(format!("{} loaders", loader.as_str()), err))?;
+            let builds = catalog::parse_loader_builds(&value);
+            if builds.is_empty() {
+                return Err(Error::unsupported(loader.as_str(), game));
+            }
+            Ok(builds)
         }
         Loader::Forge => {
             let promos = get_bytes_cancellable(
@@ -330,11 +372,11 @@ pub async fn list_loader_builds(
             let promo_value = serde_json::from_slice(&promos)
                 .map_err(|err| Error::json("forge promotions", err))?;
             let versions = catalog::maven_versions(&String::from_utf8_lossy(&meta));
-            Ok(catalog::forge_builds_for_game(
-                game,
-                &versions,
-                &promo_value,
-            ))
+            let builds = catalog::forge_builds_for_game(game, &versions, &promo_value);
+            if builds.is_empty() {
+                return Err(Error::unsupported("forge", game));
+            }
+            Ok(builds)
         }
         Loader::NeoForge => {
             let meta = get_bytes_cancellable(
@@ -344,7 +386,11 @@ pub async fn list_loader_builds(
             )
             .await?;
             let versions = catalog::maven_versions(&String::from_utf8_lossy(&meta));
-            Ok(catalog::neoforge_builds_for_game(game, &versions))
+            let builds = catalog::neoforge_builds_for_game(game, &versions);
+            if builds.is_empty() {
+                return Err(Error::unsupported("neoforge", game));
+            }
+            Ok(builds)
         }
         Loader::Vanilla => Ok(Vec::new()),
     }
@@ -399,6 +445,11 @@ pub async fn list_loader_builds_cached(
         && crate::cache::is_fresh(saved, crate::cache::FRESH_SECS)
     {
         return Ok(builds);
+    }
+    if matches!(loader, Loader::Fabric | Loader::Quilt)
+        && let Err(err) = reject_unsupported_game(client, loader, game, cache_path, cancel).await
+    {
+        return Err(err);
     }
     match list_loader_builds(client, loader, game, cancel, progress).await {
         Ok(builds) => {
@@ -751,7 +802,21 @@ async fn queue_assets(
     Ok(count)
 }
 
+/// When this file matches the index digest, the asset tree was already linked.
+fn asset_link_stamp(index_path: &std::path::Path) -> std::path::PathBuf {
+    let mut name = index_path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    name.push(".linked");
+    index_path.with_file_name(name)
+}
+
 /// Link asset objects from the store into the shared SHA-1 asset tree.
+///
+/// A later call with the same index bytes returns immediately. The first call
+/// looks each object up in the SHA-1 index and stats the destination, which is
+/// the slow part of launching an instance that is already installed.
 pub fn publish_assets(
     store: &Store,
     layout: &DataLayout,
@@ -759,17 +824,58 @@ pub fn publish_assets(
     index_bytes: &[u8],
     cancel: &CancelFlag,
 ) -> Result<()> {
+    publish_assets_with_progress(
+        store,
+        layout,
+        index_id,
+        index_bytes,
+        cancel,
+        &ProgressSink::noop(),
+    )
+}
+
+/// [`publish_assets`] that reports how many objects have been checked.
+pub fn publish_assets_with_progress(
+    store: &Store,
+    layout: &DataLayout,
+    index_id: &str,
+    index_bytes: &[u8],
+    cancel: &CancelFlag,
+    progress: &ProgressSink,
+) -> Result<()> {
     cancel.check()?;
     let paths = layout.shared_assets();
     let index_path = paths.asset_index(index_id);
     if let Some(parent) = index_path.parent() {
         std::fs::create_dir_all(parent).map_err(|err| Error::io(parent, err))?;
     }
+    let digest = download::sha1_hex(index_bytes);
+    let stamp = asset_link_stamp(&index_path);
+    if std::fs::read_to_string(&stamp)
+        .ok()
+        .is_some_and(|saved| saved.trim() == digest)
+    {
+        emit_stage(progress, "assets", "assets already linked");
+        return Ok(());
+    }
     std::fs::write(&index_path, index_bytes).map_err(|err| Error::io(&index_path, err))?;
     let index = parse_asset_index(index_bytes)?;
+    let total = index.objects.len() as u64;
+    let mut linked = 0u64;
+    let mut missing = 0u64;
     for object in index.objects.values() {
         cancel.check()?;
+        linked += 1;
+        if linked.is_multiple_of(200) || linked == total {
+            progress.emit(crate::progress::ProgressEvent {
+                stage: "assets".into(),
+                completed: linked,
+                total,
+                detail: "Linking assets".into(),
+            });
+        }
         let Some(sha512) = store.lookup_sha1(&object.hash)? else {
+            missing += 1;
             continue;
         };
         let dest = paths.asset_object(&object.hash);
@@ -785,7 +891,53 @@ pub fn publish_assets(
             &paths.virtual_assets(index_id),
         )?;
     }
+    if missing == 0 {
+        let _ = std::fs::write(&stamp, format!("{digest}\n"));
+    }
     Ok(())
+}
+
+/// Skip the per-version loader URL when the cached game list excludes `game`.
+///
+/// A missing or stale list is fetched once and shared by every Minecraft
+/// version. If that fetch fails, the caller still tries the version URL.
+async fn reject_unsupported_game(
+    client: &reqwest::Client,
+    loader: Loader,
+    game: &str,
+    builds_cache: &std::path::Path,
+    cancel: &CancelFlag,
+) -> Result<()> {
+    let Some(url) = loader_games_url(loader) else {
+        return Ok(());
+    };
+    let path = builds_cache
+        .parent()
+        .unwrap_or(builds_cache)
+        .join(format!("{}-games.json", loader.as_str()));
+    let cached = crate::cache::read(&path).filter(|(saved, bytes)| {
+        crate::cache::is_fresh(*saved, crate::cache::FRESH_SECS)
+            && !parse_game_versions(bytes).is_empty()
+    });
+    let versions = if let Some((_, bytes)) = cached {
+        parse_game_versions(&bytes)
+    } else {
+        cancel.check()?;
+        let bytes = match get_bytes_cancellable(client, url, cancel).await {
+            Ok(bytes) => bytes,
+            Err(_) => return Ok(()),
+        };
+        let versions = parse_game_versions(&bytes);
+        if !versions.is_empty() {
+            let _ = crate::cache::write(&path, &bytes);
+        }
+        versions
+    };
+    if versions.is_empty() || versions.iter().any(|version| version == game) {
+        Ok(())
+    } else {
+        Err(Error::unsupported(loader.as_str(), game))
+    }
 }
 
 fn emit_stage(progress: &ProgressSink, stage: &str, detail: &str) {
@@ -837,4 +989,86 @@ fn read_zip_file(path: &std::path::Path, name: &str) -> Result<Vec<u8>> {
     std::io::Read::read_to_end(&mut entry, &mut bytes)
         .map_err(|err| Error::message(format!("could not read {name}: {err}")))?;
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Store;
+
+    #[test]
+    fn loader_lists_are_addressed_by_minecraft_version() {
+        assert_eq!(
+            loader_versions_url(Loader::Fabric, "1.20.4").unwrap(),
+            "https://meta.fabricmc.net/v2/versions/loader/1.20.4"
+        );
+        assert_eq!(
+            loader_versions_url(Loader::Quilt, "1.14.2").unwrap(),
+            "https://meta.quiltmc.org/v3/versions/loader/1.14.2"
+        );
+        assert_ne!(
+            loader_versions_url(Loader::Fabric, "1.8").unwrap(),
+            loader_versions_url(Loader::Fabric, "1.21.1").unwrap()
+        );
+        let games = parse_game_versions(
+            br#"[{"version":"1.21.1","stable":true},{"version":"1.8","stable":true}]"#,
+        );
+        assert_eq!(games, vec!["1.21.1".to_string(), "1.8".to_string()]);
+    }
+
+    #[test]
+    fn http_errors_stay_short() {
+        let err = Error::HttpStatus {
+            url: "https://meta.fabricmc.net/v2/versions/loader/1.8".into(),
+            status: 400,
+            body: r#"[{"code":"not_found"}]"#.into(),
+        };
+        let brief = err.brief();
+        assert!(!brief.contains("http"));
+        assert!(!brief.contains("not_found"));
+        assert!(err.is_unsupported());
+        let friendly = Error::unsupported("fabric", "1.8");
+        assert_eq!(
+            friendly.to_string(),
+            "Fabric does not support Minecraft 1.8"
+        );
+    }
+
+    #[test]
+    fn a_second_asset_publish_skips_the_index_walk() {
+        let root = std::env::temp_dir().join(format!(
+            "weathered-assets-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let layout = DataLayout::new(&root);
+        let store = Store::open(layout.store_root()).unwrap();
+        let count = 2000;
+        let stored = store.ingest(b"x", None, None, None).unwrap();
+        let hash = stored.sha1;
+        let mut objects = String::from("{\"objects\":{");
+        for index in 0..count {
+            if index > 0 {
+                objects.push(',');
+            }
+            objects.push_str(&format!("\"f{index}\":{{\"hash\":\"{hash}\",\"size\":1}}"));
+        }
+        objects.push_str("}}");
+        let bytes = objects.into_bytes();
+        let started = std::time::Instant::now();
+        publish_assets(&store, &layout, "wide", &bytes, &CancelFlag::new()).unwrap();
+        let first = started.elapsed();
+        let started = std::time::Instant::now();
+        publish_assets(&store, &layout, "wide", &bytes, &CancelFlag::new()).unwrap();
+        let second = started.elapsed();
+        assert!(
+            second < first / 4 || second.as_millis() < 30,
+            "relinking {count} assets took {first:?} then {second:?}"
+        );
+        eprintln!("asset publish {count}: first {first:?}, cached {second:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

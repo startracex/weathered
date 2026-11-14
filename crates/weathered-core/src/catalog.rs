@@ -391,5 +391,20 @@ mod tests {
         assert!(!neo[0].stable);
         assert!(neo[1].recommended);
         assert!(neoforge_builds_for_game("1.20.1", &["47.1.100".into()])[0].recommended);
+        assert!(
+            builds
+                .iter()
+                .all(|build| build.version.starts_with("1.21.1-"))
+        );
+        let older = parse_loader_builds(&serde_json::json!([
+            { "loader": { "version": "0.14.0", "stable": true } }
+        ]));
+        let newer = parse_loader_builds(&serde_json::json!([
+            { "loader": { "version": "0.20.1", "stable": true } }
+        ]));
+        assert_eq!(older[0].version, "0.14.0");
+        assert!(older[0].recommended);
+        assert_eq!(newer[0].version, "0.20.1");
+        assert!(newer[0].recommended);
     }
 }

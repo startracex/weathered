@@ -172,14 +172,22 @@ fn draw_footer(frame: &mut Frame, app: &App) {
     };
     let hints = key_hints(app);
     let width = app.screen.footer.width as usize;
-    let text = if app.status.is_empty() {
-        hints.to_string()
+    let status = app.status.trim();
+    let text = if status.is_empty() {
+        hints.clone()
     } else {
-        let combined = format!(" {}  ·  {hints}", app.status);
+        let combined = format!(" {status}  ·  {hints}");
         if combined.chars().count() <= width {
             combined
         } else {
-            format!(" {}", app.status)
+            let hint_len = hints.chars().count();
+            let room = width.saturating_sub(hint_len.saturating_add(6));
+            if room < 4 {
+                format!(" {hints}")
+            } else {
+                let short: String = status.chars().take(room).collect();
+                format!(" {short}  ·  {hints}")
+            }
         }
     };
     frame.render_widget(
@@ -448,9 +456,16 @@ fn draw_loaders(frame: &mut Frame, app: &App) {
         let Some(rect) = app.screen.download_tabs.get(index).copied() else {
             continue;
         };
-        let active = current == *kind;
-        let style = if active {
+        let state = app.loader_tab_state(kind);
+        let active = current == *kind && state != "unsupported";
+        let style = if state == "unsupported" {
+            theme::muted()
+        } else if state == "error" {
+            theme::danger()
+        } else if active {
             theme::selected()
+        } else if state == "loading" {
+            theme::muted()
         } else if hot(app, rect) {
             theme::hover()
         } else {
@@ -509,13 +524,32 @@ fn draw_loaders(frame: &mut Frame, app: &App) {
         .map(|picker| picker.selected)
         .unwrap_or(0);
     if visible.is_empty() {
-        let message = match app.picker.as_ref() {
-            Some(picker) if picker.loading => "  Loading loader builds...".to_string(),
-            Some(picker) if !picker.error.is_empty() => picker.error.clone(),
-            _ => "  No builds for this version.".to_string(),
+        let (message, style) = match app.picker.as_ref() {
+            Some(picker) if picker.loading => (
+                "  Loading loader builds...".to_string(),
+                theme::muted().bg(theme::SURFACE),
+            ),
+            Some(picker) if picker.unsupported => (
+                format!(
+                    "  {} does not support Minecraft {}",
+                    display_loader(&picker.loader),
+                    picker.game_version
+                ),
+                theme::muted().bg(theme::SURFACE),
+            ),
+            Some(picker) if !picker.error.is_empty() => (
+                format!("  {}", picker.error),
+                theme::danger().bg(theme::SURFACE),
+            ),
+            _ => (
+                "  No builds for this version.".to_string(),
+                theme::muted().bg(theme::SURFACE),
+            ),
         };
         frame.render_widget(
-            Paragraph::new(message).style(theme::muted().bg(theme::SURFACE)),
+            Paragraph::new(message)
+                .style(style)
+                .wrap(Wrap { trim: false }),
             app.screen.download_list,
         );
         return;
@@ -593,15 +627,27 @@ fn draw_prompt(frame: &mut Frame, app: &App) {
         return;
     }
     let value = with_cursor(&editor.buffer, editor.cursor);
+    let text_x = inner.x.saturating_add(1);
+    let text_w = inner.width.saturating_sub(2);
     frame.render_widget(
-        Paragraph::new(fit(&value, inner.width as usize)).style(theme::surface()),
-        Rect::new(inner.x, inner.y, inner.width, 1),
+        Paragraph::new(fit(&value, text_w as usize)).style(theme::surface()),
+        Rect::new(text_x, inner.y.saturating_add(1), text_w, 1),
     );
-    if inner.height > 1 {
+    if inner.height > 2 {
         frame.render_widget(
             Paragraph::new("Enter save  Esc cancel").style(theme::muted().bg(theme::SURFACE)),
-            Rect::new(inner.x, inner.y.saturating_add(1), inner.width, 1),
+            Rect::new(text_x, inner.y.saturating_add(2), text_w, 1),
         );
+    }
+}
+
+fn display_loader(kind: &str) -> &str {
+    match kind {
+        "fabric" => "Fabric",
+        "quilt" => "Quilt",
+        "forge" => "Forge",
+        "neoforge" => "NeoForge",
+        other => other,
     }
 }
 
@@ -855,7 +901,11 @@ fn draw_jobs(frame: &mut Frame, app: &App) {
         {
             break;
         }
-        let line = format!(" {} {}%  {}", job.version, job.percent(), job.detail);
+        let line = if job.total == 0 {
+            format!(" {}  {}  {}", job.version, job.stage, job.detail)
+        } else {
+            format!(" {} {}%  {}", job.version, job.percent(), job.detail)
+        };
         frame.render_widget(
             Paragraph::new(fit(&line, width as usize)).style(theme::muted().bg(theme::SURFACE)),
             Rect::new(x, y, width, 1),
@@ -981,10 +1031,10 @@ fn draw_login(frame: &mut Frame, app: &App) {
         Line::from(login.message.clone()),
     ];
     let text = Rect::new(
-        inner.x,
-        inner.y,
-        inner.width,
-        inner.height.saturating_sub(1),
+        inner.x.saturating_add(1),
+        inner.y.saturating_add(1),
+        inner.width.saturating_sub(2),
+        inner.height.saturating_sub(3),
     );
     frame.render_widget(
         Paragraph::new(lines)
@@ -1175,6 +1225,11 @@ mod tests {
         );
         assert!(text.contains("[Edit]"), "{text}");
         assert!(text.contains("[Q][E] pages"), "{text}");
+        app.note("x".repeat(400), false);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let crowded = frame_text(terminal.backend().buffer());
+        assert!(crowded.contains("[Q][E] pages"), "{crowded}");
+        assert!(crowded.contains("Ctrl+C quit"), "{crowded}");
         assert!(text.contains("[W][A][S][D] move"), "{text}");
         assert!(text.contains(">Launch<"), "{text}");
         assert!(text.contains("O sort"), "{text}");

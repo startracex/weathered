@@ -568,6 +568,7 @@ fn start_loader_fetches(
         entry.loading = true;
         if force {
             entry.error.clear();
+            entry.unsupported = false;
         }
         let showing = app
             .picker
@@ -577,6 +578,7 @@ fn start_loader_fetches(
             picker.loading = true;
             if force {
                 picker.error.clear();
+                picker.unsupported = false;
             }
         }
         let cancel = CancelFlag::new();
@@ -633,7 +635,7 @@ fn spawn_loader_list(
             .await
         }
         .await;
-        let (builds, saved_at, error) = match outcome {
+        let (builds, saved_at, error, unsupported) = match outcome {
             Ok(builds) => {
                 let saved = weathered_core::cache::read(&cache)
                     .map(|(saved, _)| saved)
@@ -649,10 +651,29 @@ fn spawn_loader_list(
                         .collect(),
                     saved,
                     String::new(),
+                    false,
                 )
             }
             Err(err) if err.is_cancelled() => return,
-            Err(err) => (Vec::new(), 0, err.to_string()),
+            Err(err) if err.is_unsupported() => (Vec::new(), 0, err.to_string(), true),
+            Err(err) => {
+                let name = match loader.as_str() {
+                    "fabric" => "Fabric",
+                    "quilt" => "Quilt",
+                    "forge" => "Forge",
+                    "neoforge" => "NeoForge",
+                    other => other,
+                };
+                (
+                    Vec::new(),
+                    0,
+                    format!(
+                        "Could not load {name} builds: {}. Press R to retry.",
+                        err.brief()
+                    ),
+                    false,
+                )
+            }
         };
         let _ = tx
             .send(Msg::LoaderBuilds {
@@ -661,6 +682,7 @@ fn spawn_loader_list(
                 builds,
                 saved_at,
                 error,
+                unsupported,
             })
             .await;
     })
@@ -865,6 +887,12 @@ fn spawn_launch(tx: mpsc::Sender<Msg>, params: LaunchParams, control: LaunchCont
                 detail: event.detail,
                 launching: true,
             });
+        });
+        sink.emit(weathered_core::progress::ProgressEvent {
+            stage: "account".into(),
+            completed: 0,
+            total: 0,
+            detail: "Checking the account".into(),
         });
         let started = async {
             if control.is_cancelled() {
