@@ -308,10 +308,17 @@ fn paint_row_button(
         ButtonFace::Hover => (idle, theme::hover().add_modifier(Modifier::BOLD)),
         ButtonFace::Idle => (idle, theme::row_button()),
     };
-    frame.render_widget(
-        Paragraph::new(fit(label, rect.width as usize)).style(style),
-        rect,
+    let width = (label.chars().count() as u16).min(rect.width);
+    if width == 0 {
+        return;
+    }
+    let chip = Rect::new(
+        rect.x.saturating_add(rect.width.saturating_sub(width)),
+        rect.y,
+        width,
+        1,
     );
+    frame.render_widget(Paragraph::new(label).style(style), chip);
 }
 
 fn draw_edit(frame: &mut Frame, app: &App) {
@@ -426,18 +433,22 @@ fn inherit_label(override_value: &str, global: &str, fallback: &str) -> String {
 }
 
 fn draw_loaders(frame: &mut Frame, app: &App) {
-    let kinds = ["fabric", "quilt", "forge", "neoforge"];
-    let labels = ["Fabric", "Quilt", "Forge", "NeoForge"];
+    let tabs = [
+        ("fabric", "Fabric"),
+        ("quilt", "Quilt"),
+        ("forge", "Forge"),
+        ("neoforge", "NeoForge"),
+    ];
     let current = app
         .picker
         .as_ref()
         .map(|picker| picker.loader.clone())
         .unwrap_or_else(|| "fabric".into());
-    for (index, label) in labels.iter().enumerate() {
+    for (index, (kind, name)) in tabs.iter().enumerate() {
         let Some(rect) = app.screen.download_tabs.get(index).copied() else {
             continue;
         };
-        let active = current == kinds[index];
+        let active = current == *kind;
         let style = if active {
             theme::selected()
         } else if hot(app, rect) {
@@ -445,6 +456,7 @@ fn draw_loaders(frame: &mut Frame, app: &App) {
         } else {
             theme::base()
         };
+        let label = app.loader_tab_label(kind, name);
         frame.render_widget(Paragraph::new(format!(" {label} ")).style(style), rect);
     }
     let show_unstable = app
@@ -972,7 +984,7 @@ fn draw_login(frame: &mut Frame, app: &App) {
         inner.x,
         inner.y,
         inner.width,
-        inner.height.saturating_sub(2),
+        inner.height.saturating_sub(1),
     );
     frame.render_widget(
         Paragraph::new(lines)
@@ -1208,6 +1220,28 @@ mod tests {
             expand(app.screen.download_list).y,
             app.screen.download_tabs[0].y + 1
         );
+    }
+
+    #[test]
+    fn row_button_fill_stops_at_the_label() {
+        let backend = TestBackend::new(100, 36);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::preview();
+        app.page = Page::Download;
+        app.focus = Focus::DownloadAction;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let create = app.screen.install_buttons[0];
+        let install = app.screen.install_buttons[1];
+        assert_eq!(create.width as usize, "[Create instance]".len());
+        assert_eq!(install.width as usize, "[Install]".len());
+        let chip = buffer[(install.x, install.y)].style();
+        let beside = buffer[(install.x - 1, install.y)].style();
+        assert_ne!(chip.bg, beside.bg);
+        let focused = buffer[(create.x, create.y)].style();
+        let before = buffer[(create.x - 1, create.y)].style();
+        assert_ne!(focused.bg, before.bg);
+        assert!(focused.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]

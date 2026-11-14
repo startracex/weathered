@@ -96,7 +96,7 @@ pub async fn run(game_dir: Option<PathBuf>) -> Result<i32> {
     let mut login_task: Option<JoinHandle<()>> = None;
     weathered_core::store::DownloadSlots::install(config.jobs());
     let mut download_tasks: Vec<DownloadTask> = Vec::new();
-    let mut picker_task: Option<DownloadTask> = None;
+    let mut loader_tasks: Vec<LoaderTask> = Vec::new();
 
     loop {
         guard.terminal.draw(|frame| view::draw(frame, &mut app))?;
@@ -109,13 +109,13 @@ pub async fn run(game_dir: Option<PathBuf>) -> Result<i32> {
                     Some(Ok(Event::Key(key))) => {
                         if let Some(mapped) = map_key(key) {
                             let effect = app.on_key(mapped);
-                            dispatch(&mut app, effect, &mut config, &tx, &mut launch_control, &mut login_task, &mut download_tasks, &mut picker_task).await;
+                            dispatch(&mut app, effect, &mut config, &tx, &mut launch_control, &mut login_task, &mut download_tasks, &mut loader_tasks).await;
                         }
                     }
                     Some(Ok(Event::Mouse(mouse))) => {
                         if let Some(mapped) = map_mouse(mouse) {
                             let effect = app.on_mouse(mapped);
-                            dispatch(&mut app, effect, &mut config, &tx, &mut launch_control, &mut login_task, &mut download_tasks, &mut picker_task).await;
+                            dispatch(&mut app, effect, &mut config, &tx, &mut launch_control, &mut login_task, &mut download_tasks, &mut loader_tasks).await;
                         }
                     }
                     Some(Ok(Event::Resize(_, _))) => {}
@@ -138,7 +138,7 @@ pub async fn run(game_dir: Option<PathBuf>) -> Result<i32> {
         task.abort();
     }
     stop_all_downloads(&mut download_tasks);
-    stop_download(&mut picker_task);
+    stop_loader_tasks(&mut loader_tasks);
     if let Some(control) = launch_control.take() {
         control.cancel();
     }
@@ -154,13 +154,13 @@ async fn dispatch(
     launch_control: &mut Option<LaunchControl>,
     login_task: &mut Option<JoinHandle<()>>,
     download_tasks: &mut Vec<DownloadTask>,
-    picker_task: &mut Option<DownloadTask>,
+    loader_tasks: &mut Vec<LoaderTask>,
 ) {
     match effect {
         Effect::None => {}
         Effect::Quit => {
             stop_all_downloads(download_tasks);
-            stop_download(picker_task);
+            stop_loader_tasks(loader_tasks);
             app.quit = true;
         }
         Effect::CancelJob { id } => {
@@ -192,21 +192,8 @@ async fn dispatch(
                 && app.page == model::Page::Loaders
                 && let Some(picker) = app.picker.clone()
             {
-                stop_download(picker_task);
-                let cancel = CancelFlag::new();
-                let handle = spawn_loader_list(
-                    tx.clone(),
-                    app.game_dir.clone(),
-                    picker.game_version,
-                    picker.loader,
-                    true,
-                    cancel.clone(),
-                );
-                *picker_task = Some(DownloadTask {
-                    id: 0,
-                    cancel,
-                    handle,
-                });
+                let loaders = ["fabric", "quilt", "forge", "neoforge"].map(str::to_string);
+                start_loader_fetches(app, loader_tasks, tx, &picker.game_version, &loaders, true);
             }
         }
         Effect::Install {
@@ -230,26 +217,12 @@ async fn dispatch(
             );
             download_tasks.push(DownloadTask { id, cancel, handle });
         }
-        Effect::OpenPicker {
+        Effect::LoadLoaders {
             version,
-            loader,
+            loaders,
             force,
         } => {
-            stop_download(picker_task);
-            let cancel = CancelFlag::new();
-            let handle = spawn_loader_list(
-                tx.clone(),
-                app.game_dir.clone(),
-                version,
-                loader,
-                force,
-                cancel.clone(),
-            );
-            *picker_task = Some(DownloadTask {
-                id: 0,
-                cancel,
-                handle,
-            });
+            start_loader_fetches(app, loader_tasks, tx, &version, &loaders, force);
         }
         Effect::DeleteInstance => {
             let layout = DataLayout::new(&app.game_dir);
@@ -555,10 +528,72 @@ struct DownloadTask {
     handle: JoinHandle<()>,
 }
 
-fn stop_download(task: &mut Option<DownloadTask>) {
-    if let Some(task) = task.take() {
+struct LoaderTask {
+    game: String,
+    loader: String,
+    cancel: CancelFlag,
+    handle: JoinHandle<()>,
+}
+
+fn stop_loader_tasks(tasks: &mut Vec<LoaderTask>) {
+    for task in tasks.drain(..) {
         task.cancel.cancel();
         task.handle.abort();
+    }
+}
+
+fn start_loader_fetches(
+    app: &mut App,
+    tasks: &mut Vec<LoaderTask>,
+    tx: &mpsc::Sender<Msg>,
+    version: &str,
+    loaders: &[String],
+    force: bool,
+) {
+    for loader in loaders {
+        if let Some(index) = tasks
+            .iter()
+            .position(|task| task.game == version && task.loader == *loader)
+        {
+            if !force {
+                continue;
+            }
+            let task = tasks.remove(index);
+            task.cancel.cancel();
+            task.handle.abort();
+        }
+        let key = format!("{loader}\n{version}");
+        app.loader_inflight.insert(key.clone());
+        let entry = app.loader_cache.entry(key).or_default();
+        entry.loading = true;
+        if force {
+            entry.error.clear();
+        }
+        let showing = app
+            .picker
+            .as_ref()
+            .is_some_and(|picker| picker.game_version == version && picker.loader == *loader);
+        if showing && let Some(picker) = app.picker.as_mut() {
+            picker.loading = true;
+            if force {
+                picker.error.clear();
+            }
+        }
+        let cancel = CancelFlag::new();
+        let handle = spawn_loader_list(
+            tx.clone(),
+            app.game_dir.clone(),
+            version.to_string(),
+            loader.clone(),
+            force,
+            cancel.clone(),
+        );
+        tasks.push(LoaderTask {
+            game: version.to_string(),
+            loader: loader.clone(),
+            cancel,
+            handle,
+        });
     }
 }
 
