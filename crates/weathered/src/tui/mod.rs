@@ -242,6 +242,10 @@ async fn dispatch(
                 app.reload_local();
             }
         }
+        Effect::OpenDataDir => match instance::open_in_file_manager(&app.game_dir) {
+            Ok(()) => app.note("Opened the data directory", false),
+            Err(err) => app.note(err.to_string(), true),
+        },
         Effect::OpenFolder => {
             let layout = DataLayout::new(&app.game_dir);
             let id = app

@@ -100,7 +100,8 @@ impl Category {
 pub enum Focus {
     Versions,
     Accounts,
-    LaunchButton,
+    /// Path in the top bar. Enter opens it in the file manager.
+    DataDir,
     /// Launch control on the selected instance row.
     RowLaunch,
     /// Edit control on the selected instance row.
@@ -158,6 +159,7 @@ pub enum Effect {
     DeleteInstance,
     SetDefault,
     OpenFolder,
+    OpenDataDir,
     PersistDraft,
     CreateInstance {
         catalog_id: String,
@@ -515,7 +517,7 @@ impl App {
     pub fn empty(game_dir: PathBuf) -> Self {
         let mut app = Self {
             page: Page::Launch,
-            focus: Focus::Versions,
+            focus: Focus::RowLaunch,
             game_dir,
             memory: "2G".into(),
             username: "Steve".into(),
@@ -858,10 +860,8 @@ impl App {
     fn apply_startup_focus(&mut self) {
         self.version_selected = 0;
         self.version_scroll = 0;
-        self.focus = if self.selected_is_default() {
-            Focus::LaunchButton
-        } else if self.instances.is_empty() {
-            Focus::Versions
+        self.focus = if self.instances.is_empty() {
+            Focus::Accounts
         } else {
             Focus::RowLaunch
         };
@@ -902,7 +902,7 @@ impl App {
         }
         if key == Key::Esc && self.page == Page::Edit {
             self.page = Page::Launch;
-            self.focus = Focus::Versions;
+            self.focus = Focus::RowLaunch;
             return Effect::None;
         }
         if key == Key::CtrlF && self.page == Page::Download {
@@ -1208,7 +1208,13 @@ impl App {
     fn goto(&mut self, page: Page) -> Effect {
         self.page = page;
         self.focus = match page {
-            Page::Launch => Focus::Versions,
+            Page::Launch => {
+                if self.instances.is_empty() {
+                    Focus::Accounts
+                } else {
+                    Focus::RowLaunch
+                }
+            }
             Page::Download => Focus::DownloadList,
             Page::Settings | Page::Edit => Focus::Settings(self.setting_selected),
             Page::More => Focus::More,
@@ -1218,24 +1224,14 @@ impl App {
 
     fn cycle_focus(&mut self, reverse: bool) {
         self.focus = match (self.page, self.focus, reverse) {
-            (Page::Launch, Focus::Versions, false) => Focus::Accounts,
-            (Page::Launch, Focus::Accounts, false) => Focus::RowLaunch,
             (Page::Launch, Focus::RowLaunch, false) => Focus::RowEdit,
-            (Page::Launch, Focus::RowEdit, false) if self.selected_is_default() => {
-                Focus::LaunchButton
-            }
-            (Page::Launch, _, false) => Focus::Versions,
-            (Page::Launch, Focus::LaunchButton, true) => Focus::RowEdit,
-            (Page::Launch, Focus::RowEdit, true) => Focus::RowLaunch,
-            (Page::Launch, Focus::RowLaunch, true) => Focus::Accounts,
-            (Page::Launch, Focus::Versions, true) => {
-                if self.selected_is_default() {
-                    Focus::LaunchButton
-                } else {
-                    Focus::RowEdit
-                }
-            }
-            (Page::Launch, _, true) => Focus::Versions,
+            (Page::Launch, Focus::RowEdit, false) => Focus::Accounts,
+            (Page::Launch, Focus::Accounts, false) => Focus::DataDir,
+            (Page::Launch, _, false) => Focus::RowLaunch,
+            (Page::Launch, Focus::RowLaunch, true) => Focus::DataDir,
+            (Page::Launch, Focus::DataDir, true) => Focus::Accounts,
+            (Page::Launch, Focus::Accounts, true) => Focus::RowEdit,
+            (Page::Launch, _, true) => Focus::RowLaunch,
             (Page::Download, Focus::DownloadList, false) => Focus::DownloadCats,
             (Page::Download, Focus::DownloadCats, false) if self.search_open => Focus::Search,
             (Page::Download, _, false) => Focus::DownloadList,
@@ -1257,19 +1253,16 @@ impl App {
                     delta.signum(),
                 );
             }
+            Page::Launch if self.focus == Focus::DataDir => {}
             Page::Launch if self.creator.is_some() => {
                 let len = self.creator_len();
                 bump(&mut self.creator_selected, len, delta.signum());
             }
-            Page::Launch if self.focus == Focus::LaunchButton => {
-                if delta < 0 {
-                    self.focus = Focus::RowLaunch;
-                }
-            }
             Page::Launch => {
-                let column = match self.focus {
-                    Focus::RowLaunch | Focus::RowEdit => self.focus,
-                    _ => Focus::Versions,
+                let column = if self.focus == Focus::RowEdit {
+                    Focus::RowEdit
+                } else {
+                    Focus::RowLaunch
                 };
                 slide(
                     &mut self.version_selected,
@@ -1312,41 +1305,12 @@ impl App {
             return Effect::None;
         }
         if self.page == Page::Launch && self.creator.is_none() {
-            match (self.focus, delta.signum()) {
-                (Focus::Accounts, 1) => {
-                    self.focus = Focus::Versions;
-                    return Effect::None;
-                }
-                (Focus::Versions, 1) => {
-                    self.focus = Focus::RowLaunch;
-                    return Effect::None;
-                }
-                (Focus::RowLaunch, 1) => {
-                    self.focus = Focus::RowEdit;
-                    return Effect::None;
-                }
-                (Focus::RowEdit, 1) if self.selected_is_default() => {
-                    self.focus = Focus::LaunchButton;
-                    return Effect::None;
-                }
-                (Focus::RowEdit, 1) | (Focus::LaunchButton, -1) => {
-                    self.focus = Focus::RowEdit;
-                    return Effect::None;
-                }
-                (Focus::RowEdit, -1) => {
-                    self.focus = Focus::RowLaunch;
-                    return Effect::None;
-                }
-                (Focus::RowLaunch, -1) | (Focus::Versions, -1) => {
-                    self.focus = if self.focus == Focus::RowLaunch {
-                        Focus::Versions
-                    } else {
-                        Focus::Accounts
-                    };
-                    return Effect::None;
-                }
-                _ => {}
-            }
+            self.focus = if delta > 0 {
+                Focus::RowEdit
+            } else {
+                Focus::RowLaunch
+            };
+            return Effect::None;
         }
         if self.focus == Focus::DownloadCats {
             self.shift_category(delta.signum());
@@ -1381,6 +1345,9 @@ impl App {
     fn activate(&mut self) -> Effect {
         if self.creator.is_some() && self.page == Page::Launch {
             return self.activate_creator();
+        }
+        if self.focus == Focus::DataDir {
+            return Effect::OpenDataDir;
         }
         match self.page {
             Page::Launch if self.focus == Focus::RowEdit => self.open_edit(),
@@ -1432,7 +1399,7 @@ impl App {
             }
             Click::Version(index) => {
                 self.page = Page::Launch;
-                self.focus = Focus::Versions;
+                self.focus = Focus::RowLaunch;
                 let now = Instant::now();
                 let double = self.last_version_click.is_some_and(|(previous, when)| {
                     previous == index && now.duration_since(when) < Duration::from_millis(400)
@@ -1457,8 +1424,12 @@ impl App {
                 self.focus = Focus::RowLaunch;
                 self.request_launch()
             }
+            Click::OpenDataDir => {
+                self.focus = Focus::DataDir;
+                Effect::OpenDataDir
+            }
             Click::LaunchButton => {
-                self.focus = Focus::LaunchButton;
+                self.focus = Focus::RowLaunch;
                 if self.game_running {
                     Effect::StopGame
                 } else {
@@ -1518,7 +1489,9 @@ impl App {
 
     fn scroll_at(&mut self, x: u16, y: u16, delta: isize) {
         if contains(self.screen.version_list, x, y) {
-            self.focus = Focus::Versions;
+            if self.focus != Focus::RowEdit {
+                self.focus = Focus::RowLaunch;
+            }
             slide(
                 &mut self.version_selected,
                 &mut self.version_scroll,
@@ -2111,6 +2084,7 @@ pub enum Click {
     Refresh,
     CancelLogin,
     CancelJob,
+    OpenDataDir,
     Stop,
 }
 
@@ -2224,6 +2198,7 @@ fn byte_index(text: &str, chars: usize) -> usize {
 pub struct Screen {
     pub zones: Vec<Zone>,
     pub header: Rect,
+    pub data_path: Rect,
     pub nav: Rect,
     pub body: Rect,
     pub footer: Rect,
@@ -2281,6 +2256,20 @@ pub fn layout(app: &App, area: Rect) -> Screen {
     ])
     .split(area);
     screen.header = chunks[0];
+    let title_w = 20.min(screen.header.width);
+    let path_w = screen.header.width.saturating_sub(title_w);
+    screen.data_path = Rect::new(
+        screen.header.x.saturating_add(title_w),
+        screen.header.y,
+        path_w,
+        1,
+    );
+    if path_w > 0 {
+        screen.zones.push(Zone {
+            rect: screen.data_path,
+            action: Click::OpenDataDir,
+        });
+    }
     screen.nav = chunks[1];
     screen.body = chunks[2];
     screen.footer = chunks[3];
@@ -2370,7 +2359,8 @@ fn layout_launch(app: &App, screen: &mut Screen) {
     }
 
     let right_inner = inner(screen.right);
-    let show_big = app.creator.is_none() && app.selected_is_default();
+    let show_big =
+        app.creator.is_none() && app.selected_is_default() && app.focus == Focus::RowLaunch;
     let progress_h = if app.job.is_some() { 2 } else { 0 };
     let button_band = if show_big {
         5.min(right_inner.height.saturating_sub(3))
@@ -2761,14 +2751,13 @@ mod tests {
         assert_eq!(app.category, Category::Release);
         app.on_key(Key::Char('q'));
         assert_eq!(app.page, Page::Launch);
-        app.on_key(Key::Char('d'));
         assert_eq!(app.focus, Focus::RowLaunch);
         app.on_key(Key::Char('d'));
         assert_eq!(app.focus, Focus::RowEdit);
         app.on_key(Key::Char('d'));
-        assert_eq!(app.focus, Focus::LaunchButton);
-        app.on_key(Key::Char('a'));
         assert_eq!(app.focus, Focus::RowEdit);
+        app.on_key(Key::Char('a'));
+        assert_eq!(app.focus, Focus::RowLaunch);
         app.begin_edit(Field::Rename, String::new());
         app.on_key(Key::Char('q'));
         app.on_key(Key::Char('e'));
@@ -2786,7 +2775,7 @@ mod tests {
         let mut app = App::preview();
         app.apply_startup_focus();
         assert!(app.selected_is_default());
-        assert_eq!(app.focus, Focus::LaunchButton);
+        assert_eq!(app.focus, Focus::RowLaunch);
         assert_eq!(app.on_key(Key::Enter), Effect::Launch);
     }
 
@@ -2794,9 +2783,7 @@ mod tests {
     fn sideways_keys_move_across_the_row_buttons() {
         let mut app = App::preview();
         app.version_selected = 1;
-        app.focus = Focus::Versions;
-        app.on_key(Key::Right);
-        assert_eq!(app.focus, Focus::RowLaunch);
+        app.focus = Focus::RowLaunch;
         app.on_key(Key::Right);
         assert_eq!(app.focus, Focus::RowEdit);
         app.on_key(Key::Right);
@@ -2808,8 +2795,26 @@ mod tests {
         assert_eq!(app.version_selected, 0);
         assert_eq!(app.focus, Focus::RowLaunch);
         app.on_key(Key::Right);
-        app.on_key(Key::Right);
-        assert_eq!(app.focus, Focus::LaunchButton);
+        assert_eq!(app.focus, Focus::RowEdit);
+        app.on_key(Key::Left);
+        assert_eq!(app.focus, Focus::RowLaunch);
+    }
+
+    #[test]
+    fn enter_on_the_data_path_opens_the_directory() {
+        let mut app = App::preview();
+        app.focus = Focus::DataDir;
+        assert_eq!(app.on_key(Key::Enter), Effect::OpenDataDir);
+        app.screen = layout(&app, Rect::new(0, 0, 100, 36));
+        let path = app.screen.data_path;
+        assert!(path.width > 0);
+        assert_eq!(
+            app.on_mouse(Mouse::Click {
+                x: path.x + path.width - 1,
+                y: path.y,
+            }),
+            Effect::OpenDataDir
+        );
     }
 
     #[test]
@@ -3072,6 +3077,7 @@ mod tests {
         assert_eq!(app.page, Page::Download);
 
         app.page = Page::Launch;
+        app.focus = Focus::RowLaunch;
         app.screen = layout(&app, Rect::new(0, 0, 100, 36));
         assert!(app.screen.launch_button.height >= 3);
         assert!(app.screen.launch_button.width >= 20);

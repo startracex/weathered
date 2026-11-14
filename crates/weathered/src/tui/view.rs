@@ -54,24 +54,35 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 fn draw_header(frame: &mut Frame, app: &App) {
-    let width = app.screen.header.width as usize;
-    let path = app.screen.header.width.saturating_sub(28) as usize;
-    let dir = shorten(&app.game_dir.display().to_string(), path);
-    let left = " weathered  launcher";
-    let gap = width.saturating_sub(left.chars().count() + dir.chars().count());
-    let line = Line::from(vec![
-        Span::styled(
-            " weathered",
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            " Weathered Launcher",
             Style::default()
                 .fg(ACCENT)
                 .bg(BG)
                 .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  launcher", theme::muted()),
-        Span::styled(" ".repeat(gap), theme::base()),
-        Span::styled(dir, theme::muted()),
-    ]);
-    frame.render_widget(Paragraph::new(line).style(theme::base()), app.screen.header);
+        ))
+        .style(theme::base()),
+        app.screen.header,
+    );
+    if app.screen.data_path.width == 0 {
+        return;
+    }
+    let dir = shorten(
+        &app.game_dir.display().to_string(),
+        app.screen.data_path.width as usize,
+    );
+    let path_style = if app.focus == Focus::DataDir || hot(app, app.screen.data_path) {
+        theme::selected()
+    } else {
+        theme::muted()
+    };
+    frame.render_widget(
+        Paragraph::new(dir)
+            .alignment(ratatui::layout::Alignment::Right)
+            .style(path_style),
+        app.screen.data_path,
+    );
 }
 
 fn draw_nav(frame: &mut Frame, app: &App) {
@@ -116,30 +127,30 @@ fn draw_nav(frame: &mut Frame, app: &App) {
 }
 
 fn key_hints(app: &App) -> String {
-    if app.editing.is_some() {
-        return "[W][A][S][D] type  Enter save  Esc cancel  Ctrl+C quit".into();
-    }
-    if app.picker.is_some() {
-        return "[W][S] move  Enter choose  B unstable  Esc close  Ctrl+C quit".into();
-    }
     let movement = match app.page {
-        Page::Settings | Page::Edit => "[W][S] move",
-        _ => "[W][A][S][D] move",
+        Page::Settings | Page::Edit => " [Q][E] pages [W][S] move",
+        _ => " [Q][E] pages [W][A][S][D] move",
     };
     let actions = match app.page {
-        Page::Launch => "Enter launch  O sort  N new  [Q][E] pages",
-        Page::Download => "Enter install  O sort  [Q][E] pages",
-        Page::Settings => "Enter edit  [Q][E] pages",
+        Page::Launch => "Enter launch  O sort  N new",
+        Page::Download => "Enter install  O sort",
+        Page::Settings => "Enter edit",
         Page::Edit => "Enter change  Esc back",
-        Page::More => "Enter refresh  [Q][E] pages",
+        Page::More => "Enter refresh",
     };
-    let ctrl = if app.page == Page::Download {
+    let ctrl = if app.page == Page::Download && app.picker.is_none() {
         "Ctrl+F search  Ctrl+C quit"
     } else {
         "Ctrl+C quit"
     };
+    if app.editing.is_some() {
+        return format!("{movement}  Enter save  Esc cancel  {ctrl}");
+    }
+    if app.picker.is_some() {
+        return format!("{movement}  Enter choose  B unstable  Esc close  Ctrl+C quit");
+    }
     if app.job.is_some() {
-        format!("{movement}  Esc cancel  {ctrl}")
+        format!("{movement}  {actions}  Esc cancel  {ctrl}")
     } else if app.search_open {
         format!("{movement}  Esc clear  {ctrl}")
     } else {
@@ -280,7 +291,7 @@ fn draw_launch(frame: &mut Frame, app: &App) {
             ("STOP", theme::selected())
         } else if preparing {
             ("PREPARING", theme::disabled_button())
-        } else if app.focus == Focus::LaunchButton || hot(app, app.screen.launch_button) {
+        } else if app.focus == Focus::RowLaunch || hot(app, app.screen.launch_button) {
             (
                 "LAUNCH",
                 theme::launch_button().add_modifier(Modifier::REVERSED),
@@ -778,17 +789,13 @@ fn draw_more(frame: &mut Frame, app: &App) {
             "Weathered Launcher",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )),
-        Line::from("A Minecraft: Java Edition launcher, named for weathered copper."),
+        Line::from("A Minecraft: Java Edition launcher. Instances keep their own worlds,"),
+        Line::from("and downloaded files are stored once and shared."),
         Line::from(""),
-        Line::from("Launch selects an instance. New instance copies mods into that instance."),
-        Line::from("Download stores vanilla, Fabric, or Quilt once in the shared store."),
-        Line::from("Settings stores the game directory, memory, Java, and username."),
+        Line::from("Launch starts a game. Download fetches a version. Settings holds"),
+        Line::from("Java, memory, and the account. The footer lists the keys."),
         Line::from(""),
-        Line::from("Mouse: click tabs, rows, and buttons. The wheel scrolls lists."),
-        Line::from("Keys: Q/E pages, W/S move, A/D sideways, Enter activates, Esc goes back."),
-        Line::from("Ctrl+F searches downloads. O cycles instance sort. Ctrl+C quits."),
-        Line::from(""),
-        Line::from("Microsoft login uses a device code. Set an Azure client id first."),
+        Line::from("License: MIT. Copyright (c) 2026 Weathered Contributors."),
     ];
     let text_area = Rect::new(
         inner.x,
@@ -1018,7 +1025,7 @@ mod tests {
         let mut app = App::preview();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let text = frame_text(terminal.backend().buffer());
-        assert!(text.contains("weathered"), "{text}");
+        assert!(text.contains("Weathered Launcher"), "{text}");
         assert!(text.contains("Launch"), "{text}");
         assert!(text.contains("Download"), "{text}");
         assert!(text.contains("Settings"), "{text}");
@@ -1026,7 +1033,9 @@ mod tests {
         assert!(text.contains("LAUNCH"), "{text}");
         assert!(text.contains("[Launch]"), "{text}");
         assert!(text.contains("[Edit]"), "{text}");
+        assert!(text.contains("[Q][E] pages"), "{text}");
         assert!(text.contains("[W][A][S][D] move"), "{text}");
+        assert!(text.contains(">Launch<"), "{text}");
         assert!(text.contains("O sort"), "{text}");
         assert!(text.contains("Ctrl+C quit"), "{text}");
         assert!(text.contains("Steve"), "{text}");
@@ -1176,6 +1185,27 @@ mod tests {
         assert!(text.contains("[Edit]"), "{text}");
         assert!(!text.contains("LAUNCH"), "{text}");
         assert_eq!(app.screen.launch_button.height, 0);
+        app.version_selected = 0;
+        app.focus = Focus::RowEdit;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.screen.launch_button.height, 0);
+        app.focus = Focus::RowLaunch;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(app.screen.launch_button.height >= 3);
+    }
+
+    #[test]
+    fn more_page_is_a_short_overview_and_the_license() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::preview();
+        app.page = Page::More;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let text = frame_text(terminal.backend().buffer());
+        assert!(text.contains("Weathered Launcher"), "{text}");
+        assert!(text.contains("MIT"), "{text}");
+        assert!(!text.contains("Azure"), "{text}");
+        assert!(!text.contains("client id"), "{text}");
     }
 
     #[test]
