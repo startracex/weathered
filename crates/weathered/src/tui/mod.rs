@@ -8,12 +8,13 @@ mod model;
 mod theme;
 mod view;
 
-use std::io::{self, BufRead, BufReader, IsTerminal, Read};
-use std::path::PathBuf;
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use crossterm::event::{
@@ -742,13 +743,27 @@ fn spawn_launch(tx: mpsc::Sender<Msg>, params: LaunchParams, control: LaunchCont
             let stdout = child.stdout.take();
             let stderr = child.stderr.take();
             control.store(child);
+            let launch_log = create_launch_log(&params.game_dir).ok();
+            let log_path = launch_log
+                .as_ref()
+                .map(|(path, _)| path.clone())
+                .unwrap_or_default();
+            let log_file = launch_log.map(|(_, file)| Arc::new(Mutex::new(file)));
+            let mut pumps = Vec::new();
             if let Some(stdout) = stdout {
-                pump(stdout, tx.clone());
+                pumps.push(pump(stdout, log_file.clone()));
             }
             if let Some(stderr) = stderr {
-                pump(stderr, tx.clone());
+                pumps.push(pump(stderr, log_file));
             }
-            watch_exit(control.clone(), tx.clone());
+            watch_exit(
+                control.clone(),
+                tx.clone(),
+                pumps,
+                log_path,
+                plan.working_dir.clone(),
+                SystemTime::now(),
+            );
             Ok::<(), weathered_core::Error>(())
         }
         .await;
@@ -767,26 +782,90 @@ fn spawn_launch(tx: mpsc::Sender<Msg>, params: LaunchParams, control: LaunchCont
     });
 }
 
-fn pump(reader: impl Read + Send + 'static, tx: mpsc::Sender<Msg>) {
+fn pump(
+    reader: impl Read + Send + 'static,
+    log: Option<Arc<Mutex<File>>>,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut lines = BufReader::new(reader).lines();
         while let Some(Ok(line)) = lines.next() {
-            if tx.blocking_send(Msg::GameLog(line)).is_err() {
-                break;
+            if let Some(log) = &log {
+                append_log(log, &line);
             }
         }
+    })
+}
+
+fn watch_exit(
+    control: LaunchControl,
+    tx: mpsc::Sender<Msg>,
+    pumps: Vec<thread::JoinHandle<()>>,
+    log_path: PathBuf,
+    game_dir: PathBuf,
+    started: SystemTime,
+) {
+    thread::spawn(move || {
+        let code = loop {
+            thread::sleep(Duration::from_millis(200));
+            if let Some(code) = control.poll_exit() {
+                break code;
+            }
+        };
+        for pump in pumps {
+            let _ = pump.join();
+        }
+        let crash_report = model::newest_crash_report(&game_dir, started)
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+        let _ = tx.blocking_send(Msg::GameExit {
+            code,
+            log_path: log_path.display().to_string(),
+            crash_report,
+        });
     });
 }
 
-fn watch_exit(control: LaunchControl, tx: mpsc::Sender<Msg>) {
-    thread::spawn(move || loop {
-        thread::sleep(Duration::from_millis(200));
-        let status = control.poll_exit();
-        if let Some(code) = status {
-            let _ = tx.blocking_send(Msg::GameExit(code));
-            return;
-        }
-    });
+fn create_launch_log(data_dir: &Path) -> io::Result<(PathBuf, File)> {
+    let dir = data_dir.join("logs");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("launch-{}.log", utc_stamp()));
+    let file = OpenOptions::new().create(true).append(true).open(&path)?;
+    Ok((path, file))
+}
+
+fn append_log(log: &Mutex<File>, line: &str) {
+    if let Ok(mut file) = log.lock() {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+fn utc_stamp() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    format_unix(secs)
+}
+
+fn format_unix(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    let hour = tod / 3600;
+    let minute = (tod % 3600) / 60;
+    let second = tod % 60;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let mut year = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    if month <= 2 {
+        year += 1;
+    }
+    format!("{year:04}{month:02}{day:02}-{hour:02}{minute:02}{second:02}")
 }
 
 #[derive(Clone)]
@@ -1055,5 +1134,39 @@ impl App {
             })
             .unwrap_or_default();
         self.replace_profiles(microsoft);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unix_stamp_formats_the_epoch() {
+        assert_eq!(format_unix(0), "19700101-000000");
+        assert_eq!(format_unix(86_400 + 3661), "19700102-010101");
+    }
+
+    #[test]
+    fn launch_log_is_written_under_the_data_logs_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "weathered-log-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let (path, file) = create_launch_log(&root).unwrap();
+        assert!(path.starts_with(root.join("logs")));
+        assert!(path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("launch-"));
+        append_log(&Mutex::new(file), "log4j example");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("log4j example"));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

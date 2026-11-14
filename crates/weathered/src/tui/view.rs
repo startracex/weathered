@@ -164,13 +164,38 @@ fn draw_launch(frame: &mut Frame, app: &App) {
             } else {
                 " "
             };
+            let launch = app
+                .screen
+                .row_launch
+                .get(offset)
+                .copied()
+                .unwrap_or_default();
+            let edit = app.screen.row_edit.get(offset).copied().unwrap_or_default();
+            let reserved = if launch.width > 0 {
+                rect.width.saturating_sub(launch.x.saturating_sub(rect.x))
+            } else {
+                0
+            };
             let label = format!(
-                " {mark}{pin} {:<16} {:<10} {}",
+                " {mark}{pin} {}  {}  {}",
                 instance.name, instance.game_version, instance.loader
             );
             frame.render_widget(
-                Paragraph::new(fit(&label, rect.width as usize)).style(style),
+                Paragraph::new(fit(&label, rect.width.saturating_sub(reserved) as usize))
+                    .style(style),
                 rect,
+            );
+            paint_row_button(
+                frame,
+                launch,
+                "[Launch]",
+                (app.focus == Focus::RowLaunch && selected) || hot(app, launch),
+            );
+            paint_row_button(
+                frame,
+                edit,
+                "[Edit]",
+                (app.focus == Focus::RowEdit && selected) || hot(app, edit),
             );
         }
         if app.instances.is_empty() {
@@ -202,45 +227,39 @@ fn draw_launch(frame: &mut Frame, app: &App) {
         }
     }
 
-    let running = app.game_running;
-    let preparing = app.job.as_ref().is_some_and(|job| job.launching) && !running;
-    if app.screen.launch_button.y > app.screen.version_list.y {
-        let caption = match app.selected_instance() {
-            Some(instance) => format!(
-                "{}   ·   {}   ·   {}",
-                instance.name, instance.game_version, app.memory
-            ),
-            None => "Create an instance to play".into(),
+    if app.screen.launch_button.height > 0 {
+        let running = app.game_running;
+        let preparing = app.job.as_ref().is_some_and(|job| job.launching) && !running;
+        if app.screen.launch_button.y > app.screen.version_list.y {
+            let caption = match app.selected_instance() {
+                Some(instance) => format!(
+                    "{}   ·   {}   ·   {}",
+                    instance.name, instance.game_version, app.memory
+                ),
+                None => "Create an instance to play".into(),
+            };
+            let width = app.screen.right.width.saturating_sub(2);
+            let x = app.screen.right.x.saturating_add(1);
+            frame.render_widget(
+                Paragraph::new(center(&caption, width as usize))
+                    .style(theme::muted().bg(theme::SURFACE)),
+                Rect::new(x, app.screen.launch_button.y.saturating_sub(1), width, 1),
+            );
+        }
+        let (label, style) = if running {
+            ("STOP", theme::selected())
+        } else if preparing {
+            ("PREPARING", theme::disabled_button())
+        } else if app.focus == Focus::LaunchButton || hot(app, app.screen.launch_button) {
+            (
+                "LAUNCH",
+                theme::launch_button().add_modifier(Modifier::REVERSED),
+            )
+        } else {
+            ("LAUNCH", theme::launch_button())
         };
-        let width = app.screen.right.width.saturating_sub(2);
-        let x = app.screen.right.x.saturating_add(1);
-        frame.render_widget(
-            Paragraph::new(center(&caption, width as usize))
-                .style(theme::muted().bg(theme::SURFACE)),
-            Rect::new(x, app.screen.launch_button.y.saturating_sub(1), width, 1),
-        );
+        paint_button(frame, app.screen.launch_button, label, style);
     }
-    let (label, style) = if running {
-        ("STOP", theme::selected())
-    } else if preparing {
-        ("PREPARING", theme::disabled_button())
-    } else if app.selected_instance().is_none() {
-        ("NO VERSION", theme::disabled_button())
-    } else if app.focus == Focus::LaunchButton || hot(app, app.screen.launch_button) {
-        (
-            "LAUNCH",
-            theme::launch_button().add_modifier(Modifier::REVERSED),
-        )
-    } else {
-        ("LAUNCH", theme::launch_button())
-    };
-    paint_button(frame, app.screen.launch_button, label, style);
-    let edit_style = if app.focus == Focus::EditButton || hot(app, app.screen.edit_button) {
-        theme::selected()
-    } else {
-        theme::hover()
-    };
-    paint_button(frame, app.screen.edit_button, "EDIT", edit_style);
 
     if let Some(job) = &app.job {
         draw_job(
@@ -251,22 +270,21 @@ fn draw_launch(frame: &mut Frame, app: &App) {
             &job.detail,
         );
     }
-    if app.screen.log.height > 0 {
-        let lines: Vec<Line> = app
-            .log
-            .iter()
-            .rev()
-            .take(app.screen.log.height as usize)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .map(|line| Line::from(fit(line, app.screen.log.width as usize)))
-            .collect();
-        frame.render_widget(
-            Paragraph::new(lines).style(theme::muted().bg(theme::SURFACE)),
-            app.screen.log,
-        );
+}
+
+fn paint_row_button(frame: &mut Frame, rect: Rect, label: &str, active: bool) {
+    if rect.width == 0 || rect.height == 0 {
+        return;
     }
+    let style = if active {
+        theme::selected()
+    } else {
+        Style::default().fg(ON_ACCENT).bg(ACCENT)
+    };
+    frame.render_widget(
+        Paragraph::new(fit(label, rect.width as usize)).style(style),
+        rect,
+    );
 }
 
 fn draw_edit(frame: &mut Frame, app: &App) {
@@ -297,28 +315,32 @@ fn draw_edit(frame: &mut Frame, app: &App) {
         let Some(rect) = app.screen.setting_rows.get(index).copied() else {
             continue;
         };
-        let shown = match index {
-            3 => inherit_label(
-                draft.map(|item| item.java.as_str()).unwrap_or(""),
-                &app.java_path,
-                "auto",
-            ),
-            4 => inherit_label(
-                draft.map(|item| item.memory_min.as_str()).unwrap_or(""),
-                &app.memory_min,
-                "unset",
-            ),
-            5 => inherit_label(
-                draft.map(|item| item.memory_max.as_str()).unwrap_or(""),
-                &app.memory,
-                "2G",
-            ),
-            6 => inherit_label(
-                draft.map(|item| item.jvm_args.as_str()).unwrap_or(""),
-                &app.jvm_args,
-                "none",
-            ),
-            _ => (*value).to_string(),
+        let shown = if let Some(text) = live_edit(app, index) {
+            text
+        } else {
+            match index {
+                3 => inherit_label(
+                    draft.map(|item| item.java.as_str()).unwrap_or(""),
+                    &app.java_path,
+                    "auto",
+                ),
+                4 => inherit_label(
+                    draft.map(|item| item.memory_min.as_str()).unwrap_or(""),
+                    &app.memory_min,
+                    "unset",
+                ),
+                5 => inherit_label(
+                    draft.map(|item| item.memory_max.as_str()).unwrap_or(""),
+                    &app.memory,
+                    "2G",
+                ),
+                6 => inherit_label(
+                    draft.map(|item| item.jvm_args.as_str()).unwrap_or(""),
+                    &app.jvm_args,
+                    "none",
+                ),
+                _ => (*value).to_string(),
+            }
         };
         let selected = index == app.setting_selected;
         let style = row_style(selected, hot(app, rect));
@@ -328,6 +350,39 @@ fn draw_edit(frame: &mut Frame, app: &App) {
             rect,
         );
     }
+}
+
+fn live_edit(app: &App, index: usize) -> Option<String> {
+    let editor = app.editing.as_ref()?;
+    let field = match index {
+        0 => Field::Rename,
+        1 => Field::Description,
+        3 => Field::JavaOverride,
+        4 => Field::MemoryMin,
+        5 => Field::MemoryMax,
+        6 => Field::JvmArgs,
+        _ => return None,
+    };
+    if editor.field != field {
+        return None;
+    }
+    Some(with_cursor(&editor.buffer, editor.cursor))
+}
+
+fn with_cursor(buffer: &str, cursor: usize) -> String {
+    let mut text = String::new();
+    let mut placed = false;
+    for (index, ch) in buffer.chars().enumerate() {
+        if index == cursor {
+            text.push('█');
+            placed = true;
+        }
+        text.push(ch);
+    }
+    if !placed {
+        text.push('█');
+    }
+    text
 }
 
 fn inherit_label(override_value: &str, global: &str, fallback: &str) -> String {
@@ -652,7 +707,7 @@ fn draw_settings(frame: &mut Frame, app: &App) {
         let value = if let Some(editor) = &app.editing {
             if let SettingKind::Edit(field) = row.kind {
                 if editor.field == field {
-                    editor.buffer.clone() + "█"
+                    with_cursor(&editor.buffer, editor.cursor)
                 } else {
                     row.value.clone()
                 }
@@ -931,7 +986,9 @@ mod tests {
         assert!(text.contains("Settings"), "{text}");
         assert!(text.contains("More"), "{text}");
         assert!(text.contains("LAUNCH"), "{text}");
-        assert!(text.contains("EDIT"), "{text}");
+        assert!(text.contains("[Launch]"), "{text}");
+        assert!(text.contains("[Edit]"), "{text}");
+        assert!(!text.contains("EDIT"), "{text}");
         assert!(text.contains("Steve"), "{text}");
         assert!(text.contains("1.21.1"), "{text}");
         assert!(text.contains("q quit") || text.contains("quit"), "{text}");
@@ -998,6 +1055,43 @@ mod tests {
         assert!(text.contains("Delete"), "{text}");
         assert!(text.contains("Open folder"), "{text}");
         assert!(!text.contains("Account"), "{text}");
+    }
+
+    #[test]
+    fn edit_field_shows_the_cursor_while_typing() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::preview();
+        app.page = Page::Edit;
+        app.setting_selected = 1;
+        app.draft = Some(super::super::model::InstanceDraft {
+            id: "vanilla".into(),
+            name: "Vanilla".into(),
+            description: "dda".into(),
+            java: String::new(),
+            memory_min: String::new(),
+            memory_max: String::new(),
+            jvm_args: String::new(),
+        });
+        app.on_key(super::super::model::Key::Enter);
+        app.on_key(super::super::model::Key::Char('x'));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let text = frame_text(terminal.backend().buffer());
+        assert!(text.contains("ddax█"), "{text}");
+    }
+
+    #[test]
+    fn big_launch_is_hidden_for_a_non_default_instance() {
+        let backend = TestBackend::new(100, 36);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::preview();
+        app.version_selected = 1;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let text = frame_text(terminal.backend().buffer());
+        assert!(text.contains("[Launch]"), "{text}");
+        assert!(text.contains("[Edit]"), "{text}");
+        assert!(!text.contains("LAUNCH"), "{text}");
+        assert_eq!(app.screen.launch_button.height, 0);
     }
 
     #[test]

@@ -101,7 +101,10 @@ pub enum Focus {
     Versions,
     Accounts,
     LaunchButton,
-    EditButton,
+    /// Launch control on the selected instance row.
+    RowLaunch,
+    /// Edit control on the selected instance row.
+    RowEdit,
     DownloadCats,
     DownloadList,
     Search,
@@ -194,8 +197,11 @@ pub enum Msg {
         ok: bool,
         detail: String,
     },
-    GameLog(String),
-    GameExit(i32),
+    GameExit {
+        code: i32,
+        log_path: String,
+        crash_report: String,
+    },
     LoginPrompt {
         url: String,
         code: String,
@@ -448,12 +454,13 @@ pub struct App {
     pub download_window: usize,
     pub setting_selected: usize,
     pub job: Option<Job>,
-    pub log: Vec<String>,
     pub status: String,
     pub status_error: bool,
     pub editing: Option<Editor>,
     pub login: Option<LoginPrompt>,
     pub game_running: bool,
+    /// The user asked to stop the process, so a later non-zero exit is not a crash.
+    pub stop_requested: bool,
     pub screen: Screen,
     pub hover: Option<(u16, u16)>,
     pub quit: bool,
@@ -502,12 +509,12 @@ impl App {
             download_window: 12,
             setting_selected: 0,
             job: None,
-            log: Vec::new(),
             status: "Ready".into(),
             status_error: false,
             editing: None,
             login: None,
             game_running: false,
+            stop_requested: false,
             screen: Screen::default(),
             hover: None,
             quit: false,
@@ -584,6 +591,7 @@ impl App {
             label: "21.0.13   /usr/bin/java".into(),
             path: "/usr/bin/java".into(),
         }];
+        app.default_instance = "vanilla".into();
         app.note("Ready", false);
         app
     }
@@ -591,17 +599,6 @@ impl App {
     pub fn note(&mut self, text: impl Into<String>, error: bool) {
         self.status = text.into();
         self.status_error = error;
-    }
-
-    pub fn push_log(&mut self, line: String) {
-        if line.is_empty() {
-            return;
-        }
-        self.log.push(line);
-        if self.log.len() > 200 {
-            let drop_count = self.log.len() - 200;
-            self.log.drain(0..drop_count);
-        }
     }
 
     pub fn filtered(&self) -> Vec<&CatalogEntry> {
@@ -725,6 +722,7 @@ impl App {
             SortMode::Played => weathered_core::instance::InstanceOrder::Played,
         };
         weathered_core::instance::order_instances(&mut found, order, &self.default_instance);
+        let startup = self.startup_select;
         let keep = if self.startup_select {
             self.version_selected = 0;
             self.version_scroll = 0;
@@ -765,6 +763,28 @@ impl App {
         if !self.instances.is_empty() && self.version_selected >= self.instances.len() {
             self.version_selected = 0;
         }
+        if startup {
+            self.apply_startup_focus();
+        }
+    }
+
+    /// The pinned default is selected, so the large Launch button belongs on screen.
+    pub fn selected_is_default(&self) -> bool {
+        self.selected_instance().is_some_and(|item| {
+            !self.default_instance.is_empty() && item.id == self.default_instance
+        })
+    }
+
+    fn apply_startup_focus(&mut self) {
+        self.version_selected = 0;
+        self.version_scroll = 0;
+        self.focus = if self.selected_is_default() {
+            Focus::LaunchButton
+        } else if self.instances.is_empty() {
+            Focus::Versions
+        } else {
+            Focus::RowLaunch
+        };
     }
 
     pub fn selected_profile(&self) -> Option<&Profile> {
@@ -949,14 +969,19 @@ impl App {
                     self.note(format!("Install {version} failed: {detail}"), true);
                 }
             }
-            Msg::GameLog(line) => self.push_log(line),
-            Msg::GameExit(code) => {
+            Msg::GameExit {
+                code,
+                log_path,
+                crash_report,
+            } => {
                 self.game_running = false;
                 self.job = None;
-                if code == 0 {
-                    self.note("Game exited", false);
+                if self.stop_requested {
+                    self.stop_requested = false;
+                    self.note("Stopped", false);
                 } else {
-                    self.note(format!("Game exited with status {code}"), true);
+                    let (text, error) = exit_notice(code, &log_path, &crash_report);
+                    self.note(text, error);
                 }
             }
             Msg::LoginPrompt { url, code, message } => {
@@ -1104,12 +1129,22 @@ impl App {
     fn cycle_focus(&mut self, reverse: bool) {
         self.focus = match (self.page, self.focus, reverse) {
             (Page::Launch, Focus::Versions, false) => Focus::Accounts,
-            (Page::Launch, Focus::Accounts, false) => Focus::LaunchButton,
-            (Page::Launch, Focus::LaunchButton, false) => Focus::EditButton,
+            (Page::Launch, Focus::Accounts, false) => Focus::RowLaunch,
+            (Page::Launch, Focus::RowLaunch, false) => Focus::RowEdit,
+            (Page::Launch, Focus::RowEdit, false) if self.selected_is_default() => {
+                Focus::LaunchButton
+            }
             (Page::Launch, _, false) => Focus::Versions,
-            (Page::Launch, Focus::Versions, true) => Focus::EditButton,
-            (Page::Launch, Focus::EditButton, true) => Focus::LaunchButton,
-            (Page::Launch, Focus::LaunchButton, true) => Focus::Accounts,
+            (Page::Launch, Focus::LaunchButton, true) => Focus::RowEdit,
+            (Page::Launch, Focus::RowEdit, true) => Focus::RowLaunch,
+            (Page::Launch, Focus::RowLaunch, true) => Focus::Accounts,
+            (Page::Launch, Focus::Versions, true) => {
+                if self.selected_is_default() {
+                    Focus::LaunchButton
+                } else {
+                    Focus::RowEdit
+                }
+            }
             (Page::Launch, _, true) => Focus::Versions,
             (Page::Download, Focus::DownloadList, false) => Focus::DownloadCats,
             (Page::Download, Focus::DownloadCats, false) if self.search_open => Focus::Search,
@@ -1136,17 +1171,16 @@ impl App {
                 let len = self.creator_len();
                 bump(&mut self.creator_selected, len, delta.signum());
             }
-            Page::Launch
-                if self.focus == Focus::LaunchButton || self.focus == Focus::EditButton =>
-            {
-                self.focus = if delta < 0 {
-                    Focus::LaunchButton
-                } else {
-                    Focus::EditButton
-                };
+            Page::Launch if self.focus == Focus::LaunchButton => {
+                if delta < 0 {
+                    self.focus = Focus::RowLaunch;
+                }
             }
             Page::Launch => {
-                self.focus = Focus::Versions;
+                let column = match self.focus {
+                    Focus::RowLaunch | Focus::RowEdit => self.focus,
+                    _ => Focus::Versions,
+                };
                 slide(
                     &mut self.version_selected,
                     &mut self.version_scroll,
@@ -1154,6 +1188,7 @@ impl App {
                     self.version_window,
                     delta,
                 );
+                self.focus = column;
             }
             Page::Download if self.focus == Focus::DownloadCats => {
                 self.shift_category(delta.signum());
@@ -1188,20 +1223,36 @@ impl App {
         }
         if self.page == Page::Launch && self.creator.is_none() {
             match (self.focus, delta.signum()) {
-                (Focus::Versions | Focus::Accounts, 1) => {
-                    self.focus = Focus::LaunchButton;
-                    return Effect::None;
-                }
-                (Focus::LaunchButton, 1) => {
-                    self.focus = Focus::EditButton;
-                    return Effect::None;
-                }
-                (Focus::EditButton, -1) => {
-                    self.focus = Focus::LaunchButton;
-                    return Effect::None;
-                }
-                (Focus::LaunchButton | Focus::Accounts, -1) => {
+                (Focus::Accounts, 1) => {
                     self.focus = Focus::Versions;
+                    return Effect::None;
+                }
+                (Focus::Versions, 1) => {
+                    self.focus = Focus::RowLaunch;
+                    return Effect::None;
+                }
+                (Focus::RowLaunch, 1) => {
+                    self.focus = Focus::RowEdit;
+                    return Effect::None;
+                }
+                (Focus::RowEdit, 1) if self.selected_is_default() => {
+                    self.focus = Focus::LaunchButton;
+                    return Effect::None;
+                }
+                (Focus::RowEdit, 1) | (Focus::LaunchButton, -1) => {
+                    self.focus = Focus::RowEdit;
+                    return Effect::None;
+                }
+                (Focus::RowEdit, -1) => {
+                    self.focus = Focus::RowLaunch;
+                    return Effect::None;
+                }
+                (Focus::RowLaunch, -1) | (Focus::Versions, -1) => {
+                    self.focus = if self.focus == Focus::RowLaunch {
+                        Focus::Versions
+                    } else {
+                        Focus::Accounts
+                    };
                     return Effect::None;
                 }
                 _ => {}
@@ -1242,7 +1293,7 @@ impl App {
             return self.activate_creator();
         }
         match self.page {
-            Page::Launch if self.focus == Focus::EditButton => self.open_edit(),
+            Page::Launch if self.focus == Focus::RowEdit => self.open_edit(),
             Page::Launch if self.focus == Focus::Accounts => Effect::None,
             Page::Launch => self.request_launch(),
             Page::Edit => self.activate_edit(),
@@ -1304,7 +1355,18 @@ impl App {
                     Effect::None
                 }
             }
-            Click::EditButton => self.open_edit(),
+            Click::RowEdit(index) => {
+                self.page = Page::Launch;
+                self.version_selected = index;
+                self.focus = Focus::RowEdit;
+                self.open_edit()
+            }
+            Click::RowLaunch(index) => {
+                self.page = Page::Launch;
+                self.version_selected = index;
+                self.focus = Focus::RowLaunch;
+                self.request_launch()
+            }
             Click::LaunchButton => {
                 self.focus = Focus::LaunchButton;
                 if self.game_running {
@@ -1749,8 +1811,9 @@ impl App {
                 return;
             }
             editor.cursor -= 1;
-            let at = byte_index(&editor.buffer, editor.cursor);
-            editor.buffer.remove(at);
+            let start = byte_index(&editor.buffer, editor.cursor);
+            let end = byte_index(&editor.buffer, editor.cursor + 1);
+            editor.buffer.replace_range(start..end, "");
         }
         self.mirror_search();
     }
@@ -1929,6 +1992,7 @@ impl App {
     }
 
     pub fn mark_game_stopped(&mut self) {
+        self.stop_requested = true;
         self.game_running = false;
         if self.job.as_ref().is_some_and(|job| job.launching) {
             self.job = None;
@@ -1945,6 +2009,8 @@ pub enum Click {
     NewInstance,
     Creator(usize),
     LaunchButton,
+    RowLaunch(usize),
+    RowEdit(usize),
     Category(Category),
     DownloadRow(usize),
     InstallRow(usize),
@@ -1955,7 +2021,6 @@ pub enum Click {
     Refresh,
     CancelLogin,
     CancelJob,
-    EditButton,
     Stop,
 }
 
@@ -2055,11 +2120,11 @@ pub struct Screen {
     pub version_list: Rect,
     pub version_rows: Vec<Rect>,
     pub launch_button: Rect,
-    pub edit_button: Rect,
+    pub row_launch: Vec<Rect>,
+    pub row_edit: Vec<Rect>,
     pub new_instance: Rect,
     pub progress: Rect,
     pub cancel: Rect,
-    pub log: Rect,
     pub download_tabs: Vec<Rect>,
     pub search: Rect,
     pub download_list: Rect,
@@ -2156,7 +2221,6 @@ pub fn layout(app: &App, area: Rect) -> Screen {
 
 fn layout_launch(app: &App, screen: &mut Screen) {
     let body = screen.body;
-    let show_log = !app.log.is_empty() || app.job.as_ref().is_some_and(|job| job.launching);
     if body.width >= 78 {
         let left_width = 32.min(body.width / 3);
         screen.left = Rect::new(body.x, body.y, left_width, body.height);
@@ -2192,14 +2256,10 @@ fn layout_launch(app: &App, screen: &mut Screen) {
     }
 
     let right_inner = inner(screen.right);
-    let button_band = 7.min(right_inner.height.saturating_sub(3));
-    let log_h = if show_log {
-        5.min(
-            right_inner
-                .height
-                .saturating_sub(button_band)
-                .saturating_sub(3),
-        )
+    let show_big = app.creator.is_none() && app.selected_is_default();
+    let progress_h = if app.job.is_some() { 2 } else { 0 };
+    let button_band = if show_big {
+        5.min(right_inner.height.saturating_sub(3))
     } else {
         0
     };
@@ -2207,7 +2267,7 @@ fn layout_launch(app: &App, screen: &mut Screen) {
     let list_h = right_inner
         .height
         .saturating_sub(button_band)
-        .saturating_sub(log_h)
+        .saturating_sub(progress_h)
         .saturating_sub(new_h);
     screen.version_list = Rect::new(right_inner.x, right_inner.y, right_inner.width, list_h);
     if new_h > 0 {
@@ -2224,31 +2284,16 @@ fn layout_launch(app: &App, screen: &mut Screen) {
     }
     let band_y = right_inner.y.saturating_add(list_h).saturating_add(new_h);
     let band = Rect::new(right_inner.x, band_y, right_inner.width, button_band);
-    screen.launch_button = centered(band, 24.min(band.width.saturating_sub(2)), 3);
-    if app.creator.is_none() {
-        if app.game_running {
-            screen.zones.push(Zone {
-                rect: screen.launch_button,
-                action: Click::Stop,
-            });
+    if show_big {
+        screen.launch_button = centered(band, 24.min(band.width.saturating_sub(2)), 3);
+        let action = if app.game_running {
+            Click::Stop
         } else {
-            screen.zones.push(Zone {
-                rect: screen.launch_button,
-                action: Click::LaunchButton,
-            });
-        }
-        screen.edit_button = Rect::new(
-            screen.launch_button.x,
-            screen
-                .launch_button
-                .y
-                .saturating_add(screen.launch_button.height),
-            screen.launch_button.width,
-            1,
-        );
+            Click::LaunchButton
+        };
         screen.zones.push(Zone {
-            rect: screen.edit_button,
-            action: Click::EditButton,
+            rect: screen.launch_button,
+            action,
         });
     }
     let list_len = if app.creator.is_some() {
@@ -2257,33 +2302,73 @@ fn layout_launch(app: &App, screen: &mut Screen) {
         app.instances.len()
     };
     screen.version_rows = rows(screen.version_list, list_len, app.version_scroll);
+    screen.row_launch.clear();
+    screen.row_edit.clear();
     for (offset, rect) in screen.version_rows.iter().copied().enumerate() {
-        let action = if app.creator.is_some() {
-            Click::Creator(offset)
+        if app.creator.is_some() {
+            screen.row_launch.push(Rect::default());
+            screen.row_edit.push(Rect::default());
+            screen.zones.push(Zone {
+                rect,
+                action: Click::Creator(offset),
+            });
+            continue;
+        }
+        let index = app.version_scroll + offset;
+        screen.zones.push(Zone {
+            rect,
+            action: Click::Version(index),
+        });
+        if let Some((launch, edit)) = row_action_rects(rect) {
+            screen.zones.push(Zone {
+                rect: launch,
+                action: Click::RowLaunch(index),
+            });
+            screen.zones.push(Zone {
+                rect: edit,
+                action: Click::RowEdit(index),
+            });
+            screen.row_launch.push(launch);
+            screen.row_edit.push(edit);
         } else {
-            Click::Version(app.version_scroll + offset)
+            screen.row_launch.push(Rect::default());
+            screen.row_edit.push(Rect::default());
+        }
+    }
+    if progress_h > 0 {
+        let progress_y = if show_big {
+            band.y.saturating_add(band.height)
+        } else {
+            right_inner.y.saturating_add(list_h).saturating_add(new_h)
         };
-        screen.zones.push(Zone { rect, action });
-    }
-    if log_h > 0 {
-        screen.log = Rect::new(
-            right_inner.x,
-            band.y.saturating_add(band.height),
-            right_inner.width,
-            log_h,
-        );
-    }
-    if app.job.is_some() {
         place_cancel(
             screen,
-            Rect::new(
-                band.x,
-                band.y.saturating_add(band.height.saturating_sub(1)),
-                band.width,
-                1,
-            ),
+            Rect::new(right_inner.x, progress_y, right_inner.width, progress_h),
         );
     }
+}
+
+fn row_action_rects(rect: Rect) -> Option<(Rect, Rect)> {
+    let launch_w = 8;
+    let edit_w = 6;
+    let gap = 1;
+    let total = launch_w + gap + edit_w;
+    if rect.width <= total + 8 {
+        return None;
+    }
+    let edit = Rect::new(
+        rect.x.saturating_add(rect.width.saturating_sub(edit_w)),
+        rect.y,
+        edit_w,
+        1,
+    );
+    let launch = Rect::new(
+        edit.x.saturating_sub(gap).saturating_sub(launch_w),
+        rect.y,
+        launch_w,
+        1,
+    );
+    Some((launch, edit))
 }
 
 fn layout_download(app: &App, screen: &mut Screen) {
@@ -2464,6 +2549,51 @@ fn rows(area: Rect, len: usize, scroll: usize) -> Vec<Rect> {
     out
 }
 
+/// Status text after the game process ends.
+pub fn exit_notice(code: i32, log_path: &str, crash_report: &str) -> (String, bool) {
+    if code == 0 && crash_report.is_empty() {
+        return ("Game exited".into(), false);
+    }
+    let mut text = if code == 0 {
+        "Game crashed.".to_string()
+    } else {
+        format!("Game crashed (status {code}).")
+    };
+    if !log_path.is_empty() {
+        text.push_str(" Log: ");
+        text.push_str(log_path);
+    }
+    if !crash_report.is_empty() {
+        text.push_str(" Crash report: ");
+        text.push_str(crash_report);
+    }
+    (text, true)
+}
+
+/// Newest crash report written at or after `since`.
+pub fn newest_crash_report(game_dir: &Path, since: std::time::SystemTime) -> Option<PathBuf> {
+    let reports = game_dir.join("crash-reports");
+    let entries = std::fs::read_dir(reports).ok()?;
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) else {
+            continue;
+        };
+        if modified < since {
+            continue;
+        }
+        let replace = best.as_ref().is_none_or(|(time, _)| modified >= *time);
+        if replace {
+            best = Some((modified, path));
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(area.width);
     let height = height.min(area.height);
@@ -2517,11 +2647,13 @@ mod tests {
         app.on_key(Key::Char('q'));
         assert_eq!(app.page, Page::Launch);
         app.on_key(Key::Char('d'));
-        assert_eq!(app.focus, Focus::LaunchButton);
+        assert_eq!(app.focus, Focus::RowLaunch);
         app.on_key(Key::Char('d'));
-        assert_eq!(app.focus, Focus::EditButton);
-        app.on_key(Key::Char('a'));
+        assert_eq!(app.focus, Focus::RowEdit);
+        app.on_key(Key::Char('d'));
         assert_eq!(app.focus, Focus::LaunchButton);
+        app.on_key(Key::Char('a'));
+        assert_eq!(app.focus, Focus::RowEdit);
         app.begin_edit(Field::Rename, String::new());
         app.on_key(Key::Char('q'));
         app.on_key(Key::Char('e'));
@@ -2532,6 +2664,97 @@ mod tests {
         let editor = app.editing.clone().unwrap();
         assert_eq!(editor.buffer, "qeadws");
         assert_eq!(app.page, Page::Launch);
+    }
+
+    #[test]
+    fn startup_focuses_the_default_launch_button() {
+        let mut app = App::preview();
+        app.apply_startup_focus();
+        assert!(app.selected_is_default());
+        assert_eq!(app.focus, Focus::LaunchButton);
+        assert_eq!(app.on_key(Key::Enter), Effect::Launch);
+    }
+
+    #[test]
+    fn sideways_keys_move_across_the_row_buttons() {
+        let mut app = App::preview();
+        app.version_selected = 1;
+        app.focus = Focus::Versions;
+        app.on_key(Key::Right);
+        assert_eq!(app.focus, Focus::RowLaunch);
+        app.on_key(Key::Right);
+        assert_eq!(app.focus, Focus::RowEdit);
+        app.on_key(Key::Right);
+        assert_eq!(app.focus, Focus::RowEdit);
+        assert!(!app.selected_is_default());
+        app.on_key(Key::Left);
+        assert_eq!(app.focus, Focus::RowLaunch);
+        app.on_key(Key::Up);
+        assert_eq!(app.version_selected, 0);
+        assert_eq!(app.focus, Focus::RowLaunch);
+        app.on_key(Key::Right);
+        app.on_key(Key::Right);
+        assert_eq!(app.focus, Focus::LaunchButton);
+    }
+
+    #[test]
+    fn description_edit_shows_each_key_and_escape_cancels_it() {
+        let mut app = App::preview();
+        app.draft = Some(InstanceDraft {
+            id: "vanilla".into(),
+            name: "Vanilla".into(),
+            description: "dda".into(),
+            java: String::new(),
+            memory_min: String::new(),
+            memory_max: String::new(),
+            jvm_args: String::new(),
+        });
+        app.page = Page::Edit;
+        app.setting_selected = 1;
+        app.begin_edit(Field::Description, "dda".into());
+        app.on_key(Key::Char('x'));
+        app.on_key(Key::Left);
+        app.on_key(Key::Backspace);
+        let editor = app.editing.clone().unwrap();
+        assert_eq!(editor.buffer, "ddx");
+        assert_eq!(editor.cursor, 2);
+        assert_eq!(app.on_key(Key::Esc), Effect::None);
+        assert!(app.editing.is_none());
+        assert_eq!(app.page, Page::Edit);
+        assert_eq!(app.draft.unwrap().description, "dda");
+    }
+
+    #[test]
+    fn a_crash_names_the_saved_log() {
+        let (text, error) = exit_notice(1, "/data/logs/launch-1.log", "");
+        assert!(error);
+        assert!(text.contains("crashed"));
+        assert!(text.contains("/data/logs/launch-1.log"));
+        let (clean, error) = exit_notice(0, "/data/logs/launch-1.log", "");
+        assert!(!error);
+        assert_eq!(clean, "Game exited");
+        let root = std::env::temp_dir().join(format!(
+            "weathered-crash-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let reports = root.join("crash-reports");
+        std::fs::create_dir_all(&reports).unwrap();
+        let old = reports.join("old.txt");
+        let old_file = std::fs::File::create(&old).unwrap();
+        old_file
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(120))
+            .unwrap();
+        drop(old_file);
+        let since = std::time::SystemTime::now() - std::time::Duration::from_secs(30);
+        let fresh = reports.join("crash.txt");
+        std::fs::write(&fresh, b"boom").unwrap();
+        let found = newest_crash_report(&root, since).unwrap();
+        assert_eq!(found, fresh);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
