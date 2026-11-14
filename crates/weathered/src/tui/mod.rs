@@ -31,6 +31,7 @@ use ratatui::Terminal;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use weathered_core::auth::{AccountStore, MicrosoftAuth};
+use weathered_core::cancel::CancelFlag;
 use weathered_core::config::{resolve_ms_client_id, Config};
 use weathered_core::content::{self, Loader};
 use weathered_core::download::build_http_client;
@@ -80,6 +81,7 @@ pub async fn run(game_dir: Option<PathBuf>) -> Result<i32> {
     let mut events = EventStream::new();
     let mut launch_control: Option<LaunchControl> = None;
     let mut login_task: Option<JoinHandle<()>> = None;
+    let mut download_task: Option<DownloadTask> = None;
 
     loop {
         guard.terminal.draw(|frame| view::draw(frame, &mut app))?;
@@ -92,13 +94,13 @@ pub async fn run(game_dir: Option<PathBuf>) -> Result<i32> {
                     Some(Ok(Event::Key(key))) => {
                         if let Some(mapped) = map_key(key) {
                             let effect = app.on_key(mapped);
-                            dispatch(&mut app, effect, &mut config, &tx, &mut launch_control, &mut login_task).await;
+                            dispatch(&mut app, effect, &mut config, &tx, &mut launch_control, &mut login_task, &mut download_task).await;
                         }
                     }
                     Some(Ok(Event::Mouse(mouse))) => {
                         if let Some(mapped) = map_mouse(mouse) {
                             let effect = app.on_mouse(mapped);
-                            dispatch(&mut app, effect, &mut config, &tx, &mut launch_control, &mut login_task).await;
+                            dispatch(&mut app, effect, &mut config, &tx, &mut launch_control, &mut login_task, &mut download_task).await;
                         }
                     }
                     Some(Ok(Event::Resize(_, _))) => {}
@@ -120,6 +122,7 @@ pub async fn run(game_dir: Option<PathBuf>) -> Result<i32> {
     if let Some(task) = login_task.take() {
         task.abort();
     }
+    stop_download(&mut download_task);
     if let Some(control) = launch_control.take() {
         control.cancel();
     }
@@ -133,10 +136,17 @@ async fn dispatch(
     tx: &mpsc::Sender<Msg>,
     launch_control: &mut Option<LaunchControl>,
     login_task: &mut Option<JoinHandle<()>>,
+    download_task: &mut Option<DownloadTask>,
 ) {
     match effect {
         Effect::None => {}
-        Effect::Quit => app.quit = true,
+        Effect::Quit => {
+            stop_download(download_task);
+            app.quit = true;
+        }
+        Effect::CancelJob => {
+            stop_download(download_task);
+        }
         Effect::Save => {
             if let Err(err) = persist(app, config) {
                 app.note(format!("Could not save settings: {err}"), true);
@@ -152,20 +162,33 @@ async fn dispatch(
             loader,
             create_instance,
         } => {
-            spawn_install(
+            stop_download(download_task);
+            let cancel = CancelFlag::new();
+            let handle = spawn_install(
                 tx.clone(),
                 app.game_dir.clone(),
                 version,
                 loader,
                 create_instance,
                 config.jobs(),
+                cancel.clone(),
             );
+            *download_task = Some(DownloadTask { cancel, handle });
         }
         Effect::CreateInstance { catalog_id } => {
             spawn_create(tx.clone(), app.game_dir.clone(), catalog_id);
         }
         Effect::ImportPack { path } => {
-            spawn_import(tx.clone(), app.game_dir.clone(), path, config.jobs());
+            stop_download(download_task);
+            let cancel = CancelFlag::new();
+            let handle = spawn_import(
+                tx.clone(),
+                app.game_dir.clone(),
+                path,
+                config.jobs(),
+                cancel.clone(),
+            );
+            *download_task = Some(DownloadTask { cancel, handle });
         }
         Effect::Launch => {
             if let Some(previous) = launch_control.take() {
@@ -313,6 +336,18 @@ fn spawn_javas(tx: mpsc::Sender<Msg>, game_dir: PathBuf) {
     });
 }
 
+struct DownloadTask {
+    cancel: CancelFlag,
+    handle: JoinHandle<()>,
+}
+
+fn stop_download(task: &mut Option<DownloadTask>) {
+    if let Some(task) = task.take() {
+        task.cancel.cancel();
+        task.handle.abort();
+    }
+}
+
 fn spawn_install(
     tx: mpsc::Sender<Msg>,
     game_dir: PathBuf,
@@ -320,7 +355,8 @@ fn spawn_install(
     loader: String,
     create_instance: bool,
     jobs: usize,
-) {
+    cancel: CancelFlag,
+) -> JoinHandle<()> {
     let progress_tx = tx.clone();
     let version_for_progress = version.clone();
     tokio::spawn(async move {
@@ -349,10 +385,12 @@ fn spawn_install(
                     os: &os,
                     concurrency: jobs,
                     java_mode: JavaMode::Auto,
+                    cancel: cancel.clone(),
                 },
                 &sink,
             )
             .await?;
+            cancel.check()?;
             let mut detail = format!("stored {}", item.id);
             if create_instance {
                 let name = if item.kind == "vanilla" {
@@ -368,6 +406,7 @@ fn spawn_install(
         .await;
         let (ok, detail) = match outcome {
             Ok(detail) => (true, detail),
+            Err(err) if err.is_cancelled() => return,
             Err(err) => (false, err.to_string()),
         };
         let _ = tx
@@ -377,7 +416,7 @@ fn spawn_install(
                 detail,
             })
             .await;
-    });
+    })
 }
 
 fn spawn_create(tx: mpsc::Sender<Msg>, game_dir: PathBuf, catalog_id: String) {
@@ -411,7 +450,13 @@ fn spawn_create(tx: mpsc::Sender<Msg>, game_dir: PathBuf, catalog_id: String) {
     });
 }
 
-fn spawn_import(tx: mpsc::Sender<Msg>, game_dir: PathBuf, path: String, jobs: usize) {
+fn spawn_import(
+    tx: mpsc::Sender<Msg>,
+    game_dir: PathBuf,
+    path: String,
+    jobs: usize,
+    cancel: CancelFlag,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let sink = ProgressSink::new({
             let tx = tx.clone();
@@ -447,6 +492,7 @@ fn spawn_import(tx: mpsc::Sender<Msg>, game_dir: PathBuf, path: String, jobs: us
             &OsInfo::current(),
             jobs,
             &sink,
+            &cancel,
         )
         .await
         {
@@ -459,6 +505,7 @@ fn spawn_import(tx: mpsc::Sender<Msg>, game_dir: PathBuf, path: String, jobs: us
                     })
                     .await;
             }
+            Err(err) if err.is_cancelled() => {}
             Err(err) => {
                 let _ = tx
                     .send(Msg::Notice {
@@ -468,7 +515,7 @@ fn spawn_import(tx: mpsc::Sender<Msg>, game_dir: PathBuf, path: String, jobs: us
                     .await;
             }
         }
-    });
+    })
 }
 
 fn spawn_launch(tx: mpsc::Sender<Msg>, params: LaunchParams, control: LaunchControl) {

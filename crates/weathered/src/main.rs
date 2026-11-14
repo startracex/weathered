@@ -426,6 +426,7 @@ async fn cmd_download(
             os: &os,
             concurrency: jobs,
             java_mode,
+            cancel: weathered_core::cancel::CancelFlag::new(),
         },
         &cli_progress(),
     )
@@ -462,6 +463,7 @@ async fn download_for_instance(
             os: &os,
             concurrency: jobs,
             java_mode: JavaMode::Auto,
+            cancel: weathered_core::cancel::CancelFlag::new(),
         },
         &cli_progress(),
     )
@@ -555,6 +557,7 @@ async fn cmd_instance(layout: &DataLayout, action: InstanceCmd, jobs: usize) -> 
                 &OsInfo::current(),
                 jobs,
                 &cli_progress(),
+                &weathered_core::cancel::CancelFlag::new(),
             )
             .await?;
             println!(

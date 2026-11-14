@@ -140,6 +140,7 @@ pub enum Effect {
     ImportPack {
         path: String,
     },
+    CancelJob,
     Launch,
     StopGame,
     Save,
@@ -321,6 +322,8 @@ pub struct App {
     pub creator: Option<CreatorStep>,
     pub creator_selected: usize,
     pub pending_create: bool,
+    /// Late progress from a cancelled task must not lock the screen again.
+    pub ignore_job: bool,
     pub version_selected: usize,
     pub version_scroll: usize,
     pub version_window: usize,
@@ -366,6 +369,7 @@ impl App {
             creator: None,
             creator_selected: 0,
             pending_create: false,
+            ignore_job: false,
             version_selected: 0,
             version_scroll: 0,
             version_window: 8,
@@ -620,6 +624,9 @@ impl App {
         if self.editing.is_some() {
             return self.on_edit_key(key);
         }
+        if key == Key::Esc && self.job.is_some() {
+            return self.cancel_job();
+        }
         if key == Key::Esc && self.creator.is_some() {
             self.creator = None;
             return Effect::None;
@@ -703,7 +710,7 @@ impl App {
                 total,
                 detail,
                 launching,
-            } => {
+            } if !self.ignore_job => {
                 self.job = Some(Job {
                     version,
                     stage,
@@ -717,7 +724,7 @@ impl App {
                 version,
                 ok,
                 detail,
-            } => {
+            } if !self.ignore_job => {
                 if self.job.as_ref().is_some_and(|job| job.version == version) {
                     self.job = None;
                 }
@@ -753,17 +760,21 @@ impl App {
                     self.note(detail, true);
                 }
             }
-            Msg::GameStarted => {
+            Msg::GameStarted if !self.ignore_job => {
                 self.game_running = true;
                 self.note("Game is running", false);
             }
-            Msg::LaunchFailed { detail } => {
+            Msg::LaunchFailed { detail } if !self.ignore_job => {
                 self.game_running = false;
                 if self.job.as_ref().is_some_and(|job| job.launching) {
                     self.job = None;
                 }
                 self.note(detail, true);
             }
+            Msg::Progress { .. }
+            | Msg::InstallFinished { .. }
+            | Msg::GameStarted
+            | Msg::LaunchFailed { .. } => {}
         }
     }
 
@@ -913,6 +924,7 @@ impl App {
                 self.profile_selected = index;
                 Effect::None
             }
+            Click::CancelJob => self.cancel_job(),
             Click::NewInstance => {
                 self.open_creator();
                 Effect::None
@@ -1029,9 +1041,13 @@ impl App {
             return Effect::StopGame;
         }
         if self.job.is_some() {
-            self.note("Wait for the current task to finish", true);
+            self.note(
+                "Wait for the current task to finish, or press Esc to cancel",
+                true,
+            );
             return Effect::None;
         }
+        self.ignore_job = false;
         let Some(instance) = self.selected_instance() else {
             self.note("Create an instance first", true);
             return Effect::None;
@@ -1051,9 +1067,13 @@ impl App {
 
     fn request_install(&mut self, index: usize) -> Effect {
         if self.job.is_some() {
-            self.note("A download or launch is already running", true);
+            self.note(
+                "A download or launch is already running. Press Esc to cancel",
+                true,
+            );
             return Effect::None;
         }
+        self.ignore_job = false;
         let Some(id) = self.filtered().get(index).map(|entry| entry.id.clone()) else {
             return Effect::None;
         };
@@ -1376,6 +1396,20 @@ impl App {
         );
     }
 
+    fn cancel_job(&mut self) -> Effect {
+        let launching = self.job.as_ref().is_some_and(|job| job.launching) || self.game_running;
+        self.job = None;
+        self.ignore_job = true;
+        if launching {
+            self.game_running = false;
+            self.note("Stopped", false);
+            Effect::StopGame
+        } else {
+            self.note("Cancelled", false);
+            Effect::CancelJob
+        }
+    }
+
     pub fn mark_game_stopped(&mut self) {
         self.game_running = false;
         if self.job.as_ref().is_some_and(|job| job.launching) {
@@ -1402,6 +1436,7 @@ pub enum Click {
     Save,
     Refresh,
     CancelLogin,
+    CancelJob,
     Stop,
 }
 
@@ -1503,6 +1538,7 @@ pub struct Screen {
     pub launch_button: Rect,
     pub new_instance: Rect,
     pub progress: Rect,
+    pub cancel: Rect,
     pub log: Rect,
     pub download_tabs: Vec<Rect>,
     pub search: Rect,
@@ -1704,11 +1740,14 @@ fn layout_launch(app: &App, screen: &mut Screen) {
         );
     }
     if app.job.is_some() {
-        screen.progress = Rect::new(
-            band.x,
-            band.y.saturating_add(band.height.saturating_sub(1)),
-            band.width,
-            1,
+        place_cancel(
+            screen,
+            Rect::new(
+                band.x,
+                band.y.saturating_add(band.height.saturating_sub(1)),
+                band.width,
+                1,
+            ),
         );
     }
 }
@@ -1773,13 +1812,40 @@ fn layout_download(app: &App, screen: &mut Screen) {
         }
     }
     if progress_h > 0 {
-        screen.progress = Rect::new(
-            body.x.saturating_add(1),
-            body.y
-                .saturating_add(body.height.saturating_sub(progress_h)),
-            body.width.saturating_sub(2),
-            progress_h,
+        place_cancel(
+            screen,
+            Rect::new(
+                body.x.saturating_add(1),
+                body.y
+                    .saturating_add(body.height.saturating_sub(progress_h)),
+                body.width.saturating_sub(2),
+                progress_h,
+            ),
         );
+    }
+}
+
+fn place_cancel(screen: &mut Screen, area: Rect) {
+    let cancel_w = 10.min(area.width / 4);
+    if cancel_w >= 8 && area.width > cancel_w + 4 {
+        screen.cancel = Rect::new(
+            area.x.saturating_add(area.width.saturating_sub(cancel_w)),
+            area.y,
+            cancel_w,
+            1,
+        );
+        screen.progress = Rect::new(
+            area.x,
+            area.y,
+            area.width.saturating_sub(cancel_w).saturating_sub(1),
+            area.height,
+        );
+        screen.zones.push(Zone {
+            rect: screen.cancel,
+            action: Click::CancelJob,
+        });
+    } else {
+        screen.progress = area;
     }
 }
 
@@ -1998,6 +2064,41 @@ mod tests {
                 create_instance: false,
             }
         );
+    }
+
+    #[test]
+    fn escape_cancels_a_running_download_and_unlocks_the_ui() {
+        let mut app = App::preview();
+        app.page = Page::Download;
+        app.job = Some(Job {
+            version: "26.3".into(),
+            stage: "download".into(),
+            completed: 10,
+            total: 10,
+            detail: "already stored".into(),
+            launching: false,
+        });
+        assert_eq!(app.on_key(Key::Char('q')), Effect::Quit);
+        app.quit = false;
+        assert!(app.job.is_some());
+        assert_eq!(app.on_key(Key::Esc), Effect::CancelJob);
+        assert!(app.job.is_none());
+        app.screen = layout(&app, Rect::new(0, 0, 100, 36));
+        let button = app.screen.install_buttons[0];
+        let effect = app.on_mouse(Mouse::Click {
+            x: button.x + 1,
+            y: button.y,
+        });
+        assert!(matches!(effect, Effect::Install { .. }));
+        assert!(app.job.is_some());
+        app.screen = layout(&app, Rect::new(0, 0, 100, 36));
+        assert!(app.screen.cancel.width >= 8);
+        let effect = app.on_mouse(Mouse::Click {
+            x: app.screen.cancel.x + 1,
+            y: app.screen.cancel.y,
+        });
+        assert_eq!(effect, Effect::CancelJob);
+        assert!(app.job.is_none());
     }
 
     #[test]

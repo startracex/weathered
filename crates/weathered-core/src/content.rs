@@ -6,8 +6,9 @@
 use serde_json::Value;
 
 use crate::assets::{self, parse_asset_index};
+use crate::cancel::CancelFlag;
 use crate::catalog::{self, CatalogItem};
-use crate::download::{self, get_bytes};
+use crate::download::{self, get_bytes_cancellable};
 use crate::error::{Error, Result};
 use crate::java::{self, JavaMode};
 use crate::library::plan_libraries;
@@ -67,7 +68,7 @@ impl Loader {
 }
 
 /// What [`download`] should fetch.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct DownloadRequest<'a> {
     /// Version id, or a Forge/NeoForge coordinate.
     pub version: &'a str,
@@ -81,6 +82,8 @@ pub struct DownloadRequest<'a> {
     pub concurrency: usize,
     /// Whether to download a Mojang Java runtime.
     pub java_mode: JavaMode,
+    /// Raised by the UI to stop the download without waiting for HTTP timeouts.
+    pub cancel: CancelFlag,
 }
 
 /// Download `version` and, when requested, a loader profile.
@@ -147,22 +150,50 @@ async fn download_vanilla(
     let stored_json = store.ingest(&json_bytes, None, None, None)?;
     let client_sha1 = client_sha1(&resolved.info)?;
     let mut requests = version_blobs(&resolved.info, request.os)?;
-    let asset_count = queue_assets(client, layout, &store, &resolved.info, &mut requests).await?;
+    let asset_count = queue_assets(
+        client,
+        layout,
+        &store,
+        &resolved.info,
+        &mut requests,
+        &request.cancel,
+        progress,
+    )
+    .await?;
     let _stats = store
-        .fetch_all(client, requests, request.concurrency, progress)
+        .fetch_all(
+            client,
+            requests,
+            request.concurrency,
+            progress,
+            &request.cancel,
+        )
         .await?;
+    request.cancel.check()?;
     if let Some(index_ref) = resolved.info.asset_index.clone() {
         if let Some(sha512) = store.lookup_sha1(&index_ref.sha1)? {
+            emit_stage(progress, "assets", "linking assets");
             let index_path = store.object_path(&sha512)?;
             let index_bytes =
                 std::fs::read(&index_path).map_err(|err| Error::io(&index_path, err))?;
-            publish_assets(&store, layout, &index_ref.id, &index_bytes)?;
+            let store = store.clone();
+            let layout = layout.clone();
+            let index_id = index_ref.id.clone();
+            let cancel = request.cancel.clone();
+            tokio::task::spawn_blocking(move || {
+                publish_assets(&store, &layout, &index_id, &index_bytes, &cancel)
+            })
+            .await
+            .map_err(|err| Error::message(format!("could not link assets: {err}")))??;
         }
     }
     if request.java_mode != JavaMode::Skip {
-        let _ = java::resolve_java(
+        request.cancel.check()?;
+        emit_stage(progress, "java", "resolving Java");
+        let shared = layout.shared_assets();
+        let java_result = java::resolve_java(
             client,
-            &layout.shared_assets(),
+            &shared,
             java::JavaRequest {
                 spec: resolved.info.java_version.as_ref(),
                 explicit: None,
@@ -171,8 +202,14 @@ async fn download_vanilla(
                 concurrency: request.concurrency,
             },
             progress,
-        )
-        .await?;
+        );
+        tokio::select! {
+            biased;
+            () = request.cancel.cancelled() => return Err(Error::message("cancelled")),
+            result = java_result => {
+                result?;
+            }
+        }
     }
     let item = CatalogItem {
         id: format!("vanilla-{}", resolved.info.id),
@@ -202,25 +239,40 @@ async fn download_meta_loader(
 ) -> Result<CatalogItem> {
     let vanilla_request = DownloadRequest {
         loader: Loader::Vanilla,
-        ..*request
+        version: request.version,
+        loader_version: request.loader_version,
+        os: request.os,
+        concurrency: request.concurrency,
+        java_mode: request.java_mode,
+        cancel: request.cancel.clone(),
     };
     let vanilla = download_vanilla(client, layout, &vanilla_request, progress).await?;
+    request.cancel.check()?;
+    emit_stage(progress, "loader", "loader versions");
     let list_url = format!("{meta_root}/{}", vanilla.game_version);
-    let list_bytes = get_bytes(client, &list_url).await?;
+    let list_bytes = get_bytes_cancellable(client, &list_url, &request.cancel).await?;
     let list: Value =
         serde_json::from_slice(&list_bytes).map_err(|err| Error::json("loader list", err))?;
     let selected = catalog::select_loader_version(&list, request.loader_version)?;
+    request.cancel.check()?;
+    emit_stage(progress, "loader", "loader profile");
     let profile_url = format!(
         "{meta_root}/{}/{selected}/profile/json",
         vanilla.game_version
     );
-    let profile_bytes = get_bytes(client, &profile_url).await?;
+    let profile_bytes = get_bytes_cancellable(client, &profile_url, &request.cancel).await?;
     let profile = version::parse_version(&profile_bytes)?;
     let store = Store::open(layout.store_root())?;
     let stored_json = store.ingest(&profile_bytes, None, None, Some(&profile_url))?;
     let requests = version_blobs(&profile, request.os)?;
     store
-        .fetch_all(client, requests, request.concurrency, progress)
+        .fetch_all(
+            client,
+            requests,
+            request.concurrency,
+            progress,
+            &request.cancel,
+        )
         .await?;
     let item = CatalogItem {
         id: format!("{kind}-{}-{selected}", vanilla.game_version),
@@ -268,6 +320,7 @@ async fn download_installer(
             }],
             4,
             progress,
+            &request.cancel,
         )
         .await?;
     let _ = stats;
@@ -284,7 +337,9 @@ async fn download_installer(
         .unwrap_or(version)
         .to_string();
     let requests = version_blobs(&profile, &OsInfo::current())?;
-    store.fetch_all(client, requests, 16, progress).await?;
+    store
+        .fetch_all(client, requests, 16, progress, &request.cancel)
+        .await?;
     let client_sha1 = profile
         .downloads
         .as_ref()
@@ -338,7 +393,7 @@ fn version_blobs(version: &VersionInfo, os: &OsInfo) -> Result<Vec<BlobRequest>>
         requests.push(BlobRequest {
             url: file.url,
             sha1: file.sha1,
-            sha512: None,
+            sha512: file.sha512,
             size: file.size,
         });
     }
@@ -363,11 +418,14 @@ async fn queue_assets(
     store: &Store,
     version: &VersionInfo,
     requests: &mut Vec<BlobRequest>,
+    cancel: &CancelFlag,
+    progress: &ProgressSink,
 ) -> Result<usize> {
     let Some(index_ref) = version.asset_index.as_ref() else {
         return Ok(0);
     };
-    let bytes = get_bytes(client, &index_ref.url).await?;
+    emit_stage(progress, "assets", "asset index");
+    let bytes = get_bytes_cancellable(client, &index_ref.url, cancel).await?;
     let actual = download::sha1_hex(&bytes);
     if !actual.eq_ignore_ascii_case(&index_ref.sha1) {
         return Err(Error::Checksum {
@@ -397,7 +455,9 @@ pub fn publish_assets(
     layout: &DataLayout,
     index_id: &str,
     index_bytes: &[u8],
+    cancel: &CancelFlag,
 ) -> Result<()> {
+    cancel.check()?;
     let paths = layout.shared_assets();
     let index_path = paths.asset_index(index_id);
     if let Some(parent) = index_path.parent() {
@@ -406,6 +466,7 @@ pub fn publish_assets(
     std::fs::write(&index_path, index_bytes).map_err(|err| Error::io(&index_path, err))?;
     let index = parse_asset_index(index_bytes)?;
     for object in index.objects.values() {
+        cancel.check()?;
         let Some(sha512) = store.lookup_sha1(&object.hash)? else {
             continue;
         };
@@ -423,6 +484,15 @@ pub fn publish_assets(
         )?;
     }
     Ok(())
+}
+
+fn emit_stage(progress: &ProgressSink, stage: &str, detail: &str) {
+    progress.emit(crate::progress::ProgressEvent {
+        stage: stage.to_string(),
+        completed: 0,
+        total: 0,
+        detail: detail.to_string(),
+    });
 }
 
 fn client_sha1(version: &VersionInfo) -> Result<String> {

@@ -60,6 +60,7 @@ pub fn plan_asset_downloads(index: &AssetIndex, objects_root: &Path) -> Result<V
             url: format!("{OBJECT_BASE}/{rel}"),
             dest,
             sha1: Some(object.hash.clone()),
+            sha512: None,
             size: Some(object.size),
             executable: false,
         });

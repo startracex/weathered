@@ -12,6 +12,7 @@ use sha2::{Sha256, Sha512};
 
 use futures::stream::{StreamExt, TryStreamExt};
 
+use crate::cancel::CancelFlag;
 use crate::download::MAX_FILE_BYTES;
 use crate::error::{Error, IoResultExt, Result};
 use crate::progress::{ProgressEvent, ProgressSink};
@@ -215,12 +216,14 @@ impl Store {
         requests: Vec<BlobRequest>,
         concurrency: usize,
         progress: &ProgressSink,
+        cancel: &CancelFlag,
     ) -> Result<FetchStats> {
         let mut pending = Vec::new();
         let mut cached = 0u64;
         let mut total_bytes = 0u64;
         let mut done_bytes = 0u64;
         for request in requests {
+            cancel.check()?;
             if request.url.is_empty() && request.sha1.is_none() && request.sha512.is_none() {
                 continue;
             }
@@ -234,7 +237,8 @@ impl Store {
             total_bytes += request.size.unwrap_or(0);
             pending.push(request);
         }
-        emit_overall(progress, done_bytes, total_bytes, cached, "already stored");
+        let (shown_done, shown_total, detail) = opening_progress(done_bytes, total_bytes, &pending);
+        emit_overall(progress, shown_done, shown_total, cached, &detail);
         if pending.is_empty() {
             return Ok(FetchStats {
                 downloaded: 0,
@@ -244,11 +248,12 @@ impl Store {
 
         let concurrency = concurrency.max(1);
         let downloaded = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let done = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(done_bytes));
-        let total = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(total_bytes));
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(shown_done));
+        let total = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(shown_total));
         let client = client.clone();
         let store = self.clone();
         let progress = progress.clone();
+        let cancel = cancel.clone();
 
         futures::stream::iter(pending)
             .map(|request| {
@@ -258,20 +263,28 @@ impl Store {
                 let downloaded = std::sync::Arc::clone(&downloaded);
                 let done = std::sync::Arc::clone(&done);
                 let total = std::sync::Arc::clone(&total);
+                let cancel = cancel.clone();
                 async move {
+                    cancel.check()?;
                     let known = request.size.unwrap_or(0);
-                    let object = store.fetch_one(&client, &request).await?;
+                    let object = tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => return Err(Error::message("cancelled")),
+                        result = store.fetch_one(&client, &request) => result?,
+                    };
                     if !object.cached {
                         downloaded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     let size = object.size;
                     if known == 0 {
-                        total.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+                        total.fetch_add(
+                            size.saturating_sub(1),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                     }
-                    let completed = done.fetch_add(
-                        if known == 0 { size } else { known },
-                        std::sync::atomic::Ordering::Relaxed,
-                    ) + if known == 0 { size } else { known };
+                    let added = if known == 0 { size.max(1) } else { known };
+                    let completed =
+                        done.fetch_add(added, std::sync::atomic::Ordering::Relaxed) + added;
                     emit_overall(
                         &progress,
                         completed,
@@ -517,6 +530,37 @@ fn lookup_sha1_of_sha512(store: &Store, sha512: &str) -> Option<String> {
     None
 }
 
+/// Progress before any pending transfer starts.
+///
+/// Cached files count as finished. Pending files with no size still leave the
+/// total ahead of the completed count, so the bar does not read 100% while
+/// work remains.
+fn opening_progress(done: u64, known_total: u64, pending: &[BlobRequest]) -> (u64, u64, String) {
+    if pending.is_empty() {
+        return (done, known_total, "already stored".into());
+    }
+    let unknown = pending
+        .iter()
+        .filter(|item| item.size.unwrap_or(0) == 0)
+        .count() as u64;
+    let mut total = known_total.saturating_add(unknown);
+    if total <= done {
+        total = done.saturating_add(unknown.max(1));
+    }
+    let detail = pending
+        .first()
+        .map(|item| {
+            let name = item.url.rsplit(['/', '?']).next().unwrap_or("");
+            if name.is_empty() {
+                "downloading".into()
+            } else {
+                name.to_string()
+            }
+        })
+        .unwrap_or_else(|| "downloading".into());
+    (done, total, detail)
+}
+
 fn emit_overall(progress: &ProgressSink, completed: u64, total: u64, _cached: u64, detail: &str) {
     let detail = detail
         .rsplit(['/', '?'])
@@ -642,6 +686,72 @@ mod tests {
                 None
             )
             .is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn unsized_pending_work_does_not_look_finished() {
+        let (root, store) = temp_store();
+        let stored = store
+            .ingest(
+                b"abc",
+                Some("a9993e364706816aba3e25717850c26c9cd0d89d"),
+                None,
+                Some("https://example.test/cached"),
+            )
+            .unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = std::sync::Arc::clone(&events);
+        let sink = ProgressSink::new(move |event| {
+            recorded.lock().unwrap().push(event);
+        });
+        let client = crate::download::build_http_client().unwrap();
+        let pending = store
+            .fetch_all(
+                &client,
+                vec![
+                    BlobRequest {
+                        url: "https://example.test/cached".into(),
+                        sha1: Some(stored.sha1),
+                        sha512: None,
+                        size: Some(3),
+                    },
+                    BlobRequest {
+                        url: String::new(),
+                        sha1: None,
+                        sha512: Some("ab".repeat(64)),
+                        size: None,
+                    },
+                ],
+                1,
+                &sink,
+                &crate::cancel::CancelFlag::new(),
+            )
+            .await;
+        assert!(pending.is_err());
+        let opening = events.lock().unwrap().first().cloned().unwrap();
+        assert_ne!(opening.detail, "already stored");
+        assert!(opening.completed < opening.total);
+
+        events.lock().unwrap().clear();
+        store
+            .fetch_all(
+                &client,
+                vec![BlobRequest {
+                    url: "https://example.test/cached".into(),
+                    sha1: Some("a9993e364706816aba3e25717850c26c9cd0d89d".into()),
+                    sha512: None,
+                    size: Some(3),
+                }],
+                1,
+                &sink,
+                &crate::cancel::CancelFlag::new(),
+            )
+            .await
+            .unwrap();
+        let finished = events.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(finished.detail, "already stored");
+        assert_eq!(finished.completed, finished.total);
         let _ = std::fs::remove_dir_all(root);
     }
 }

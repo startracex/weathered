@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::cancel::CancelFlag;
 use crate::catalog::CatalogItem;
 use crate::content::{self, Loader};
 use crate::error::{Error, IoResultExt, Result};
@@ -261,6 +262,7 @@ pub fn delete(layout: &DataLayout, query: &str) -> Result<Instance> {
 }
 
 /// Download anything the pack needs, then copy mods and overrides into a new instance.
+#[allow(clippy::too_many_arguments)]
 pub async fn import_mrpack(
     client: &reqwest::Client,
     layout: &DataLayout,
@@ -269,6 +271,7 @@ pub async fn import_mrpack(
     os: &OsInfo,
     concurrency: usize,
     progress: &ProgressSink,
+    cancel: &CancelFlag,
 ) -> Result<Instance> {
     let bytes = std::fs::read(pack_path).map_err(|err| Error::io(pack_path, err))?;
     let pack = modpack::parse_mrpack(&bytes)?;
@@ -293,6 +296,7 @@ pub async fn import_mrpack(
             os,
             concurrency,
             java_mode: JavaMode::Auto,
+            cancel: cancel.clone(),
         },
         progress,
     )
@@ -309,6 +313,7 @@ pub async fn import_mrpack(
         Path::new(&instance.game_dir),
         concurrency,
         progress,
+        cancel,
     )
     .await?;
     modpack::extract_overrides(&bytes, Path::new(&instance.game_dir))?;
@@ -368,7 +373,14 @@ pub async fn prepare_launch(
         if let Some(sha512) = store.lookup_sha1(&index_ref.sha1)? {
             let index_path = store.object_path(&sha512)?;
             let bytes = std::fs::read(&index_path).map_err(|err| Error::io(&index_path, err))?;
-            content::publish_assets(&store, layout, &index_ref.id, &bytes)?;
+            let store = store.clone();
+            let layout = layout.clone();
+            let index_id = index_ref.id.clone();
+            tokio::task::spawn_blocking(move || {
+                content::publish_assets(&store, &layout, &index_id, &bytes, &CancelFlag::new())
+            })
+            .await
+            .map_err(|err| Error::message(format!("could not link assets: {err}")))??;
         }
     }
     if let Some(logging) = resolved
@@ -467,6 +479,7 @@ async fn copy_pack_files(
     game_dir: &Path,
     concurrency: usize,
     progress: &ProgressSink,
+    cancel: &CancelFlag,
 ) -> Result<()> {
     let store = Store::open(layout.store_root())?;
     let mut requests = Vec::new();
@@ -480,9 +493,10 @@ async fn copy_pack_files(
         });
     }
     store
-        .fetch_all(client, requests, concurrency, progress)
+        .fetch_all(client, requests, concurrency, progress, cancel)
         .await?;
     for file in &pack.files {
+        cancel.check()?;
         let sha512 = locate_pack_file(&store, file)?;
         let dest = game_dir.join(crate::paths::safe_rel_path(&file.path)?);
         store.copy_to(&sha512, &dest)?;

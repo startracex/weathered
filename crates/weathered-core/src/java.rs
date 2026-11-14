@@ -389,6 +389,7 @@ pub fn plan_runtime(manifest: &JavaRuntimeManifest, root: &Path) -> Result<Runti
                     url: raw.url.clone().unwrap_or_default(),
                     dest,
                     sha1: raw.sha1.clone(),
+                    sha512: None,
                     size: raw.size,
                     executable: file.executable,
                 });

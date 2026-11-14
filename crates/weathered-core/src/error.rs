@@ -132,6 +132,11 @@ impl Error {
         }
     }
 
+    /// The caller asked the operation to stop.
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Message(text) if text == "cancelled")
+    }
+
     /// Whether a download should be tried again.
     pub fn is_retryable(&self) -> bool {
         match self {

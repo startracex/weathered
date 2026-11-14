@@ -33,6 +33,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Page::More => draw_more(frame, app),
     }
     draw_footer(frame, app);
+    if app.screen.cancel.width > 0 {
+        let style = if hot(app, app.screen.cancel) {
+            theme::selected()
+        } else {
+            Style::default().fg(ON_ACCENT).bg(ACCENT)
+        };
+        frame.render_widget(
+            Paragraph::new(center("Cancel", app.screen.cancel.width as usize)).style(style),
+            app.screen.cancel,
+        );
+    }
     if app.login.is_some() {
         draw_login(frame, app);
     }
@@ -88,7 +99,11 @@ fn draw_footer(frame: &mut Frame, app: &App) {
     } else {
         theme::muted()
     };
-    let hints = "1-4 pages   ↑↓ move   enter   click & wheel   q quit";
+    let hints = if app.job.is_some() {
+        "esc cancel   q quit"
+    } else {
+        "1-4 pages   ↑↓ move   enter   click & wheel   q quit"
+    };
     let width = app.screen.footer.width as usize;
     let text = if app.status.is_empty() {
         hints.to_string()
@@ -509,7 +524,7 @@ fn draw_more(frame: &mut Frame, app: &App) {
         Line::from("Settings stores the game directory, memory, Java, and username."),
         Line::from(""),
         Line::from("Mouse: click tabs, rows, and buttons. The wheel scrolls lists."),
-        Line::from("Keys: 1–4 switch pages, arrows move, enter activates, q quits."),
+        Line::from("Keys: 1–4 switch pages, arrows move, enter activates, esc cancels, q quits."),
         Line::from(""),
         Line::from("Microsoft login uses a device code. Set an Azure client id first."),
     ];

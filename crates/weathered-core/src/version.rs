@@ -122,6 +122,16 @@ pub struct Library {
     pub downloads: Option<LibraryDownloads>,
     /// Legacy base URL. Joined with the Maven path when `downloads` is absent.
     pub url: Option<String>,
+    /// SHA-1 published beside the Maven coordinate. Fabric and Quilt use this
+    /// instead of `downloads.artifact`.
+    #[serde(default)]
+    pub sha1: Option<String>,
+    /// SHA-512 published beside the Maven coordinate.
+    #[serde(default)]
+    pub sha512: Option<String>,
+    /// Size in bytes published beside the Maven coordinate.
+    #[serde(default)]
+    pub size: Option<u64>,
     /// OS and feature rules. Missing rules mean the library is included.
     pub rules: Option<Vec<Rule>>,
     /// Old-style native classifier names keyed by OS.
